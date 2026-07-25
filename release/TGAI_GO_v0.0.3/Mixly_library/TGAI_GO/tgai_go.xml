@@ -1,0 +1,140 @@
+<script type='text/javascript' src='./language/en.js'></script>
+<script type='text/javascript' src='./language/zh-hans.js'></script>
+<script type='text/javascript' src='./block/tgai_go.js'></script>
+<script type='text/javascript' src='./generator/tgai_go.js'></script>
+<category id='CAT_TGAI_GO' name='TGAI GO' colour='#E65100'>
+
+  <label text='━━━ 部署步骤 ━━━'></label>
+  <label text='① 转换模型：python tgai_convert.py --input model.pt --output model.TG --dtype q4_0'></label>
+  <label text='② 上传模型：双击 TGAI GO/tools/upload_model.bat → 选择 .TG 文件 → 上传'></label>
+  <label text='③ 安装库：把 TGAI_GO 文件夹放到 文档/Arduino/libraries/'></label>
+  <label text='④ 拖积木：把「自动检测并加载」积木放 setup，把「对话」积木放 loop'></label>
+  <label text='⑤ 烧录：点击 Mixly 上传按钮，等待编译上传完成'></label>
+  <label text='⑥ 对话：打开串口监视器(115200)，输入文字回车即可聊天'></label>
+  <label text='━━━ 积木 ━━━'></label>
+
+  <category id='CAT_TGAI_EXAMPLE' name='📖 使用示例' colour='#c6a0f6'>
+    <label text='▼ 方式1: 串口流式对话 — 最简单'></label>
+    <block type='tgai_chat'>
+      <value name='PROMPT'>
+        <shadow type='text'>
+          <field name='TEXT'>你好</field>
+        </shadow>
+      </value>
+      <field name='MAX_TOKENS'>128</field>
+    </block>
+
+    <label text='▼ 方式2: 等待完整回复 — 可存入变量'></label>
+    <block type='tgai_chat_full'>
+      <value name='PROMPT'>
+        <shadow type='text'>
+          <field name='TEXT'>你好</field>
+        </shadow>
+      </value>
+      <field name='MAX_TOKENS'>128</field>
+    </block>
+
+    <label text='▼ 方式3: 预测下一个Token（真·流式，逐token控制）'></label>
+    <block type='tgai_predict'>
+      <value name='TEXT'>
+        <shadow type='text'>
+          <field name='TEXT'>你好</field>
+        </shadow>
+      </value>
+    </block>
+  </category>
+
+  <category id='CAT_TGAI_PREBUILT' name='🧩 预拼接示例' colour='#df8e1d'>
+    <label text='━━━ setup 里放这个 ━━━'></label>
+    <block type='tgai_auto_load'></block>
+
+    <label text='━━━ loop 里放这些 ━━━'></label>
+    <label text='  方式A: 串口流式（打字机效果）'></label>
+    <block type='tgai_chat'>
+      <value name='PROMPT'>
+        <shadow type='text'>
+          <field name='TEXT'>你好</field>
+        </shadow>
+      </value>
+      <field name='MAX_TOKENS'>128</field>
+    </block>
+
+    <label text='  方式B: 存入变量（等待完整输出后返回String）'></label>
+    <label text='  此积木有返回值，连到「设置变量」右侧即可'></label>
+    <block type='tgai_chat_full'>
+      <value name='PROMPT'>
+        <shadow type='text'>
+          <field name='TEXT'>你好</field>
+        </shadow>
+      </value>
+      <field name='MAX_TOKENS'>128</field>
+    </block>
+
+    <label text='  方式C: 预测token（真流式，1次只出1个token）'></label>
+    <block type='tgai_predict'>
+      <value name='TEXT'>
+        <shadow type='text'>
+          <field name='TEXT'>你好</field>
+        </shadow>
+      </value>
+    </block>
+  </category>
+
+  <category id='CAT_TGAI_START' name='初始化（放 setup）' colour='#a65d00'>
+    <block type='tgai_auto_load'></block>
+    <block type='tgai_load_model'>
+      <value name='FILE_PATH'>
+        <shadow type='text'>
+          <field name='TEXT'>/model.TG</field>
+        </shadow>
+      </value>
+    </block>
+    <block type='tgai_config'></block>
+  </category>
+
+  <category id='CAT_TGAI_CHAT' name='对话（放 loop）' colour='#1e66f5'>
+    <block type='tgai_chat'>
+      <value name='PROMPT'>
+        <shadow type='text'>
+          <field name='TEXT'>你好</field>
+        </shadow>
+      </value>
+      <field name='MAX_TOKENS'>128</field>
+    </block>
+    <block type='tgai_chat_full'>
+      <value name='PROMPT'>
+        <shadow type='text'>
+          <field name='TEXT'>你好</field>
+        </shadow>
+      </value>
+      <field name='MAX_TOKENS'>128</field>
+    </block>
+    <block type='tgai_input'>
+      <field name='TEXT'>你好</field>
+    </block>
+  </category>
+
+  <category id='CAT_TGAI_PREDICT' name='预测' colour='#8839ef'>
+    <block type='tgai_predict'>
+      <value name='TEXT'>
+        <shadow type='text'>
+          <field name='TEXT'>你好</field>
+        </shadow>
+      </value>
+    </block>
+  </category>
+
+  <category id='CAT_TGAI_TOOLS' name='工具' colour='#40a02b'>
+    <block type='tgai_reset'></block>
+    <block type='tgai_ready'></block>
+    <block type='tgai_diagnostic'></block>
+    <block type='tgai_token_decode'>
+      <value name='TOKEN_ID'>
+        <shadow type='math_number'>
+          <field name='NUM'>0</field>
+        </shadow>
+      </value>
+    </block>
+  </category>
+
+</category>

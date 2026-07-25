@@ -1,0 +1,5 @@
+{
+    "name": "TGAI GO",
+    "version": "1.0.0",
+    "description": "Lightweight LLM inference engine for ESP32/Arduino"
+}

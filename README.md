@@ -18,7 +18,7 @@
 
 ## 项目简介
 
-TGAI GO 是一个从零手搓的纯 C/C++ LLM 推理引擎，零外部依赖，不调任何 ML 库。同一个引擎能跑在从 ESP32 单片机（8MB PSRAM）到 CUDA GPU 服务器的任何设备上。支持 FP32、FP16、Q8_0、Q4_0 多种量化格式，内置 BPE Tokenizer 支持中英文分词，KV Cache 加速多轮对话。提供三种部署方案：GPU 加速版（CUDA 并行计算，支持 NTK-by-parts 长上下文扩展）、桌面 CPU 版（AVX2 SIMD 优化，Q4_0 直推不解码）、嵌入式版（ESP32/Arduino/Mixly 图形化编程，LittleFS 模型存储）。兼容 TGAI-NLP 训练的 PyTorch 模型一键转换，同时支持 Llama、Qwen2、Mistral、Phi-3、Gemma 等社区 GGUF 模型导入。从训练到部署全链路打通，真正做到一套代码、多端运行。
+TGAI GO 是一个从零手搓的纯 C/C++ LLM 推理引擎，零外部依赖，不调任何 ML 库。同一个引擎能跑在从 ESP32 单片机（8MB PSRAM）到 CUDA GPU 服务器的任何设备上。支持 FP32、FP16、Q8_0、Q4_0 多种量化格式，内置 BPE Tokenizer 支持中英文分词，KV Cache 加速多轮对话。提供三种部署方案：GPU 加速版（CUDA 并行计算，支持 NTK-by-parts 长上下文扩展）、桌面 CPU 版（AVX2 SIMD 优化，Q4_0 直推不解码）、嵌入式版（ESP32/Arduino/Mixly 图形化编程，LittleFS 模型存储）。兼容 TGAI-NLP 训练的 PyTorch 模型一键转换，从训练到部署全链路打通，真正做到一套代码、多端运行。
 
 ---
 

@@ -16,6 +16,26 @@ tools/build/
 tools/dist/
 *.spec
 
+# ── Python 包（tgai-go）──────────────────────────────
+# 构建产物；源码在 python/tgai_go/ 与 python/pyproject.toml
+python/build/
+python/dist/
+python/*.egg-info/
+python/tgai_go.egg-info/
+python/build_tools/__pycache__/
+# 注意：python/tgai_go/_native/*.dll 是【要提交】的
+#       （pip 安装后用户不该再编译，原生库随包分发）
+
+# ── 本地备份/清理产物 ────────────────────────────────
+*.bak
+*.bak_*
+*.orig
+*~
+_*.log
+_*.bat
+_*.err
+_*.exe
+
 # IDE
 .vscode/
 .idea/
@@ -35,3 +55,6 @@ tests/*.exe
 # Env files
 .env
 *.env.local
+
+# 实验残留（instrumented 副本，非源码）
+*.exp_*

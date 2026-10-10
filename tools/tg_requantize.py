@@ -52,8 +52,9 @@ DTYPE_INT8 = 2
 DTYPE_INT32 = 3
 DTYPE_Q8_0 = 4               # block-wise 8-bit: 34B/block (2B fp16 scale + 32B int8)
 DTYPE_Q4_0 = 5               # block-wise 4-bit: 18B/block (2B fp16 scale + 16B packed 4-bit)
+DTYPE_BF16 = 6               # bfloat16 (与 V2.7 的 v27_*_bf16.TG 一致; bf16→fp32 = 左移 16 位)
 
-DTYPE_NAMES = {0: 'FP32', 1: 'FP16', 2: 'INT8', 3: 'INT32', 4: 'Q8_0', 5: 'Q4_0'}
+DTYPE_NAMES = {0: 'FP32', 1: 'FP16', 2: 'INT8', 3: 'INT32', 4: 'Q8_0', 5: 'Q4_0', 6: 'BF16'}
 DTYPE_FROM_STR = {'fp32': DTYPE_FP32, 'fp16': DTYPE_FP16, 'q8_0': DTYPE_Q8_0, 'q4_0': DTYPE_Q4_0}
 
 
@@ -148,6 +149,12 @@ def dequant_to_fp32(data: bytes, dtype: int, n: int, scale_u32: int = 0) -> np.n
         q[:, 1::2] = high                                       # 奇数 index: 高 nibble
         w = (q - 8.0) * scale[:, None]                          # 中心化反量化
         return w.reshape(-1)[:n].copy()
+    if dtype == DTYPE_BF16:
+        # bfloat16 → float32：bf16 就是 fp32 的高 16 位，左移 16 位即可（无损）
+        # ★ 2026-10-10 加：V2.7 的 v27_*_bf16.TG 是 BF16 存储，本工具原先不支持，
+        #   导致「BF16 → Q4_0」这条路走不通（用户实测 ValueError: 不支持的源 dtype=6）。
+        u16 = np.frombuffer(data[:n * 2], dtype=np.uint16).astype(np.uint32)
+        return (u16 << 16).view(np.float32).copy()
     if dtype == DTYPE_INT8:
         # scale_or_pad 字段存的是 float 重解释为 uint32
         scale = struct.unpack('<f', struct.pack('<I', scale_u32))[0] if scale_u32 else 1.0

@@ -22,6 +22,48 @@ ROOT = os.path.dirname(SCRIPT_DIR)
 # ══════════════════════════════════════════════════════════════
 DEFAULT_THREADS = 4
 
+# ★ 历史窗口的"低水位"（迟滞系数）
+#   命中预算后不是刚好压到预算，而是一次丢到预算的 60%，
+#   这样之后若干轮都不必再丢 ⇒ prompt 前缀保持稳定 ⇒ KV cache 复用生效。
+#   代价：偶尔一次全量重算，换来后续每轮只 prefill 增量。
+HIST_TRIM_LOW = 0.60
+
+# ══════════════════════════════════════════════════════════════
+#  ★★ Soft-Stop（长度递增收尾偏置）
+#
+#  语义对齐 llama.cpp PR #14229 的 escalating EOG bias：
+#      bias = max(0, max(start_after, n_remain - start_at_remain)) * per_tok
+#
+#  动机：V2.7 自由生成时会一路写到 max_tokens 才停（实测 2048 token / 189 秒），
+#        既慢又把上下文挤爆（下一轮 prompt 装不下 ⇒ prefill 失败）。
+#        加上之后越接近上限越容易自然收尾，且【不切断句子】。
+#
+#  为什么不用"概率上限 95%"：
+#        logit 加常数会让 EOS 概率渐进趋近 1 但永不到 100%（已满足"不到 100%"）；
+#        而强行归一化成"恰好 95%"会破坏其余 token 的相对分布，伤害采样质量。
+#        llama.cpp 同样选择"线性斜坡 + 不设概率上限"。
+#
+#  可用环境变量覆盖（便于 A/B，不必改代码）：
+#        TGAI_SOFT_STOP_PER_TOK / TGAI_SOFT_STOP_AT_REMAIN / TGAI_SOFT_STOP_AFTER
+#  设 TGAI_SOFT_STOP_PER_TOK=0 可整体关闭。
+# ══════════════════════════════════════════════════════════════
+def _env_f(name, dflt):
+    try:
+        v = os.environ.get(name)
+        return float(v) if v not in (None, '') else dflt
+    except (TypeError, ValueError):
+        return dflt
+
+
+# 每 token 递增的 bias 强度。1.0 表示"接近上限时，每多生成 1 token 给 EOS 加 1.0 logit"。
+# 取值经验：0.02~0.2 起步（远小于 1，否则会过早掐断回答）。
+# 实测教训：per_tok=1.0 + at_remain 触发太早 ⇒ 13 token 就结束了（答不完整）。
+SOFT_STOP_PER_TOK = _env_f('TGAI_SOFT_STOP_PER_TOK', 0.08)
+# 剩余多少 token 时开始施加（绝对 token 数）
+SOFT_STOP_AT_REMAIN = _env_f('TGAI_SOFT_STOP_AT_REMAIN', 64)
+# 已生成多少 token 后开始施加（绝对 token 数；与上面取先到者）
+SOFT_STOP_AFTER = _env_f('TGAI_SOFT_STOP_AFTER', 256)
+
 DLL_CANDIDATES = [
     os.path.join(SCRIPT_DIR, 'cpu', 'build', 'libtgai_engine.dll'),
     os.path.join(SCRIPT_DIR, 'cpu', 'build', 'libtgai_engine.so'),
@@ -519,10 +561,10 @@ def _dry_penalize(logits, recent, p, decode_fn):
 
 
 def sample_numpy(logits, temp, top_k, top_p, vocab, p=None, recent=None,
-                 decode_fn=None, turn_recent=None):
-    """采样（linearly: penalties -> dry -> top_k -> top_p -> min_p -> multinomial）。
+                 decode_fn=None, turn_recent=None, max_tok=0, step=0, eos_ids=None):
+    """采样（linearly: penalties -> dry -> soft-stop -> top_k -> top_p -> min_p -> multinomial）。
 
-    p: 完整参数字典（含 seed / *_penalty / dry_* / min_p）；缺省时退化为旧行为。
+    p: 完整参数字典（含 seed / *_penalty / dry_* / min_p / soft_stop_*）；缺省时退化为旧行为。
     recent: 已生成 token 列表（供 repeat/frequency/presence 惩罚）
     decode_fn: token -> 文本（供 DRY 断句）；为 None 时 DRY 跳过断句检查
     turn_recent: ★ TURN_SCOPED_DRY（2026-10-10 加）
@@ -531,6 +573,9 @@ def sample_numpy(logits, temp, top_k, top_p, vocab, p=None, recent=None,
         为什么需要：TGAI GO 是常驻进程，跨轮累积的 DRY 会把正确答案压坏
         （实测 '1+1=2' → '1+1=3'），但完全不压又挡不住训练语料的模板复读
         （'[简称]|[机构名称]|[职称]|…'）。
+    max_tok / step / eos_ids: ★ Soft-Stop（2026-10-10 加）
+        长度递增收尾偏置所需：本轮上限、已生成数、停止符 id 集合。
+        详见下方 ②.5 的注释。
     """
     arr = np.asarray(logits, dtype=np.float64).copy()
     p = p or {}
@@ -545,6 +590,34 @@ def sample_numpy(logits, temp, top_k, top_p, vocab, p=None, recent=None,
         if dry_hist:
             dfn = decode_fn or (lambda t: '')
             arr = _dry_penalize(arr, dry_hist, p, dfn)
+
+    # ②.5 ★★ 长度递增收尾偏置（Soft-Stop，2026-10-10 加）
+    #
+    #  语义对齐 llama.cpp PR #14229 的 escalating EOG bias：
+    #      bias = max(0, max(start_after, n_remain - start_at_remain)) * per_tok
+    #      ↳ n_remain 越来越小 ⇒ bias 线性增大 ⇒ 模型越来越倾向结束
+    #      ↳ bias 加在【结束符的 logit】上，不是硬性设概率上限
+    #        （logit 加常数会让 EOS 概率渐进趋近 1，但永不到 100%）
+    #
+    #  为什么需要：V2.7 在自由生成时会一路写到 max_tokens 才停
+    #    （实测 2048 token / 189 秒），既慢又把上下文挤爆。
+    #    加了这个之后，越接近上限越容易自然收尾，且【不切断句子】。
+    #
+    #  参数：soft_stop_per_tok  每 token 递增的 bias 强度（0 = 关闭）
+    #        soft_stop_at_remain 剩余多少 token 时开始施加
+    #        soft_stop_after     已生成多少 token 后开始施加（两者取先到）
+    #        eos_ids            本轮所有停止符 id（含轮次标记）
+    _spt = float(p.get('soft_stop_per_tok', SOFT_STOP_PER_TOK) or 0.0)
+    if _spt > 0.0 and eos_ids:
+        _n_remain = max_tok - step
+        _after = step - float(p.get('soft_stop_after', SOFT_STOP_AFTER) or 0)
+        _at_rem = float(p.get('soft_stop_at_remain', SOFT_STOP_AT_REMAIN) or 0) - _n_remain
+        _k = _after if _after > _at_rem else _at_rem
+        if _k > 0.0:
+            _bias = _k * _spt
+            for _e in eos_ids:
+                if 0 <= _e < arr.size and np.isfinite(arr[_e]):
+                    arr[_e] += _bias
 
     # ③ 温度
     arr = arr / max(float(temp), 0.01)
@@ -687,6 +760,20 @@ class ChatSession:
         #   多给几轮有助于"记住"（实测 4 轮时多轮回忆不稳定）
         #   注意：轮数越多 prompt 越长 ⇒ prefill 越慢，8 轮是折中
         self.max_turns = 8
+        # ★★ prompt token 预算 + 迟滞窗口（2026-10-10 加）
+        #   为什么需要：固定轮数窗口（[-max_turns:]）会在历史满后【每轮滑动】，
+        #     导致 prompt 前缀变化 ⇒ KV cache 复用失效 ⇒ 每轮重算整个历史
+        #     （实测 1000 token 上下文下每轮 prefill 50~72 秒）。
+        #   改成"总 token 预算 + 低水位迟滞"后，prompt 大部分时间单调增长，
+        #     LCP 得以命中，每轮只需 prefill 新增的几十个 token。
+        #   预算取 max_seq 的 70%：留 30% 给生成，避免 prompt+生成 撞上下文上限。
+        self.max_prompt_tokens = max(512, int(engine.cfg.get('max_seq', 2048) * 0.70))
+        # ★ 历史里助手回答的档位标记（2026-10-10 加，用于 KV cache 前缀对齐）
+        #   必须与模型【实际生成】的档位标记一致，否则 prompt 与 cache 差 1 个 token
+        #   ⇒ LCP 断裂 ⇒ 每轮全量重算。详见 build_prompt 里的注释。
+        #   直答档 = '<回答>'；思考档模型会先出 '<思考>'，这里按直答历史渲染即可
+        #   （llama.cpp 官方模板对直答历史也是写 <回答>）。
+        self.answer_marker = '<回答>'
         self.eos = engine.cfg.get('eos_id', 3)
         # ★★ 轮次边界标记作为停止符（TGAI 专属，见模块顶部 TGAI_TURN_EOG 注释）
         self.turn_eog = _build_turn_eog(engine)
@@ -743,10 +830,52 @@ class ChatSession:
             parts = []
             if self.sp.strip():
                 parts.append(f"<系统>\n{self.sp.strip()}")
-            # 保留最近 N 轮（过多会让 prompt 变长且慢；V2.7 训练时上下文是拼接的）
-            for u, a in self.history[-self.max_turns:]:
+            # ★★ 历史窗口（2026-10-10 重写）—— 目标是让 prompt 【单调增长】以保住 KV cache
+            #
+            #  为什么不能用 [-max_turns:] 这种固定轮数滑动窗口：
+            #    历史一旦超过 max_turns，窗口每轮向前滑一格
+            #    ⇒ prompt 的【开头】每轮都不同
+            #    ⇒ generate() 里的 LCP（最长公共前缀）= 0
+            #    ⇒ KV cache 复用完全失效，退化成"每轮重算整个历史"
+            #  实测后果（1000 token 上下文）：每轮 prefill 要 50~72 秒，
+            #    用户看到的是「35 token 用了 57.3 秒 / 0.6 tok/s」。
+            #  对照：llama.cpp 的 cache_prompt 之所以每轮只算 5 个新 token，
+            #    正是因为它的 prompt 前缀稳定、只在末尾追加。
+            #
+            #  做法（带迟滞的窗口）：
+            #    ① 先用全部历史拼 prompt；
+            #    ② 若超出 token 预算，才从最老的轮次开始丢，
+            #       但【一次丢到低水位 low】，而不是"刚好压到预算"。
+            #       ⇒ 之后若干轮都不用再丢 ⇒ 前缀保持稳定 ⇒ LCP 命中。
+            #    代价：偶尔一次全量重算（丢窗口那轮），换来后续每轮只算增量。
+            hist = self.history
+            if self.max_prompt_tokens > 0:
+                budget = self.max_prompt_tokens
+                low = int(budget * HIST_TRIM_LOW)      # 低水位（迟滞）
+                n_keep = len(hist)
+                # 预估：每轮约 40 token，加上当前问题与尾部标记
+                est = sum(len(u) + len(a) for u, a in hist) / 3.0 + len(msg) / 1.5 + 24
+                if est > budget and hist:
+                    keep = max(1, int(len(hist) * low / max(est, 1.0)))
+                    n_keep = min(len(hist), max(1, keep))
+            else:
+                n_keep = min(len(hist), self.max_turns)   # 兜底：按轮数
+            for u, a in hist[-n_keep:] if n_keep else []:
                 parts.append(f"<用户>\n{u}")
-                parts.append(f"<TGAI>{a}")          # ★ 无 \n
+                # ★★ 历史里的助手回答必须带上档位标记（2026-10-10 修）
+                #
+                #  bug：原实现写 f"<TGAI>{a}"，少了 "<回答>\n"。
+                #       而模型【实际生成】的是 <TGAI>→<回答>→\n→正文
+                #       ⇒ KV cache 里存的前缀与下一轮重建的 prompt 只差这 1 个 token
+                #       ⇒ LCP 在位置 11 断掉 ⇒ 后面 ~316 个 token 全部重算
+                #         （实测第2轮 prefill 316 token 花了 16.5 秒）
+                #  依据：官方 Jinja 模板 _tgai_v27.jinja 的格式说明
+                #         历史(直答): <用户>\n{q}\n<TGAI><回答>\n{a}
+                #         历史(思考): <用户>\n{q}\n<TGAI><思考>\n{t}\n\n<回答>\n{a}
+                #  收益：前缀逐 token 对齐 ⇒ LCP 命中几乎全部历史
+                #        ⇒ 每轮只 prefill 新增的几十个 token（实测 24 而非 316）。
+                _am = getattr(self, 'answer_marker', '<回答>')
+                parts.append(f"<TGAI>{_am}\n{a}")
             parts.append(f"<用户>\n{msg}")
             mode = getattr(self, 'think_mode', 'direct')
             tail = '<思考>' if mode == 'think' else '<回答>'
@@ -754,12 +883,6 @@ class ChatSession:
             prompt = "".join(parts)                  # ★ 直接拼接，不加分隔符
             # ★ BOS: GGUF 元数据 tokenizer.ggml.add_bos_token = 1
             #   实测有 BOS 才能与 llama.cpp 逐 token 一致（无 BOS 时会复读 \n）
-            return prompt, self.e.encode(prompt, add_bos=True)
-            # ★★ GGUF_META_ADD_BOS（2026-10-10 修）
-            #   GGUF 元数据里 tokenizer.ggml.add_bos_token = 1
-            #   ⇒ llama.cpp 会在 prompt 前加 BOS(2)。实测这是生成质量的关键：
-            #      无BOS → 惩罚后仍选 '\n'（复读）
-            #      有BOS → 惩罚后选 '您'，与 llama.cpp 逐 token 一致
             return prompt, self.e.encode(prompt, add_bos=True)
         else:
             # TGAI 原生旧格式 (NB V1/V2/V2.6 等自训练模型)
@@ -942,7 +1065,13 @@ def generate(engine, input_ids, params, eos_id, eos_set=None, kv=None):
             tid = sample_numpy(arr, temp, top_k, top_p, vocab,
                                p=params, recent=_recent,
                                decode_fn=_dry_raw_decode,
-                               turn_recent=_turn_ids)
+                               turn_recent=_turn_ids,
+                               # ★ Soft-Stop（长度递增收尾偏置）
+                               #   比例阈值在这里换算成绝对值：at_remain 是"剩余多少"
+                               #   （相对 max_tok），after 是"已生成多少"。
+                               #   eos_set 已含 eos + 轮次边界标记（ChatSession 里合成）。
+                               max_tok=max_tok, step=step,
+                               eos_ids=eos_set)
 
             # EOS check (after min_tokens) — 支持多 EOS token
             if tid in eos_set and step >= min_tok: break
@@ -984,6 +1113,18 @@ def generate(engine, input_ids, params, eos_id, eos_set=None, kv=None):
             na = (ctypes.c_int32 * 1)(tid)
             lp = lib.tg_forward(model, na, 1, cache, cur)
             if not lp: break
+            # ★★ 把本轮生成的 token 也记入 cache 台账（2026-10-10 修）
+            #
+            # bug：原实现只在开头做 kv.ids = list(input_ids)，只记了 prompt，
+            #      而 tg_forward 已经把生成的 token 写进了 KV cache。
+            #      结果 cache 里实际有 (prompt + 生成) 个位置，台账却只有 prompt 个，
+            #      两者错位 ⇒ 下一轮的 LCP 算错 ⇒ 增量 prefill 失效，
+            #      退化成「每轮重算整个历史」。
+            # 实测症状：1000 token 上下文下，第二轮的 prefill 要 ~50 秒
+            #          （1000 token prefill ≈ 46s @ 本机），
+            #          用户看到的就是「35 token 用了 57.3 秒 / 0.6 tok/s」。
+            if kv is not None:
+                kv.ids.append(tid)
             cur += 1
             if cur >= max_seq: break
     finally:

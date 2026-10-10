@@ -67,10 +67,10 @@ def ui_user(text):
     """用户消息（无气泡，前缀字形区分）
 
     ★ 这里【只打印一次】：输入框本身已经把用户输入回显过了，
-      若再打一遍就会出现"❯ You 你好"连续两条的重复观感
+      若再打一遍就会出现"> You 你好"连续两条的重复观感
       （实测踩坑：以前输入框只有裸 input()，回显在框内不算重复）。
     """
-    print('%s%s%s %s%s❯ You%s  %s' % (U.LINE, U.V, U.RST, U.USER, U.BLD, U.RST, text))
+    print('%s%s%s %s%s> You%s  %s' % (U.LINE, U.V, U.RST, U.USER, U.BLD, U.RST, text))
 
 
 def ui_ai_start():

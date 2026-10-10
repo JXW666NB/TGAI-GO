@@ -386,7 +386,7 @@ def md_print(text, width=76, indent='', prefix=''):
 #
 #  视觉（参考小狸 CLI）：
 #      ╭──────────────────────────────────────────────╮
-#      │ ❯ 输入消息 … （/help 命令 · /params 调参）    │
+#      │ > 输入消息 … （/help 命令 · /params 调参）    │
 #      ╰──────────────────────────────────────────────╯
 #      就绪 │ v27_merged_bf16.TG · 8K · 4线程 │ /exit 退出
 #
@@ -398,37 +398,61 @@ INBOX = _c(110)      # 输入框边线（蓝）
 INBOX_BG = _c(236)   # 状态栏底色
 
 
+def _input_fallback(prompt_text='> '):
+    """非 TTY（管道 / 重定向）时的保底输入：不画框、不做光标定位"""
+    try:
+        _sys.stdout.write(prompt_text)
+        _sys.stdout.flush()
+        return _sys.stdin.readline().rstrip('\r\n')
+    except (EOFError, KeyboardInterrupt):
+        raise
+
+
 def input_box(width=None, hint='输入消息 …', extra=''):
     """画出底部输入框，把光标停在框内，返回用户输入
+
+    ★ 光标定位方式（2026-10-10 定版，踩坑记录）：
+      方案：画完 3 行框 → 光标停在底边行 → 用 ANSI 回到中间行、右移到框内
+            （\\033[A 上移一行，\\r 回行首，\\033[<col>C 右移 col 列）。
+      ★ 只用 ASCII '>' 不用 '>'：cmd 对 U+276F 这类"宽窄有歧义"字符
+        按 2 列渲染，而 dw() 按 1 列算 ⇒ 光标偏左（实测偏约 11 列）。
+        改用 ASCII 后，col 的计算只依赖确定宽度的字符 ⇒ 各终端都对齐。
+      ★ 非 TTY（管道/重定向）时退化为朴素输入，不画框、不做光标定位
+        —— 此时 input(prompt) 的提示串不会被消耗，会把界面刷乱。
 
     宽屏适配：框宽跟随终端，顶到边。
     """
     W = width or term_width() - 2
     inner = max(20, W - 4)
 
-    def line_border(l, m, r, label=''):
+    if not (_sys.stdin.isatty() and _sys.stdout.isatty()):
+        return _input_fallback()
+
+    tip = '%s>%s %s%s%s' % (USER + BLD, RST + INBOX, META, hint, RST + INBOX)
+    tail = ('  %s%s%s' % (META, extra, RST + INBOX)) if extra else ''
+    pad = max(0, inner - dw(tip) - dw(tail))
+
+    def border(l, m, r, label=''):
         lab = (' %s%s%s ' % (META, label, RST + INBOX)) if label else ''
         n = max(0, W - 2 - dw(lab))
         print('%s%s%s%s%s%s%s' % (INBOX, l, H, lab, H * n, r, RST))
 
-    line_border(TL, H, TR)
-    tip = '%s%s❯%s %s%s%s' % (USER, BLD, RST + INBOX, META, hint, RST + INBOX)
-    tail = ('  %s%s%s' % (META, extra, RST + INBOX)) if extra else ''
-    pad = max(0, inner - dw(tip) - dw(tail))
+    border(TL, H, TR)
     print('%s%s%s %s%s%s %s%s' % (INBOX, V, RST, tip, ' ' * pad, tail, INBOX, V + RST))
-    line_border(BL, H, BR)
-    # 此时光标在底边下一行行首；回到中间行、并移到框内（边框1+空格1+提示后1）
-    col = dw(tip) + 3
+    border(BL, H, BR)
+
+    # 光标现在在底边下一行行首；上移一行、回行首、右移到框内
+    # 框内起点 = 边框(1) + 空格(1) + 提示宽度 + 提示后空格(1)
+    col = 3 + dw(tip)
     _sys.stdout.write('\033[A\r\033[%dC' % col)
     _sys.stdout.flush()
     try:
         s = input()
     finally:
-        # input() 回车后光标已在新行；向上擦掉该行并回到原位
-        # （不动上面的框：TUI 是滚动式输出，框保留在历史里是正常的）
+        # 回车后光标在新行；擦掉该行（框保留在历史里，滚动式输出）
         _sys.stdout.write('\033[A\r\033[K')
         _sys.stdout.flush()
-    return s
+    return s.strip()
 
 
 def status_bar(width=None, left='就绪', mid='', right=''):
@@ -483,7 +507,13 @@ class MdStream:
 
     # ── 实时区 ──
     def _clear_live(self):
-        """回退到实时区起始处（用于落定时擦掉重绘）"""
+        """回退到实时区起始处（用于落定时擦掉重绘）
+
+        ★ 必须先 flush：_draw_live 是增量 append 且不带换行，
+          若输出缓冲里还有未刷出的字符就发 \\033[A / \\033[K，
+          终端会先处理控制序列、再打印缓冲内容 ⇒ 擦错行。
+        """
+        _sys.stdout.flush()
         if self._live_n > 0:
             self.sys_write('\r\033[K')
             for _ in range(self._live_n - 1):

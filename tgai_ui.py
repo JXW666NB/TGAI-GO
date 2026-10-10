@@ -28,6 +28,7 @@
 """
 import re
 import shutil
+import sys as _sys
 
 # ── 配色（ANSI 256 色，Win10+ 现代终端普遍支持）─────────────────
 _E = '\033['
@@ -384,27 +385,91 @@ def md_print(text, width=76, indent='', prefix=''):
 #        这样既保留了"逐行出现"的流式感，又不会把标记拆坏。
 # ══════════════════════════════════════════════════════════════
 class MdStream:
-    """流式 Markdown 输出器：feed(增量) → 已（染色）输出若干行"""
+    """流式 Markdown 输出器
 
-    def __init__(self, width=76, prefix='', indent=''):
+    ★ 核心权衡（用户要求"我流式输出呢"）：
+      纯逐 token 打印会把 **粗体** 拆断、代码围栏半截就铺底色；
+      而只在整行完成时才打印，又失去了流式感（长行要等很久）。
+      折中方案 = "实时吐字 + 行完成时回退重绘"：
+        · 未完成的行：以 [实时区] 的形式立即画出（每来一个 token 就重画该行）
+        · 收到 \\n：用 \\r + ESC[K 回到行首擦掉，改画成【渲染后的 Markdown】再换行
+      ⇒ 有打字机的实时感，最终又落到正确的 Markdown 排版。
+
+    · 连续空行会被压缩（模型常吐 \\n\\n，不压缩会在流式时刷出一堆空行）
+    · 代码围栏内的行不做重绘（本来就该原样输出）
+    """
+
+    def __init__(self, width=76, prefix='', indent='', live=True):
         self.width = width
         self.prefix = prefix
         self.indent = indent
+        self.live = live
         self.buf = ''
         self.infence = False
+        self._live_n = 0        # 实时区已占用的行数（用于回退）
+        self._last_blank = False
 
+    # ── 实时区 ──
+    def _clear_live(self):
+        if self._live_n > 0:
+            self.sys_write('\r\033[K')
+            for _ in range(self._live_n - 1):
+                self.sys_write('\033[A\r\033[K')
+            self._live_n = 0
+
+    def sys_write(self, s):
+        _sys.stdout.write(s)
+        _sys.stdout.flush()
+
+    def _draw_live(self):
+        """把当前未完成的行以纯文本形式实时画出
+
+        ★ 折行宽度要用 avail = width - dw(prefix)：
+          踩坑：曾直接用 self.width 折行，但实际画出来的是 prefix + 文本，
+          可用列数少了 prefix 的宽度 ⇒ 文本提前折行，
+          观感上出现"会写代 / 码、会"这种莫名断行。
+        """
+        if not self.live or self.infence or not self.buf:
+            return
+        self._clear_live()
+        avail = max(16, self.width - dw(self.prefix))
+        segs = wrap(self.buf, avail) or ['']
+        for i, s in enumerate(segs):
+            self.sys_write('%s%s%s' % (self.prefix if i == 0 else ' ' * dw(self.prefix),
+                                       s, '\n' if i < len(segs) - 1 else ''))
+        self._live_n = len(segs)
+
+    # ── 对外接口 ──
     def feed(self, chunk):
-        """喂入一段文本，输出其中已完整的行；返回本次输出的行数"""
-        self.buf += chunk
-        n = 0
-        while '\n' in self.buf:
-            line, self.buf = self.buf.split('\n', 1)
-            n += self._emit(line)
-        return n
+        """喂入一段文本；立即实时显示，遇到换行则落定该行"""
+        for ch in chunk:
+            if ch == '\n':
+                self._finalize_line()
+            else:
+                self.buf += ch
+        if '\n' not in chunk:
+            self._draw_live()
 
-    def _emit(self, line):
-        """输出一整行（line 不含 \\n）"""
+    def _finalize_line(self):
+        """当前缓冲区构成一整行 ⇒ 擦掉实时区，按 Markdown 正式输出"""
+        line, self.buf = self.buf, ''
+        self._clear_live()
         s = line.rstrip()
+        blank = (s == '')
+        if blank and self._last_blank:
+            return                       # 连续空行压缩
+        self._last_blank = blank
+        self._emit(s)
+
+    def flush(self):
+        """收尾：把最后一行（无 \\n 结尾）落定"""
+        self._clear_live()
+        if self.buf:
+            line, self.buf = self.buf, ''
+            self._emit(line.rstrip())
+
+    def _emit(self, s):
+        """输出一整行（s 不含 \\n）"""
         if _FENCE_RE.match(s):
             self.infence = not self.infence
             lang = s.lstrip()[3:].strip() if self.infence else ''
@@ -417,27 +482,14 @@ class MdStream:
             else:
                 print('%s%s╰%s%s' % (self.prefix, LINE,
                                      H * max(0, avail - 1), RST), flush=True)
-            return 1
+            return
         if self.infence:
             avail = max(16, self.width - dw(self.indent))
-            k = 0
             for seg in (wrap(s, avail - 4) or ['']):
                 pad = max(0, avail - 4 - dw(seg))
                 print('%s%s│%s %s%s%s ' % (self.prefix, LINE, RST,
                                            _c(252) + _c(238),
                                            seg + ' ' * pad, RST), flush=True)
-                k += 1
-            return k
-        k = 0
+            return
         for l in md_render(s, self.width, self.indent):
             print('%s%s' % (self.prefix, l), flush=True)
-            k += 1
-        return k
-
-    def flush(self):
-        """收尾：输出缓冲区里最后一行（无 \\n 结尾的部分）"""
-        if self.buf:
-            k = self._emit(self.buf)
-            self.buf = ''
-            return k
-        return 0

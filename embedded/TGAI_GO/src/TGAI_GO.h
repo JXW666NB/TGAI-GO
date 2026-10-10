@@ -47,6 +47,12 @@
   #endif
 #endif
 
+/* SD card support (ESP32 only) */
+#ifdef ESP32
+  #include <SD.h>
+  #include <SD_MMC.h>
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -90,11 +96,59 @@ extern "C" {
 #define TG_EMBED_MAX_GENERATE_TOKENS 512
 
 /**
+ * @brief SD card configuration for loading models from external storage.
+ *
+ * Supported modes:
+ *   - SPI mode (default): uses cs_pin + optional custom sck/miso/mosi
+ *   - SD_MMC mode:      uses ESP32's built-in SDMMC host controller (fixed pins)
+ *
+ * Pin defaults (SPI mode, compatible with most SD card modules):
+ *   cs   = GPIO5
+ *   sck  = GPIO18 (VSPI default)
+ *   miso = GPIO19 (VSPI default)
+ *   mosi = GPIO23 (VSPI default)
+ *
+ * Usage:
+ * @code
+ *   // SPI mode with defaults
+ *   TGAISDConfig sd = TGAI_SD_SPI(5);
+ *   ai.begin("/TGAI_NB.TG", &sd);
+ *
+ *   // SD_MMC 4-bit mode (faster, uses fixed pins)
+ *   TGAISDConfig sd = TGAI_SD_MMC();
+ *   ai.begin("/TGAI_NB.TG", &sd);
+ *
+ *   // Auto-fallback: try LittleFS first, then SD
+ *   ai.begin("/TGAI_NB.TG");  // unchanged old API
+ * @endcode
+ */
+typedef struct {
+    int  cs_pin;        ///< Chip select pin (SPI mode only, ignored for SD_MMC)
+    int  sck_pin;       ///< SCK pin (SPI mode only, default 18)
+    int  miso_pin;      ///< MISO pin (SPI mode only, default 19)
+    int  mosi_pin;      ///< MOSI pin (SPI mode only, default 23)
+    bool use_sdmmc;     ///< true = SD_MMC 4-bit mode, false = SPI mode
+    int  freq_khz;      ///< SPI clock frequency in kHz (default 4000, max 20000)
+    bool sd_premounted; ///< true = SD already initialized by other library, don't touch SPI/SD.begin
+} TGAISDConfig;
+
+/** @brief Create SD config for SPI mode with just a CS pin. */
+#ifdef ESP32
+#define TGAI_SD_SPI(cs)       { (cs), 18, 19, 23, false, 4000, false }
+#define TGAI_SD_SPI_FULL(cs, sck, miso, mosi) { (cs), (sck), (miso), (mosi), false, 4000, false }
+#define TGAI_SD_MMC()         { -1, -1, -1, -1, true, 0, false }
+/** @brief SD card already initialized by other library (e.g. MP3 player, file reader).
+ *         TGAI GO will NOT call SD.begin/SPI.begin — just open files from the existing mount. */
+#define TGAI_SD_EXTERNAL()    { -1, -1, -1, -1, false, 0, true }
+#else
+#define TGAI_SD_SPI(cs)       { (cs), -1, -1, -1, false, 0, false }
+#define TGAI_SD_SPI_FULL(cs, sck, miso, mosi) { (cs), (sck), (miso), (mosi), false, 0, false }
+#define TGAI_SD_MMC()         { -1, -1, -1, -1, true, 0, false }
+#define TGAI_SD_EXTERNAL()    { -1, -1, -1, -1, false, 0, true }
+#endif
+
+/**
  * @brief Callback type for streaming token output.
- *
- * Called each time a new token is generated (as a UTF-8 C string).
- * Must be non-blocking and fast.
- *
  * @param token Null-terminated UTF-8 string of the generated token.
  */
 typedef void (*TGOutputCallback)(const char* token);
@@ -147,6 +201,30 @@ public:
      * @return true if initialization succeeded, false otherwise.
      */
     bool begin(const char* tg_path);
+
+    /**
+     * @brief Initialize model from SD card (SPI or SD_MMC mode).
+     *
+     * Automatically mounts the SD card using the provided pin configuration,
+     * then loads the .TG model file. Falls back to trying LittleFS if
+     * SD mount fails.
+     *
+     * @param tg_path  Path to the .TG file (e.g. "/TGAI_NB.TG").
+     * @param sd       SD card pin configuration. Use TGAI_SD_SPI(cs),
+     *                 TGAI_SD_SPI_FULL(cs,sck,miso,mosi), or TGAI_SD_MMC().
+     * @return true if model loaded successfully from any filesystem.
+     *
+     * @code
+     *   // SD card in SPI mode on GPIO5 (CS)
+     *   TGAISDConfig sd = TGAI_SD_SPI(5);
+     *   ai.begin("/TGAI_NB.TG", &sd);
+     *
+     *   // SD_MMC 4-bit mode (faster, uses fixed pins GPIO2/4/12/13/14/15)
+     *   TGAISDConfig sd = TGAI_SD_MMC();
+     *   ai.begin("/TGAI_NB.TG", &sd);
+     * @endcode
+     */
+    bool begin(const char* tg_path, const TGAISDConfig* sd);
 
     /**
      * @brief Tokenize text into token IDs using the model's BPE tokenizer.
@@ -288,6 +366,52 @@ public:
      */
     const char* getLastError() const;
 
+
+    /**
+     * @brief 多轮对话（自动拼 V2.7 九标记 prompt + 带历史）
+     *
+     * 与单轮 generate() 的区别：
+     *   1. 按 .TG 的对话配置（或 V2.7 默认）拼接 prompt：
+     *        <用户>\n{问题}\n<TGAI><回答>\n
+     *      而不是把裸文本丢给分词器
+     *   2. 自动保留最近 N 轮历史，模型能"记住"前文
+     *   3. 生成到轮次边界标记（<用户>/<TGAI>/...）立即停止
+     *      —— 这是必须的：TGAI 语料把多轮连续拼接，不拦就会一直续写
+     *
+     * @param user_msg 用户这一轮说的话（UTF-8）
+     * @param callback 每个生成 token 回调
+     * @param max_tokens 最多生成多少 token
+     * @param temp / top_k 采样参数
+     * @return 生成 token 数，负数表示错误
+     *
+     * @code
+     *   ai.chat("我叫小明", [](const char* t){ Serial.print(t); });
+     *   ai.chat("我叫什么？", [](const char* t){ Serial.print(t); });  // 能记住
+     * @endcode
+     */
+    int chat(const char* user_msg, TGOutputCallback callback,
+             int max_tokens = 128, float temp = 0.6f, int top_k = 40);
+
+    /**
+     * @brief 清空多轮对话历史（KV cache 一并重置）
+     */
+    void clearHistory();
+
+    /**
+     * @brief 当前对话历史轮数
+     */
+    int getHistoryTurns() const;
+
+    /**
+     * @brief 模型是否带 V2.7 九标记（决定用九标记还是旧格式）
+     */
+    bool hasV27Markers() const { return _has_v27; }
+
+    /**
+     * @brief 模型的渲染模式名（"markers" / "chatml" / "plain"）
+     */
+    const char* getRenderMode() const { return _render_mode; }
+
 private:
     /* ─── Internal state ──────────────────────────── */
     TGModel*     _model;          /* C engine model handle */
@@ -302,9 +426,64 @@ private:
     int          _eos_id;         /* cached EOS token id */
     int          _bos_id;         /* cached BOS token id */
 
+    /* ─── 对话格式（2026-10-10 加，与桌面引擎对齐）─────
+     * 特殊标记表用【固定数组 + 指向词表的指针】：
+     *   - 不复制字符串 ⇒ 零额外 RAM
+     *   - ESP32 上 sizeof(TGAI_GO) 只增约 200 字节
+     */
+    #define TGAI_MAX_MARKS 10
+    const char*  _marks[TGAI_MAX_MARKS];  /* 指向词表内的标记字符串 */
+    int          _n_marks;                /* 识别到几个标记 */
+    int          _mark_ids[TGAI_MAX_MARKS]; /* 对应 token id（-1=无）*/
+    bool         _has_v27;                /* 九标记齐全？ */
+    char         _render_mode[12];        /* "markers"/"chatml"/"plain" */
+    bool         _stop_on_marks;          /* 生成到边界标记即停 */
+    int          _turn_eog_ids[6];        /* 轮次边界标记 id（-1=无）*/
+    int          _n_turn_eog;
+
+    /* ─── prompt 缓冲上限（拼好的完整 prompt，含历史）──
+     * 为什么固定而不是动态：嵌入式避免堆碎片。
+     * 1024 字节 ≈ 300+ 汉字问题（含 6 轮历史），够日常用；
+     * 不够时 _build_chat_prompt 会返回 -1 并报错（不会越界）。*/
+    #ifndef TGAI_PROMPT_CAP
+    #define TGAI_PROMPT_CAP 1024
+    #endif
+
+    /* ─── 多轮历史（固定缓冲，可配 TGAI_HISTORY_BYTES）── */
+    #ifndef TGAI_HISTORY_BYTES
+    #define TGAI_HISTORY_BYTES 2048
+    #endif
+    char         _hist[TGAI_HISTORY_BYTES]; /* 已拼好的历史 prompt 片段 */
+    int          _hist_len;                 /* 当前占用字节数 */
+    int          _hist_turns;               /* 历史轮数 */
+    #ifndef TGAI_MAX_TURNS
+    #define TGAI_MAX_TURNS 6
+    #endif
+    int          _hist_off[TGAI_MAX_TURNS]; /* 每轮起始偏移（环形）*/
+
+    /* ─── 上一轮回答（generate 时顺手收集，chat() 拿它写历史）──
+     * 为什么需要：generate() 是【回调式】的，调用方自己拼字符串；
+     *   chat() 要记历史就必须自己留一份。
+     * 512 字节 ≈ 170 汉字，超出则截断（历史只用于"记住大意"）。*/
+    #ifndef TGAI_ANSWER_CAP
+    #define TGAI_ANSWER_CAP 512
+    #endif
+    char         _last_answer[TGAI_ANSWER_CAP];
+    int          _last_answer_len;
+
+    /* ─── 内部方法（对话格式）─────────────────────── */
+    void _detect_marks();
+    int  _build_chat_prompt(const char* user_msg, char* out, int out_cap);
+
+
     /* ─── Internal file data holder (LittleFS/SPIFFS) ── */
     uint8_t*     _file_data;      /* heap copy of file data */
     bool         _file_loaded;    /* true if file loaded into _file_data */
+
+    /* ─── SD card state ──────────────────────────── */
+    bool         _sd_mounted;     /* true if SD was mounted by us */
+    bool         _sd_is_mmc;      /* true if using SD_MMC, false if SPI */
+    int          _sd_cs_pin;      /* remembered for cleanup */
 
     /* ─── Model scanning ──────────────────────────── */
     char         _model_names[8][64]; /* scanned model filenames (max 8) */
@@ -314,6 +493,8 @@ private:
     /* ─── Internal methods ────────────────────────── */
     bool _init_model();
     bool _load_from_file(const char* path);
+    bool _load_from_sd(const char* path, const TGAISDConfig* sd);
+    void _unmount_sd();
     void _free_resources();
     int  _sample_token(const float* logits, int vocab_size, float temp, int top_k);
     void _set_error(const char* msg);

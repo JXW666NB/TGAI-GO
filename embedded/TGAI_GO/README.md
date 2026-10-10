@@ -11,6 +11,7 @@ TGAI GO 是一个轻量级的大语言模型（LLM）推理引擎，专为 ESP32
 - **BPE Tokenizer** 内置，支持中英文分词
 - **流式输出**，每生成一个 token 立即通过串口/回调输出
 - **模型格式 .TG**，统一打包权重 + tokenizer + 配置
+- **⭐ 新增: SD 卡加载**，外接 SD 卡读取模型，突破 Flash 存储限制
 
 ## 硬件要求
 
@@ -132,6 +133,64 @@ python tools/tgai_convert.py --input model.pt --output model.TG --dtype fp16
 2. 将 `model.TG` 放入 `data/` 文件夹
 3. 安装 [ESP32 LittleFS Uploader](https://github.com/lorol/arduino-esp32fs-plugin) 插件
 4. 菜单：`工具 → ESP32 Sketch Data Upload`
+
+#### 方式三：SD 卡加载（⭐ 新功能）
+
+当 ESP32 内部 Flash 不够用时，外接 SD 卡读取模型。SD 卡格式 FAT32，.TG 文件直接复制到根目录。
+
+**SPI 模式（最常用，兼容性最好）**
+
+接线：
+
+| SD 模块 | ESP32 |
+|---------|-------|
+| CS      | GPIO5 |
+| SCK     | GPIO18 |
+| MISO    | GPIO19 |
+| MOSI    | GPIO23 |
+| VCC     | 5V 或 3.3V |
+| GND     | GND |
+
+```cpp
+#include <TGAI_GO.h>
+TGAI_GO ai;
+
+void setup() {
+    Serial.begin(115200);
+    TGAISDConfig sd = TGAI_SD_SPI(5);  // CS on GPIO5
+    sd.freq_khz = 4000;  // 4 MHz（稳妥，可尝试 10000）
+    ai.begin("/model.TG", &sd);
+}
+```
+
+自定义引脚（非标准接线）：
+
+```cpp
+TGAISDConfig sd = TGAI_SD_SPI_FULL(10, 14, 12, 13);
+// 对应: CS=10, SCK=14, MISO=12, MOSI=13
+```
+
+**SD_MMC 4-bit 模式（更快，需开发板自带卡槽）**
+
+ESP32-S3 DevKit 等带 TF 卡槽的开发板，直接 4-bit 通信，速度更快：
+
+```cpp
+TGAISDConfig sd = TGAI_SD_MMC();
+sd.freq_khz = 20000;  // 20 MHz
+ai.begin("/model.TG", &sd);
+```
+
+> SD_MMC 使用固定引脚（GPIO 2/4/12/13/14/15），不可自定义。
+
+**自动回退**
+
+SD 卡没插或挂载失败时，自动回退到 LittleFS 尝试加载：
+
+```cpp
+ai.begin("/model.TG", &sd);  // SD 失败 → 自动尝试 LittleFS
+```
+
+> ⚠️ SD 卡只解决存储问题。模型加载后仍占用 PSRAM（ESP32 最多 8MB），模型大小受 PSRAM 限制，不受 SD 卡限制。
 
 ## 示例接线（TFT 显示器）
 

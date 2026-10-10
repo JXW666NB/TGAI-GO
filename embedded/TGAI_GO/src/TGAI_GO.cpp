@@ -312,8 +312,30 @@ static float* embed_get_cached_weight(TGEmbedModel* m, const TGWeightEntry* e) {
     return m->cached_weights[idx];
 }
 
-/* ─── Scalar dot product (no SIMD on embedded) ──── */
-static inline float embed_dot(const float* a, const float* b, int n) {
+/* ══════════════════════════════════════════════════════════════════
+ *  Dot product —— 可选 SIMD 加速（2026-10-10 加，D：嵌入式 MoE 优化）
+ *
+ *  背景：原实现是纯标量 + 4 路手工展开。ESP32-S3 有 128-bit SIMD（PIE），
+ *        官方 esp-dsp 的 dsps_dotprod_f32 可做到 ~4× 吞吐。
+ *
+ *  ★ 设计为 opt-in（默认零风险）：
+ *      定义 TG_USE_ESP_DSP=1 且装了 esp-dsp 组件 ⇒ 用 SIMD
+ *      否则                                       ⇒ 用原标量（行为与之前完全一致）
+ *    这样"没装库"或"板子不是 S3"都不会编译失败或行为改变。
+ *
+ *  启用方式：
+ *      Arduino IDE：装 esp-dsp 库 + 编译选项加 -DTG_USE_ESP_DSP=1
+ *      PlatformIO ：lib_deps = esp-dsp，build_flags = -DTG_USE_ESP_DSP=1
+ *
+ *  ⚠️ 未在真实硬件验证 —— 首次上机请按 docs 里的 A/B 步骤实测。
+ * ══════════════════════════════════════════════════════════════════ */
+
+#ifndef TG_USE_ESP_DSP
+#define TG_USE_ESP_DSP 0        /* 默认关闭：保持与改动前完全一致的行为 */
+#endif
+
+/* ─── 标量实现（原版逐字保留；作为默认路径与 SIMD 的对照基准）─── */
+static inline float embed_dot_scalar(const float* a, const float* b, int n) {
     float s0 = 0, s1 = 0, s2 = 0, s3 = 0;
     int i = 0;
     int n4 = n & ~3;
@@ -327,6 +349,25 @@ static inline float embed_dot(const float* a, const float* b, int n) {
     for (; i < n; i++) s += a[i] * b[i];
     return s;
 }
+
+#if TG_USE_ESP_DSP
+    #include "esp_dsp.h"
+    /* 尾部（n % 4）用标量补齐：dsps_dotprod_f32 对非 4 倍数长度的行为
+     * 在不同 IDF 版本间可能有差异，自己控制更稳。 */
+    static inline float embed_dot(const float* a, const float* b, int n) {
+        float acc = 0.0f;
+        int n4 = n & ~3;
+        if (n4 > 0) dsps_dotprod_f32(a, b, n4, &acc);
+        for (int i = n4; i < n; i++) acc += a[i] * b[i];
+        return acc;
+    }
+    #define TG_EMBED_DOT_KIND "SIMD(esp-dsp)"
+#else
+    static inline float embed_dot(const float* a, const float* b, int n) {
+        return embed_dot_scalar(a, b, n);
+    }
+    #define TG_EMBED_DOT_KIND "scalar"
+#endif
 
 /* ─── Matrix multiply (embedded scalar) ──────────── */
 static void embed_matmul(float* out, const float* x, const float* w,
@@ -1187,7 +1228,10 @@ TGAI_GO::TGAI_GO()
     : _model(NULL), _cache(NULL), _ready(false), _model_size(0),
       _max_seq_len(0), _vocab_size(0), _d_model(0),
       _eos_id(0), _bos_id(0),
+    _n_marks(0), _has_v27(false), _stop_on_marks(false), _n_turn_eog(0),
+    _hist_len(0), _hist_turns(0), _last_answer_len(0),
       _file_data(NULL), _file_loaded(false),
+      _sd_mounted(false), _sd_is_mmc(false), _sd_cs_pin(-1),
       _model_count(0)
 {
     memset(_last_error, 0, sizeof(_last_error));
@@ -1195,6 +1239,20 @@ TGAI_GO::TGAI_GO()
     memset(_loaded_model_name, 0, sizeof(_loaded_model_name));
     memset(_model_names, 0, sizeof(_model_names));
     _model_count = 0;
+
+    /* ── 对话格式相关字段的默认值（v1.1.0）──
+     * 为什么必须在这里给：模型未加载时调用方也会查 getRenderMode()，
+     * 返回空串不好判断；给 "plain" 表示"还没有模型，按纯文本处理" */
+    strcpy(_render_mode, "plain");
+    _n_marks = 0;
+    _has_v27 = false;
+    _stop_on_marks = false;
+    _n_turn_eog = 0;
+    _hist_len = 0;
+    _hist_turns = 0;
+    memset(_hist, 0, sizeof(_hist));
+    _last_answer[0] = 0;
+    _last_answer_len = 0;
 }
 
 TGAI_GO::~TGAI_GO() {
@@ -1265,6 +1323,7 @@ bool TGAI_GO::begin(const uint8_t* model_data, size_t model_size) {
     Serial.printf("[TGAI] KV=%u B  model=%u B\n", (unsigned)kv_total, (unsigned)model_size);
 #ifdef TG_EMBED_ESP32
     Serial.printf("[TGAI] PSRAM init=%d free=%u\n",
+    Serial.printf("[TGAI] dot kernel: %s\n", TG_EMBED_DOT_KIND);
         (int)esp_spiram_is_initialized(), (unsigned)ESP.getFreePsram());
 #endif
 
@@ -1305,6 +1364,7 @@ bool TGAI_GO::begin(const uint8_t* model_data, size_t model_size) {
     _eos_id      = (int)m->header.eos_token_id;
     _bos_id      = (int)m->header.bos_token_id;
     _ready       = true;
+    _detect_marks();   /* 识别对话标记（决定用九标记还是旧格式）*/
     _file_loaded = false;
     _file_data   = NULL;
     strncpy(_loaded_model_name, "(built-in)", sizeof(_loaded_model_name) - 1);
@@ -1449,12 +1509,248 @@ bool TGAI_GO::begin(const char* tg_path) {
     _eos_id      = (int)m->header.eos_token_id;
     _bos_id      = (int)m->header.bos_token_id;
     _ready       = true;
+    _detect_marks();   /* 识别对话标记（决定用九标记还是旧格式）*/
     _file_loaded = true;
     _file_data   = data;
     strncpy(_loaded_model_name, tg_path, sizeof(_loaded_model_name) - 1);
     _loaded_model_name[sizeof(_loaded_model_name) - 1] = '\0';
 
     return true;
+}
+
+/* ─── begin from SD card (SPI or SD_MMC) ────────── */
+bool TGAI_GO::_load_from_sd(const char* tg_path, const TGAISDConfig* sd) {
+#ifdef ESP32
+    if (!tg_path || !sd) return false;
+
+    /* Store premounted state */
+    _sd_is_mmc = sd->use_sdmmc;
+    bool was_premounted = sd->sd_premounted;
+
+    if (sd->sd_premounted) {
+        /* SD was already initialized by other code (e.g. MP3 player).
+         * Don't claim ownership — we won't call SD.end() on cleanup. */
+        _sd_is_mmc = false;
+        _sd_mounted = true;  /* mark as "active" for file ops, but not "ours" */
+        mount_ok = true;
+        _sd_cs_pin = -2;     /* marker: external mount, don't unmount */
+        Serial.println("[TGAI] SD already mounted by external code");
+
+    } else if (sd->use_sdmmc) {
+        /* SD_MMC 4-bit mode — uses fixed pins (2,4,12,13,14,15 on most boards) */
+        if (sd->freq_khz > 0) {
+            mount_ok = SD_MMC.setPins(sd->sck_pin > 0 ? sd->sck_pin : -1,
+                                      sd->miso_pin > 0 ? sd->miso_pin : -1,
+                                      sd->mosi_pin > 0 ? sd->mosi_pin : -1,
+                                      sd->cs_pin > 0 ? sd->cs_pin : -1);
+            if (!mount_ok) {
+                mount_ok = SD_MMC.begin("/sdcard", false, false, sd->freq_khz);
+            } else {
+                /* Pins set, try begin without path override */
+                mount_ok = SD_MMC.begin();
+            }
+        } else {
+            mount_ok = SD_MMC.begin();
+        }
+        if (mount_ok) {
+            Serial.printf("[TGAI] SD_MMC mounted OK\n");
+            _sd_is_mmc = true;
+        }
+    } else {
+        /* SPI mode */
+        SPI.begin(sd->sck_pin > 0 ? (uint8_t)sd->sck_pin : (uint8_t)18,
+                  sd->miso_pin > 0 ? (uint8_t)sd->miso_pin : (uint8_t)19,
+                  sd->mosi_pin > 0 ? (uint8_t)sd->mosi_pin : (uint8_t)23,
+                  sd->cs_pin > 0 ? (uint8_t)sd->cs_pin : (uint8_t)5);
+
+        mount_ok = SD.begin(sd->cs_pin > 0 ? sd->cs_pin : 5,
+                            (sd->freq_khz > 0) ? (uint32_t)sd->freq_khz * 1000 : (uint32_t)4000000);
+        if (mount_ok) {
+            Serial.printf("[TGAI] SD SPI mounted OK (CS=%d, freq=%d kHz)\n",
+                          sd->cs_pin > 0 ? sd->cs_pin : 5, sd->freq_khz > 0 ? sd->freq_khz : 4000);
+            _sd_is_mmc = false;
+        }
+    }
+
+    if (!mount_ok) {
+        _set_error("SD card mount failed");
+        return false;
+    }
+
+    _sd_mounted = true;
+    _sd_cs_pin = sd->cs_pin;
+
+    /* Log card info */
+    {
+        uint8_t ct = _sd_is_mmc ? SD_MMC.cardType() : SD.cardType();
+        uint64_t cs = _sd_is_mmc ? SD_MMC.cardSize() : SD.cardSize();
+        Serial.printf("[TGAI] SD card: type=%d size=%llu MB\n",
+                      (int)ct, (unsigned long long)(cs / (1024 * 1024)));
+    }
+
+    /* Open model file from SD */
+    File f;
+    if (_sd_is_mmc) {
+        f = SD_MMC.open(tg_path, "r");
+    } else {
+        f = SD.open(tg_path, "r");
+    }
+
+    if (!f) {
+        char err_buf[128];
+        snprintf(err_buf, sizeof(err_buf), "Model file not found on SD: %s", tg_path);
+        _set_error(err_buf);
+        _unmount_sd();
+        return false;
+    }
+
+    size_t fsize = f.size();
+    if (fsize < TG_HEADER_SIZE) {
+        _set_error("SD file too small for .TG header");
+        f.close();
+        _unmount_sd();
+        return false;
+    }
+
+    /* === Parse header FIRST — allocate KV cache before loading model === */
+    uint8_t hdr[TG_HEADER_SIZE];
+    if (f.read(hdr, TG_HEADER_SIZE) != TG_HEADER_SIZE) {
+        _set_error("Failed to read .TG header from SD");
+        f.close();
+        _unmount_sd();
+        return false;
+    }
+
+    int nl_val      = *(int32_t*)(hdr + 12);
+    int nh_val      = *(int32_t*)(hdr + 20);
+    int d_model_val = *(int32_t*)(hdr + 16);
+    int max_seq_val = *(int32_t*)(hdr + 32);
+    if (max_seq_val > TG_EMBED_DEFAULT_MAX_SEQ) max_seq_val = TG_EMBED_DEFAULT_MAX_SEQ;
+    int dk_val     = d_model_val / nh_val;
+    size_t per_layer = (size_t)nh_val * max_seq_val * dk_val;
+    size_t kv_total  = (size_t)nl_val * per_layer * 2 * sizeof(float);
+
+    Serial.printf("[TGAI] d=%d L=%d H=%d max_seq=%d KV=%u B file=%u B\n",
+        d_model_val, nl_val, nh_val, max_seq_val, (unsigned)kv_total, (unsigned)fsize);
+
+    /* Allocate KV cache FIRST — before model data fragments PSRAM */
+    float* kv_k = (float*)tg_embed_calloc(1, kv_total);
+    if (!kv_k) {
+        _set_error("SD: KV cache allocation failed");
+        f.close();
+        _unmount_sd();
+        return false;
+    }
+    float* kv_v = kv_k + (size_t)nl_val * per_layer;
+    Serial.printf("[TGAI] KV OK, PSRAM free after KV=%u\n",
+#ifdef TG_EMBED_ESP32
+                  (unsigned)ESP.getFreePsram()
+#else
+                  0
+#endif
+    );
+
+    /* Read full model file from SD */
+    f.seek(0);
+    uint8_t* data = (uint8_t*)tg_embed_malloc(fsize);
+    if (!data) {
+        _set_error("SD: Failed to allocate memory for model");
+        tg_embed_free(kv_k);
+        f.close();
+        _unmount_sd();
+        return false;
+    }
+
+    size_t read_bytes = 0;
+    while (read_bytes < fsize && f.available()) {
+        size_t chunk = f.read(data + read_bytes, fsize - read_bytes);
+        if (chunk == 0) break;
+        read_bytes += chunk;
+    }
+    f.close();
+
+    /* We can close SD after reading — model is in PSRAM now.
+     * Keep it mounted for scanModels(), unmount in end(). */
+    /* Actually keep it mounted — user may want to scan for other models */
+
+    if (read_bytes != fsize) {
+        _set_error("SD: Failed to read complete model file");
+        tg_embed_free(kv_k);
+        tg_embed_free(data);
+        return false;
+    }
+
+    /* Now load model from the memory buffer */
+    TGEmbedModel* m = embed_model_load(data, fsize, _last_error, sizeof(_last_error));
+    if (!m) {
+        tg_embed_free(kv_k);
+        tg_embed_free(data);
+        return false;
+    }
+
+    m->raw_data = data;
+    m->raw_size = fsize;
+
+    _cache = (TGKVCache*)calloc(1, sizeof(TGCacheInfo2));
+    if (!_cache) {
+        _set_error("SD: Cache metadata allocation failed");
+        tg_embed_free(kv_k);
+        tg_embed_free(data);
+        embed_model_free(m);
+        return false;
+    }
+
+    {
+        TGCacheInfo2* c = (TGCacheInfo2*)_cache;
+        c->k       = kv_k;
+        c->v       = kv_v;
+        c->nl      = nl_val;
+        c->nh      = nh_val;
+        c->dk      = dk_val;
+        c->max_seq = max_seq_val;
+        memset(c->pos, 0, (size_t)nl_val * sizeof(int));
+    }
+
+    _model   = (TGModel*)m;
+    _model_size  = fsize;
+    _max_seq_len = max_seq_val;
+    _vocab_size  = (int)m->header.vocab_size;
+    _d_model     = (int)m->header.d_model;
+    _eos_id      = (int)m->header.eos_token_id;
+    _bos_id      = (int)m->header.bos_token_id;
+    _ready       = true;
+    _detect_marks();   /* 识别对话标记（决定用九标记还是旧格式）*/
+    _file_loaded = true;
+    _file_data   = data;
+    strncpy(_loaded_model_name, tg_path, sizeof(_loaded_model_name) - 1);
+    _loaded_model_name[sizeof(_loaded_model_name) - 1] = '\0';
+
+    Serial.printf("[TGAI] SD model loaded: %s (%u KB)\n", tg_path, (unsigned)(fsize / 1024));
+    return true;
+#else
+    (void)tg_path; (void)sd;
+    _set_error("SD card not supported on this platform");
+    return false;
+#endif
+}
+
+/* ─── begin from SD card (public API) ────────────── */
+bool TGAI_GO::begin(const char* tg_path, const TGAISDConfig* sd) {
+    end();
+
+    if (!sd) {
+        /* No SD config — fall back to LittleFS only */
+        return begin(tg_path);
+    }
+
+    /* Try SD card load */
+    if (_load_from_sd(tg_path, sd)) {
+        return true;
+    }
+
+    /* SD failed — try LittleFS as fallback */
+    Serial.println("[TGAI] SD load failed, trying LittleFS fallback...");
+    return begin(tg_path);
 }
 
 /* ─── Tokenizer wrappers ──────────────────────────────── */
@@ -1591,16 +1887,40 @@ int TGAI_GO::generate(const char* prompt, TGOutputCallback callback,
 
     /* Auto-regressive generation */
     int gen_count = 0;
+    _last_answer_len = 0;                 /* 本次回答缓冲复位 */
+    _last_answer[0] = '\0';
     int32_t token_id = _sample_token(logits, m->vocab_size, temp, top_k);
 
     for (int i = 0; i < max_tokens && gen_count < max_tokens; i++) {
         /* Check for EOS */
         if (token_id == m->eos_id) break;
 
+        /* ★ 轮次边界标记判定（2026-10-10 加，与桌面引擎对齐）
+         *   为什么必须：TGAI 语料把多轮对话连续拼接成一条序列，
+         *   模型答完【不会主动停】，会继续"续写下一轮"
+         *   （桌面版 llama.cpp 侧有同款补丁：把 <用户>/<TGAI>/… 登记为 EOG）
+         *   这里按 token id 比对 —— 加载时已查好 id 表，运行时零开销。*/
+        if (_stop_on_marks && _n_turn_eog > 0) {
+            int hit = 0;
+            for (int e = 0; e < _n_turn_eog; e++) {
+                if (_turn_eog_ids[e] >= 0 && token_id == _turn_eog_ids[e]) { hit = 1; break; }
+            }
+            if (hit) break;               /* 到轮次边界，停 */
+        }
+
         /* Decode and callback */
         const char* token_str = m->vocab[token_id];
         if (token_str && callback) {
             callback(token_str);
+        }
+        /* ★ 顺手收集回答（chat() 用它写历史）*/
+        if (token_str && _last_answer_len < TGAI_ANSWER_CAP - 1) {
+            size_t tl = strlen(token_str);
+            size_t room = (size_t)(TGAI_ANSWER_CAP - 1 - _last_answer_len);
+            if (tl > room) tl = room;
+            memcpy(_last_answer + _last_answer_len, token_str, tl);
+            _last_answer_len += (int)tl;
+            _last_answer[_last_answer_len] = '\0';
         }
         gen_count++;
 
@@ -1639,6 +1959,26 @@ void TGAI_GO::reset() {
 }
 
 /* ─── Free resources ────────────────────────────────────── */
+void TGAI_GO::_unmount_sd() {
+#ifdef ESP32
+    if (_sd_mounted && _sd_cs_pin != -2) {
+        /* Don't unmount if SD was initialized by external code (cs_pin == -2) */
+        if (_sd_is_mmc) {
+            SD_MMC.end();
+        } else {
+            SD.end();
+        }
+        _sd_mounted = false;
+        _sd_is_mmc = false;
+        _sd_cs_pin = -1;
+    } else if (_sd_cs_pin == -2) {
+        /* External mount — just clear our flag, leave SD running */
+        _sd_mounted = false;
+        _sd_cs_pin = -1;
+    }
+#endif
+}
+
 void TGAI_GO::_free_resources() {
     if (_model) {
         TGEmbedModel* m = (TGEmbedModel*)_model;
@@ -1662,6 +2002,7 @@ void TGAI_GO::_free_resources() {
 
 void TGAI_GO::end() {
     _free_resources();
+    _unmount_sd();
     _ready = false;
     _model_size = 0;
     _max_seq_len = 0;
@@ -1672,56 +2013,72 @@ void TGAI_GO::end() {
 
 /* ─── Model scanning & loading by index ─────────────── */
 
-int TGAI_GO::scanModels() {
-    _model_count = 0;
-
-    /* LittleFS is already mounted by Arduino framework — do NOT call begin() again.
-     * Calling begin(true) on an already-mounted FS can corrupt internal state. */
-    if (!LittleFS.exists("/")) {
-        /* Only try mounting if not already available */
-        if (!LittleFS.begin(false)) {
-            _set_error("LittleFS mount failed during scan");
-            return 0;
-        }
-    }
-
-    File root = LittleFS.open("/");
+/* Helper: scan .TG files from an Arduino FS directory */
+static int _scan_fs_dir(FS& fs, const char* label, char model_names[8][64], int& count) {
+    File root = fs.open("/");
     if (!root) {
-        _set_error("Failed to open root for scanning");
+        Serial.printf("[TGAI] %s: failed to open root\n", label);
         return 0;
     }
 
-    Serial.println("===== 扫描 .TG 模型 =====");
     File f = root.openNextFile();
-    char fname_buf[64]; /* avoid String heap allocation */
-    while (f && _model_count < 8) {
+    char fname_buf[64];
+    while (f && count < 8) {
         const char* fname = f.name();
         if (fname) {
             strncpy(fname_buf, fname, sizeof(fname_buf) - 1);
             fname_buf[sizeof(fname_buf) - 1] = '\0';
             int len = strlen(fname_buf);
-            /* Case-insensitive .TG extension check */
             int is_tg = (len > 3 &&
-                (fname_buf[len-3] == '.' || fname_buf[len-3] == '.') &&
+                (fname_buf[len-3] == '.') &&
                 (fname_buf[len-2] == 'T' || fname_buf[len-2] == 't') &&
                 (fname_buf[len-1] == 'G' || fname_buf[len-1] == 'g'));
             if (is_tg) {
-                strncpy(_model_names[_model_count], fname_buf, 63);
-                _model_names[_model_count][63] = '\0';
-                _model_count++;
-                Serial.printf("  %d. %s (%u KB)\n", _model_count,
-                    _model_names[_model_count - 1],
-                    (unsigned)(f.size() / 1024));
+                strncpy(model_names[count], fname_buf, 63);
+                model_names[count][63] = '\0';
+                count++;
+                Serial.printf("  %d. %s (%u KB) [%s]\n", count,
+                    model_names[count - 1],
+                    (unsigned)(f.size() / 1024), label);
             }
         }
         f.close();
         f = root.openNextFile();
     }
     root.close();
+    return count;
+}
+
+int TGAI_GO::scanModels() {
+    _model_count = 0;
+
+    Serial.println("===== 扫描 .TG 模型 =====");
+
+    /* 1. LittleFS (internal flash) */
+    if (!LittleFS.exists("/")) {
+        if (!LittleFS.begin(false)) {
+            Serial.println("[TGAI] LittleFS: not available");
+        }
+    }
+    if (LittleFS.exists("/")) {
+        _scan_fs_dir(LittleFS, "LittleFS", _model_names, _model_count);
+    }
+
+    /* 2. SD card (if mounted externally by user or by our begin()) */
+#ifdef ESP32
+    if (_sd_mounted) {
+        if (_sd_is_mmc) {
+            _scan_fs_dir(SD_MMC, "SD_MMC", _model_names, _model_count);
+        } else {
+            _scan_fs_dir(SD, "SD", _model_names, _model_count);
+        }
+    }
+#endif
 
     if (_model_count == 0) {
         Serial.println("  未找到 .TG 模型文件");
     }
+    Serial.printf("  共找到 %d 个模型\n", _model_count);
     Serial.println("===========================");
     return _model_count;
 }
@@ -1749,3 +2106,211 @@ bool TGAI_GO::loadModelByIndex(int index) {
 const char* TGAI_GO::getLoadedModelName() const {
     return _loaded_model_name;
 }
+
+
+/* ══════════════════════════════════════════════════════════════
+ *  对话格式支持（2026-10-10 加，与桌面引擎 tgai_chat.py 对齐）
+ *
+ *  ★ 为什么必须加（来自桌面侧的实测教训）：
+ *    1) TGAI 语料把多轮对话【连续拼接】成一条序列：
+ *         …<回答>\n答案\n<用户>\n下一问\n<TGAI><回答>\n下一个答案…
+ *       于是模型答完【不会停】，会继续"续写下一轮"。
+ *       ⇒ 必须把轮次边界标记当 EOG（桌面版 llama.cpp 补丁同款做法）
+ *    2) 裸文本丢给分词器不触发对话格式 ⇒ 模型不知道在跟它说话
+ *       ⇒ 必须自己拼 <用户>\n{q}\n<TGAI><回答>\n
+ *
+ *  ★ 嵌入式做法（与桌面不同）：
+ *    - 标记字符串【指向词表内部】，不复制 ⇒ 零额外 RAM
+ *    - 历史用固定缓冲 + 环形偏移，避免堆碎片
+ * ══════════════════════════════════════════════════════════════ */
+
+/* 必须识别的 9 个 V2.7 标记（顺序即查表顺序）*/
+static const char* kTGAIAllMarks[9] = {
+    "<用户>", "<TGAI>", "<思考>", "<回答>", "<系统>",
+    "<记忆>", "<工具表>", "<TGH>", "<工具结果>"
+};
+
+/* 轮次边界标记（生成到它即停）
+ * 故意【不含】<思考>/<回答>：它们出现在回答内部，
+ * 当停止符会把回答拦腰截断（桌面版实测踩过）*/
+static const char* kTGAITurnEOG[6] = {
+    "<用户>", "<TGAI>", "<系统>", "<记忆>", "<工具表>", "<TGH>"
+};
+
+/* 在词表里线性查一个标记字符串，返回 id 或 -1
+ * 只在加载时调用一次，O(vocab*len) 相对模型加载可忽略 */
+static int tgai_find_mark(TGEmbedModel* m, const char* s) {
+    if (!m || !m->vocab || !s) return -1;
+    for (int i = 0; i < m->vocab_size; i++) {
+        const char* t = m->vocab[i];
+        if (t && t[0] == '<' && strcmp(t, s) == 0) return i;
+    }
+    return -1;
+}
+
+void TGAI_GO::_detect_marks() {
+    TGEmbedModel* m = (TGEmbedModel*)_model;
+    _n_marks = 0; _has_v27 = false; _stop_on_marks = false; _n_turn_eog = 0;
+    for (int i = 0; i < TGAI_MAX_MARKS; i++) { _marks[i] = nullptr; _mark_ids[i] = -1; }
+    for (int i = 0; i < 6; i++) _turn_eog_ids[i] = -1;
+    /* ★ 先给默认值，再判空返回 —— 否则模型未加载时 renderMode 是空串，
+     *   调用方（示例/上位机）拿到空字符串不好判断 */
+    strcpy(_render_mode, "plain");
+    if (!m || !m->vocab) return;
+
+    /* 查 9 个 V2.7 标记 */
+    int found = 0;
+    for (int i = 0; i < 9 && i < TGAI_MAX_MARKS; i++) {
+        int id = tgai_find_mark(m, kTGAIAllMarks[i]);
+        if (id >= 0) {
+            _marks[_n_marks] = m->vocab[id];    /* 指向词表，不复制 */
+            _mark_ids[_n_marks] = id;
+            _n_marks++;
+            found++;
+        }
+    }
+    /* 九标记齐全（至少这 4 个核心）才认为支持 V2.7 格式 */
+    _has_v27 = (tgai_find_mark(m, "<用户>") >= 0) &&
+               (tgai_find_mark(m, "<TGAI>") >= 0) &&
+               (tgai_find_mark(m, "<思考>") >= 0) &&
+               (tgai_find_mark(m, "<回答>") >= 0);
+
+    if (_has_v27) {
+        strcpy(_render_mode, "markers");
+        /* 登记轮次边界 EOG */
+        for (int i = 0; i < 6; i++) {
+            int id = tgai_find_mark(m, kTGAITurnEOG[i]);
+            if (id >= 0 && _n_turn_eog < 6) _turn_eog_ids[_n_turn_eog++] = id;
+        }
+        _stop_on_marks = (_n_turn_eog > 0);
+    } else {
+        /* 非 V2.7：检查 ChatML */
+        if (tgai_find_mark(m, "<|im_start|>") >= 0) {
+            strcpy(_render_mode, "chatml");
+            int id = tgai_find_mark(m, "<|im_start|>");
+            if (id >= 0) { _turn_eog_ids[_n_turn_eog++] = id; _stop_on_marks = true; }
+        }
+    }
+    (void)found;
+}
+
+/* 拼一次对话 prompt（含历史）
+ * 返回写入长度（不含结尾 NUL），-1 表示缓冲不够
+ *
+ * 输出格式（与桌面版 & 官方 Jinja 模板逐字节一致）:
+ *     [<系统>\n{sys}]
+ *     {历史轮次: <用户>\n{q}<TGAI>{a}}
+ *     <用户>\n{user_msg}<TGAI><回答>\n
+ */
+int TGAI_GO::_build_chat_prompt(const char* user_msg, char* out, int out_cap) {
+    if (!out || out_cap <= 8) return -1;
+    int n = 0;
+#define APPEND_S(lit) do { \
+        const char* _s = (lit); size_t _l = strlen(_s); \
+        if (n + (int)_l >= out_cap) return -1; \
+        memcpy(out + n, _s, _l); n += (int)_l; \
+    } while (0)
+#define APPEND_C(ch) do { if (n + 1 >= out_cap) return -1; out[n++] = (char)(ch); } while (0)
+
+    if (_has_v27) {
+        if (_hist_len > 0) {
+            if (n + _hist_len >= out_cap) return -1;
+            memcpy(out + n, _hist, _hist_len); n += _hist_len;
+        }
+        APPEND_S("<用户>\n");
+        APPEND_S(user_msg);
+        APPEND_S("<TGAI><回答>\n");
+    } else if (strcmp(_render_mode, "chatml") == 0) {
+        if (_hist_len > 0) {
+            if (n + _hist_len >= out_cap) return -1;
+            memcpy(out + n, _hist, _hist_len); n += _hist_len;
+        }
+        APPEND_S("<|im_start|>user\n");
+        APPEND_S(user_msg);
+        APPEND_S("<|im_end|>\n<|im_start|>assistant\n");
+    } else {
+        /* 纯文本兜底 */
+        if (_hist_len > 0) {
+            if (n + _hist_len >= out_cap) return -1;
+            memcpy(out + n, _hist, _hist_len); n += _hist_len;
+        }
+        APPEND_S("Q: ");
+        APPEND_S(user_msg);
+        APPEND_S("\nA:");
+    }
+    out[n] = '\0';
+#undef APPEND_S
+#undef APPEND_C
+    return n;
+}
+
+/* 把一轮问答追加进历史（环形，满了丢最旧的）*/
+static void tgai_hist_append(TGAI_GO* self_unused, char* hist, int* hist_len,
+                             int* turns, int* offs, int cap, int max_turns,
+                             const char* q, const char* a, bool v27) {
+    (void)self_unused;
+    char seg[512];
+    int n;
+    if (v27) {
+        n = snprintf(seg, sizeof(seg), "<用户>\n%s<TGAI>%s", q, a ? a : "");
+    } else {
+        n = snprintf(seg, sizeof(seg), "Q: %s\nA: %s\n", q, a ? a : "");
+    }
+    if (n <= 0) return;
+    if (n >= (int)sizeof(seg)) n = (int)sizeof(seg) - 1;
+
+    /* 满了先丢最旧一轮（整体前移）*/
+    while (*hist_len + n >= cap && *turns > 0) {
+        int drop = (*turns > 1) ? offs[1] : *hist_len;
+        if (drop <= 0) drop = *hist_len;
+        memmove(hist, hist + drop, (size_t)(*hist_len - drop));
+        *hist_len -= drop;
+        for (int i = 1; i < *turns; i++) offs[i - 1] = offs[i] - drop;
+        (*turns)--;
+    }
+    if (*turns >= max_turns && *turns > 0) {
+        int drop = offs[1];
+        memmove(hist, hist + drop, (size_t)(*hist_len - drop));
+        *hist_len -= drop;
+        for (int i = 1; i < *turns; i++) offs[i - 1] = offs[i] - drop;
+        (*turns)--;
+    }
+    if (*hist_len + n >= cap) return;      /* 单轮太长，放弃记历史 */
+    if (*turns < max_turns) offs[*turns] = *hist_len;
+    memcpy(hist + *hist_len, seg, (size_t)n);
+    *hist_len += n;
+    hist[*hist_len] = '\0';
+    (*turns)++;
+}
+
+int TGAI_GO::chat(const char* user_msg, TGOutputCallback callback,
+                  int max_tokens, float temp, int top_k) {
+    if (!_ready || !_model || !_cache) { _set_error("Model not ready"); return -1; }
+    if (!user_msg) { _set_error("null user_msg"); return -1; }
+
+    char prompt[TGAI_PROMPT_CAP];
+    int np = _build_chat_prompt(user_msg, prompt, (int)sizeof(prompt));
+    if (np <= 0) { _set_error("chat prompt too long"); return -1; }
+
+    /* 用 generate 跑（它会做 prefill + 自回归 + 边界停止）*/
+    int got = generate(prompt, callback, max_tokens, temp, top_k);
+
+    /* 把这一轮记进历史（回答内容由 _last_answer 收集）*/
+    if (got > 0) {
+        TGEmbedModel* m = (TGEmbedModel*)_model;
+        tgai_hist_append(this, _hist, &_hist_len, &_hist_turns, _hist_off,
+                         (int)sizeof(_hist), TGAI_MAX_TURNS,
+                         user_msg, _last_answer, _has_v27);
+        (void)m;
+    }
+    return got;
+}
+
+void TGAI_GO::clearHistory() {
+    _hist_len = 0; _hist_turns = 0; _hist[0] = 0;
+    for (int i = 0; i < TGAI_MAX_TURNS; i++) _hist_off[i] = 0;
+    _last_answer[0] = 0;
+    reset();
+}
+
+int TGAI_GO::getHistoryTurns() const { return _hist_turns; }

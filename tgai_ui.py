@@ -470,6 +470,173 @@ def status_bar(width=None, left='就绪', mid='', right=''):
 
 
 # ══════════════════════════════════════════════════════════════
+#  全屏模式（2026-10-10 加，用户要求"自动全屏 / 和 xiaoli 一样"）
+#
+#  与滚动式的区别：
+#    滚动式：内容一路往下堆，输入框在末尾（历史自然保留）
+#    全屏式：屏幕固定为 [启动画面] + [最近对话] + [输入框] + [状态栏]，
+#            每轮用「清屏 + 整屏重画」刷新，观感像 GUI 应用
+#
+#  ★ 为什么用整屏重画而不是增量刷新：
+#    增量刷新要精确跟踪光标行列，任何一个宽字符估算错位就整体散架
+#    （这正是之前踩过的坑：cmd 对 U+276F 按 2 列渲染）。
+#    整屏重画的代价只是每轮一次全屏输出，代价可接受、且不会错位。
+#  ★ 保留的最大消息条数：全屏下历史不能无限堆（否则重画越来越慢），
+#    只保留最近 N 条；用户要完整历史可以用 /log 导出（见 TUI）。
+# ══════════════════════════════════════════════════════════════
+class Screen:
+    """全屏聊天界面：固定框 + 消息区 + 底部输入框 + 状态栏"""
+
+    MAX_MSGS = 40          # 消息区最多保留的条目（超出丢最老的）
+
+    def __init__(self, title='TGAI GO', splash=None, width=None):
+        self.W = width or term_width()
+        self.title = title
+        self.splash = list(splash or [])      # 启动画面行（已含颜色）
+        self.msgs = []                        # [(role, text_lines)]
+        self.bar = ('就绪', '', '')
+        self.status_pairs = []
+        self.full = True
+
+    # ── 屏幕控制 ──
+    def _clear(self):
+        # \033[2J 清屏 + \033[1;1H 回原点；Windows cmd / WT / VSCode 均支持
+        _sys.stdout.write('\033[2J\033[1;1H')
+        _sys.stdout.flush()
+
+    def _rows(self):
+        try:
+            return _sys.stdout.get_terminal_size().lines or 30
+        except Exception:
+            return 30
+
+    # ── 内容 ──
+    def push(self, role, text):
+        """追加一条消息；role: 'user' / 'ai' / 'sys'"""
+        self.msgs.append((role, text))
+        if len(self.msgs) > self.MAX_MSGS:
+            self.msgs = self.msgs[-self.MAX_MSGS:]
+
+    def set_status(self, left='就绪', mid='', right=''):
+        self.bar = (left, mid, right)
+
+    def add_status_pairs(self, pairs):
+        self.status_pairs = list(pairs)
+
+    # ── 渲染 ──
+    def _render_msgs(self, budget):
+        """把消息渲染成「已染色、已折行」的行；budget 为可用行数
+
+        从【最新一条往前】取满 budget 行，再按时间顺序输出
+        —— 这样"最近的内容"永远在屏上，且顺序仍是旧的在上、新的在下。
+
+        ★ 踩坑①：原实现用 out = blk + out 往【前】插，导致整块消息倒序
+          （用户消息跑到 AI 回复下面）。改为从后往前收集，最后整体 reverse。
+        ★ 踩坑②：若最后一条回复很长（如模型写满 2048 token ≈ 60+ 行），
+          原实现直接 break ⇒ 整屏消息区【全空】。现在改为：
+          超大消息只显示【尾部】budget 行（用户最关心最新内容），
+          并在前面加一行省略提示。
+        """
+        picked = []                       # 从新到旧收集
+        for idx, (role, text) in enumerate(reversed(self.msgs)):
+            blk = []
+            if role == 'user':
+                blk.append('%s%s> You%s  %s' % (USER, BLD, RST, text))
+            elif role == 'sys':
+                for l in text.split('\n'):
+                    blk.append('%s%s%s' % (META, l, RST))
+            else:
+                blk.append('%s%s* TGAI%s' % (AI, BLD, RST))
+                blk += ['  ' + l for l in md_render(text, self.W - 6)]
+            blk.append('')
+
+            if len(blk) > budget:
+                # 单条就超预算：只保留尾部 + 省略提示（仅最新一条这样处理）
+                if not picked:
+                    keep = max(3, budget - 1)
+                    head = '%s  …（上面省略 %d 行）%s' % (META, len(blk) - keep, RST)
+                    picked.append([head] + blk[-keep:])
+                break
+            if len(picked) and sum(len(b) for b in picked) + len(blk) > budget:
+                break
+            picked.append(blk)
+        out = []
+        for blk in reversed(picked):       # 恢复时间顺序
+            out.extend(blk)
+        return out
+
+    def draw(self):
+        """整屏重画"""
+        if not self.full:
+            return
+        self._clear()
+        rows = self._rows()
+        # 顶部品牌条
+        t = ' %s%s◈ %s%s ' % (BRAND, BLD, self.title, RST)
+        r = (' %s%s%s ' % (META, self.bar[1], RST)) if self.bar[1] else ' '
+        fill = max(0, self.W - 2 - dw(t) - dw(r))
+        print('%s%s%s%s%s%s' % (LINE, t, H * fill, r, RST, ''))
+
+        # 启动画面（只在没有消息时显示）
+        body = []
+        if not self.msgs:
+            body = list(self.splash)
+        else:
+            body = self._render_msgs(max(4, rows - 12))
+        for l in body:
+            print(l)
+
+        # 底部输入框 + 状态栏
+        print()
+        self._draw_input()
+        l, m, rr = self.bar
+        status_bar(self.W - 2, l, m, rr)
+
+    def _draw_input(self):
+        W = self.W - 2
+        inner = max(20, W - 4)
+        tip = '%s>%s %s输入消息 …%s' % (USER + BLD, RST + INBOX, META, RST + INBOX)
+        tail = '%s/help 命令 · /params 调参 · /exit 退出%s' % (META, RST + INBOX)
+        pad = max(0, inner - dw(tip) - dw(tail))
+        print('%s%s%s%s%s' % (INBOX, TL, H * (W - 2), TR, RST))
+        print('%s%s%s %s%s%s %s%s' % (INBOX, V, RST, tip, ' ' * pad, tail, INBOX, V + RST))
+        print('%s%s%s%s%s' % (INBOX, BL, H * (W - 2), BR, RST))
+
+    # ── 交互 ──
+    def ask(self):
+        """显示输入框并把光标放进框内，返回用户输入
+
+        光标定位与 input_box() 同一套办法：画完框后 ANSI 上移一行 + 右移。
+        只用 ASCII '>' 与中文，避免宽窄歧义字符。
+        """
+        W = self.W - 2
+        inner = max(20, W - 4)
+        tip = '%s>%s %s输入消息 …%s' % (USER + BLD, RST + INBOX, META, RST + INBOX)
+        col = 3 + dw(tip)
+        if not (_sys.stdin.isatty() and _sys.stdout.isatty()):
+            return _input_fallback()
+        _sys.stdout.write('\033[A\r\033[%dC' % col)
+        _sys.stdout.flush()
+        try:
+            return input().strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            raise
+
+    def run_splash(self, pause=0.0):
+        """清屏后只画启动画面（模型加载期间用）"""
+        if not self.full:
+            return
+        self._clear()
+        for l in self.splash:
+            print(l)
+        _sys.stdout.flush()
+        if pause > 0:
+            import time as _t
+            _t.sleep(pause)
+
+
+# ══════════════════════════════════════════════════════════════
 #  流式 Markdown（模拟打字机）
 #
 #  问题：Markdown 是块结构，逐 token 打印会让 **粗体** 中间出现断点、

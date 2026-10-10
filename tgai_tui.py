@@ -55,11 +55,34 @@ def ui_row(text='', color=''):
 
 
 def ui_status(pairs):
-    """状态摘要：一行关键参数 + 一行操作提示（替代原先刷屏的加载日志）"""
-    parts = ['%s%s%s %s' % (U.META, k, U.RST, v) for k, v in pairs]
+    """顶部参数摘要（灰色，三行）
+
+    视觉（2026-10-10 美化）：
+        ────────────────────────────────────────────────────────
+          ◈ TGAI GO                                8K · 4线程
+          模型 v27_merged_bf16.TG · 层 28 · 维度 1024 · 专家 8/2
+          /help 命令 · /params 调参 · /threads 线程 · /exit 退出
+    分组：右侧放最常看的两个量，中间放模型结构，末行放操作提示。
+    """
+    inner = FRAME.W - 4
     FRAME.row('')
-    FRAME.row('  ' + '   '.join(parts))
-    FRAME.row('  ' + U.META + '/help 命令 · /params 调参 · /exit 退出' + U.RST)
+    # 第一行：品牌 + 右对齐的关键标签
+    left = '%s%s◈ TGAI GO%s' % (U.BRAND, U.BLD, U.RST)
+    right = ''
+    for k, tag in (('上下文', None), ('线程', None)):
+        for kk, vv in pairs:
+            if kk == k:
+                right += '%s%s%s  ' % (U.META, vv, U.RST)
+    gap = max(1, inner - U.dw(left) - U.dw(right) - 4)
+    FRAME.row('  ' + left + ' ' * gap + right)
+    # 第二行：模型结构（灰色，· 分隔）
+    struct = ['%s %s' % (k, v) for k, v in pairs
+              if k in ('模型', '层', '维度', '专家')]
+    if struct:
+        FRAME.row('  ' + U.META + ' · '.join(struct) + U.RST)
+    # 第三行：操作提示
+    FRAME.row('  ' + U.META
+              + '/help 命令 · /params 调参 · /threads 线程 · /exit 退出' + U.RST)
     FRAME.row('')
 
 
@@ -369,9 +392,22 @@ def main():
                     choices=list(PRESETS.keys()), help='启动预设')
     args = ap.parse_args()
 
-    # ── 视觉：先开窗（避免加载期"黑屏等半天"），加载完再补状态行 ──
     _mname = os.path.basename(args.model or '') or '(自动)'
-    ui_begin(_mname, right='加载中…')
+    _W = U.term_width()
+
+    # ── 启动横幅：ASCII logo + 颜文字（用户指定保留）──
+    #   ★ 刻意【不做全屏】：全屏要整屏重画，会把流式输出干掉。
+    #     这里是 CLI/TUI 原生的滚动式输出，流式才能逐 token 出来。
+    try:
+        import tgai_art as _art
+        for _l in _art.splash_lines(
+                _W - 4,
+                '%s  ·  TGAI 自研 MoE 小模型 3B · 纯 C/C++ 推理引擎' % _mname,
+                ['> 输入问题后回车发送',
+                 '/help 查看全部命令   ·   /params 调参   ·   /exit 退出']):
+            print(_l)
+    except Exception:
+        print('\n  ◈ TGAI GO\n')
 
     engine = TGEngine(dll_path=args.dll)
     engine.load(args.model, extend_ctx=args.extend)
@@ -442,17 +478,25 @@ def main():
     _nthr = engine.get_threads() if hasattr(engine, 'get_threads') else 4
     _bar_mid = '%s · %s · %d线程' % (_mname, _ctx, _nthr)
 
+    # ══════════════════════════════════════════════════════════
+    #  主循环（滚动式 CLI/TUI —— 刻意不做全屏）
+    #
+    #  ★ 为什么不做全屏整屏重画（2026-10-10 决策，踩坑记录）：
+    #    全屏要"生成完再整屏重画"，才能保证布局不错位；
+    #    但那会把【流式输出】干掉 —— 用户看不到逐字吐出的过程，
+    #    而这恰恰是 TUI 最该有的手感。
+    #    ⇒ 采用原生滚动式：内容一路往下堆，输入框在末尾，
+    #      流式 Markdown 逐行渲染（MdStream），历史天然保留、可复制。
+    # ══════════════════════════════════════════════════════════
     try:
         _eof = 0
         while True:
-            # ── 底部输入框（xiaoli 风格：框在屏幕下方，光标停在框内）──
             try:
                 ui = U.input_box(hint='输入消息 …',
                                  extra='/help 命令 · /exit 退出').strip()
             except (EOFError, KeyboardInterrupt):
                 # ★ stdin 结束（管道/重定向）时 input() 立刻抛 EOFError。
                 #   踩坑：原实现只 print() 不 break ⇒ 管道测试时死循环刷屏。
-                #   这里区分：连读 3 次都空 ⇒ 视为输入源结束，退出。
                 print()
                 _eof += 1
                 if _eof >= 3:
@@ -468,26 +512,26 @@ def main():
                 U.status_bar(left='就绪', mid=_bar_mid, right='/exit 退出')
                 continue
 
-            ui_user(ui)                       # ★ 用户消息（前缀字形区分）
+            ui_user(ui)
             t0 = time.time()
             _, ids = chat.build_prompt(ui)
-            stream = ui_ai_start()            # ★ 助手回复（流式 Markdown 渲染）
+            stream = ui_ai_start()          # ★ 流式 Markdown（逐行实时渲染）
             try:
                 out, cnt = '', 0
                 for tok in generate(engine, ids, params,
                                     eos_id=chat.eos, eos_set=chat.eos_set,
                                     kv=engine.kv_handle()):
-                    stream.feed(tok)          # 按整行推进，边生成边渲染
+                    stream.feed(tok)        # 实时：字符立刻出现，行落定时套 MD 样式
                     out += tok
                     cnt += 1
                 stream.flush()
                 el = time.time() - t0
                 tps = cnt / el if el > 0 else 0.0
                 ctx['last_stat'] = {'n': cnt, 'sec': el, 'tps': tps}
-                ui_ai_meta(cnt, el, tps, '' if out.strip() else '空回复')
-                if out.strip():
-                    chat.add(ui, out.strip())
-                # 底部状态栏刷新（显示上一轮的实际速度，像 xiaoli 那样）
+                txt = out.strip()
+                ui_ai_meta(cnt, el, tps, '' if txt else '空回复')
+                if txt:
+                    chat.add(ui, txt)
                 _bar_mid = ('%s · %s · %d线程 · 上轮 %.1f tok/s'
                             % (_mname, _ctx, _nthr, tps))
                 U.status_bar(left='就绪', mid=_bar_mid, right='/exit 退出')

@@ -63,6 +63,39 @@ SOFT_STOP_PER_TOK = _env_f('TGAI_SOFT_STOP_PER_TOK', 0.08)
 SOFT_STOP_AT_REMAIN = _env_f('TGAI_SOFT_STOP_AT_REMAIN', 64)
 # 已生成多少 token 后开始施加（绝对 token 数；与上面取先到者）
 SOFT_STOP_AFTER = _env_f('TGAI_SOFT_STOP_AFTER', 256)
+# ★ EOS 概率上限（用户要求：渐升但封顶 99%，永不强制到 100%）
+#   实现方式：按目标概率反解所需 logit，而不是直接给 logit 加常数
+#   （加常数时概率只会渐进趋近 100%，没有真上限）。
+SOFT_STOP_MAX_P = _env_f('TGAI_SOFT_STOP_MAX_P', 0.99)
+
+# ══════════════════════════════════════════════════════════════
+#  ★ 代码块内的防复读参数（2026-10-10 加）
+#
+#  背景：模型写代码时会陷入 "def generate_random_xxx" 这类函数名复读。
+#        llama.cpp 调参台的默认值（repeat_penalty 1.25 / frequency_penalty 0.25 /
+#        dry_multiplier 4.5）比我们的（1.05 / 0 / 0.8）猛得多 ——
+#        这是它代码写得更完整的主因之一。
+#  取值：比我们的默认强、但比 llama.cpp 调参台值温和。
+#        原因：TGAI GO 是常驻进程、跨轮保留历史，同样惩罚在这里累积更强
+#        （历史教训：照抄调参台激进值曾把 '1+1=2' 压成 '1+1=3'）。
+#  只在 ``` 围栏代码块内生效，出块立即恢复原值。
+# ══════════════════════════════════════════════════════════════
+CODE_REPEAT_PENALTY = _env_f('TGAI_CODE_REPEAT_PENALTY', 1.10)
+CODE_DRY_MULTIPLIER = _env_f('TGAI_CODE_DRY_MULTIPLIER', 2.5)
+CODE_FREQ_PENALTY = _env_f('TGAI_CODE_FREQ_PENALTY', 0.1)
+# 代码块内对 <回答> 的递增偏置强度（每多写 1 token 加这么多）。
+# 作用：给模型一个"该闭合围栏了"的渐进压力，避免写到 max_tokens 才停。
+# ★ 取值教训：曾用 0.12 —— _code_len=100 时偏置达 +12.0 logit（概率差 16 万倍），
+#   模型立刻狂吐 <回答> 标记污染代码（实测出现 `A list of <回答>` 刷屏）。
+#   0.02 在 _code_len=100 时只 +2.0，属"温和推动"量级。
+# ★ 围栏闭合的【概率】控制（用户设计：概率随长度上升到 99% 封顶）
+#   CODE_CLOSE_MAX_P : 目标概率上限（0.95 = 95%，永不强制到 100%）
+#   CODE_CLOSE_GAIN  : 每多写 1 个 token 给闭合概率加的绝对量
+#                      （0.002 ⇒ 写 100 token 时从 ~0 升到 0.20）
+#   CODE_CLOSE_SMOOTH: 目标 logit 的平滑系数（1.0=完全按目标概率；<1 更温和）
+CODE_CLOSE_MAX_P = _env_f('TGAI_CODE_CLOSE_MAX_P', 0.99)
+CODE_CLOSE_GAIN = _env_f('TGAI_CODE_CLOSE_GAIN', 0.001)
+CODE_CLOSE_SMOOTH = _env_f('TGAI_CODE_CLOSE_SMOOTH', 0.6)
 
 DLL_CANDIDATES = [
     os.path.join(SCRIPT_DIR, 'cpu', 'build', 'libtgai_engine.dll'),
@@ -603,10 +636,15 @@ def sample_numpy(logits, temp, top_k, top_p, vocab, p=None, recent=None,
     #    （实测 2048 token / 189 秒），既慢又把上下文挤爆。
     #    加了这个之后，越接近上限越容易自然收尾，且【不切断句子】。
     #
-    #  参数：soft_stop_per_tok  每 token 递增的 bias 强度（0 = 关闭）
+    #  参数：soft_stop_per_tok  每 token 递增的强度（0 = 关闭）
     #        soft_stop_at_remain 剩余多少 token 时开始施加
     #        soft_stop_after     已生成多少 token 后开始施加（两者取先到）
     #        eos_ids            本轮所有停止符 id（含轮次标记）
+    #
+    #  ★ 2026-10-10 改：从"logit 线性斜坡"改为【按目标概率反解 logit】。
+    #    原因（用户要求"渐升但封顶 95%"）：
+    #      直接给 logit 加常数时，EOS 概率会【渐进趋近 100%】——虽然永远到不了，
+    #      但没有真正的上限。按概率反解才能真正把概率压到 SOFT_STOP_MAX_P。
     _spt = float(p.get('soft_stop_per_tok', SOFT_STOP_PER_TOK) or 0.0)
     if _spt > 0.0 and eos_ids:
         _n_remain = max_tok - step
@@ -614,10 +652,26 @@ def sample_numpy(logits, temp, top_k, top_p, vocab, p=None, recent=None,
         _at_rem = float(p.get('soft_stop_at_remain', SOFT_STOP_AT_REMAIN) or 0) - _n_remain
         _k = _after if _after > _at_rem else _at_rem
         if _k > 0.0:
-            _bias = _k * _spt
-            for _e in eos_ids:
-                if 0 <= _e < arr.size and np.isfinite(arr[_e]):
-                    arr[_e] += _bias
+            _mx = arr.max()
+            if np.isfinite(_mx):
+                _ex = np.exp(arr - _mx)
+                _tot = float(_ex.sum())
+                # 各 EOS 当前概率之和；目标：线性升到 SOFT_STOP_MAX_P 封顶
+                _p_cur = sum(float(_ex[_e]) / _tot for _e in eos_ids
+                             if 0 <= _e < arr.size) if _tot > 0 else 0.0
+                _p_tgt = min(SOFT_STOP_MAX_P, _p_cur + _k * _spt * 0.01)
+                if _p_tgt > _p_cur and _p_tgt < 1.0:
+                    _ei = [e for e in eos_ids if 0 <= e < arr.size]
+                    if _ei:
+                        _rest = _tot - sum(float(_ex[e]) for e in _ei)
+                        if _rest > 0:
+                            _ex_need = _rest * _p_tgt / (1.0 - _p_tgt)
+                            _ex_have = sum(float(_ex[e]) for e in _ei)
+                            if _ex_have > 0:
+                                _d = float(np.log(_ex_need)) - float(np.log(_ex_have))
+                                for _e in _ei:
+                                    if np.isfinite(arr[_e]):
+                                        arr[_e] += _d
 
     # ③ 温度
     arr = arr / max(float(temp), 0.01)
@@ -1046,56 +1100,211 @@ def generate(engine, input_ids, params, eos_id, eos_set=None, kv=None):
                 start = len(input_ids) - 1
             ids = (ctypes.c_int32 * len(seg))(*seg)
             lp = lib.tg_forward(model, ids, len(seg), cache, start)
-        if not lp: yield "[prefill error]"; return
+        if not lp:
+            yield "[prefill error]"; return
 
         cur = len(input_ids); resp = ""; _lid = -1; _con = 0
         _recent = []; _so_far = ""; _first = True
         # ★ TURN_SCOPED_DRY：仅本轮生成的 token（DRY 的作用域）
         _turn_ids = []
+        # ★ 围栏代码块状态（2026-10-10 加）
+        #   _fence_open: 0=代码块外, 1=代码块内（每到 3 个连续反引号翻转一次）
+        #   _ticks     : 连续反引号计数（本模型词表把 ``` 拆成 '``'+'`' 两个 token，
+        #                所以不能用 ts == '```' 判断）
+        #   代码块内会禁用"英文洪水检测/复读检测/Soft-Stop"，否则写代码会被腰斩。
+        _fence_open = 0
+        _ticks = 0
+        _in_code = False
+        _code_overrides = False      # 代码块内是否已切换到防复读参数
+        _saved_params = {}
+        _code_len = 0                # 已进入围栏后生成的 token 数（催闭合用）
+        # ★ 围栏闭合串 "```" 的 token id 序列。本模型词表把它拆成
+        #   '``'(22450) + '`'(73) 两个 token —— 只要【最后一个】token 是 ` 就算闭合，
+        #   所以概率控制的目标取"反引号"这个 token（id 由下面探测得到）。
+        _at_line_start = True        # 上一个生成字符是否是换行（用于行首限定）
+        closing_tid = -1
+        try:
+            _tick_ids = engine.encode('`', add_bos=False)
+            if _tick_ids:
+                closing_tid = int(_tick_ids[0])
+        except Exception:
+            closing_tid = -1
+
+        # ★ 停止原因追踪（设 TGAI_STOP_TRACE=1 时会打印，便于排查"输出被腰斩"）
+        #   为什么需要：generate() 里有 6 条 break 分支（EOS / 2-gram / 3-gram /
+        #   8-gram / 英文洪水 / 同 token 超限 / max_tokens），出问题时无法判断是哪条。
+        import os as _os
+        _trace = _os.environ.get('TGAI_STOP_TRACE') == '1'
+        _stop_reason = None
 
         for step in range(max_tok):
             arr = np.ctypeslib.as_array(ctypes.cast(lp, FloatArr), shape=(vocab,)).copy()
 
             if _con >= 3: arr[_lid] -= _con * 5.0
-            if _con > 15: break
+            if _con > 15:
+                _stop_reason = 'same-token x%d' % _con
+                break
             if step < min_tok:
                 for e in eos_set:
                     if 0 <= e < vocab: arr[e] = -np.inf
+
+            # ★★★ 代码块保护（2026-10-10 加）—— 用户设计
+            #
+            #  与 llama.cpp 的 grammar 约束同原理（官方 Grammars 文档：
+            #  https://mintlify.wiki/ggml-org/llama.cpp/advanced/grammars ）：
+            #    一旦进入【未闭合的 ``` 围栏代码块】，把所有 EOG/停止标记的
+            #    logit 压到 -inf，强制模型先把代码块写完再允许结束。
+            #
+            #  为什么必须做（实测症状）：
+            #    问"用python写个小游戏代码"，输出 13~16 token 就断在
+            #    `def generate_random_` 半句上；同一模型在 llama.cpp 上却能
+            #    写完整个代码块。不是能力差异 —— 是我们有几条【为中文对话设计】
+            #    的守卫会误杀代码：
+            #      ① 英文洪水检测（代码天然全是 ASCII 字母）
+            #      ② 2/3/8-gram 复读检测（代码里 print/for/arr 天然重复）
+            #      ③ Soft-Stop 长度递增收尾偏置（代码写一半就被催停）
+            #    进入代码块后这三类守卫全部让路。
+            #
+            #  安全性：代码块内仍受 max_tokens 与 cur>=max_seq 硬上限约束。
+            _in_code = (_fence_open & 1) == 1
+            if _in_code:
+                for e in eos_set:
+                    if 0 <= e < vocab:
+                        arr[e] = -np.inf
+                # ★★ 催闭合围栏（2026-10-10 加，用户设计）
+                #
+                #  设计（用户指定）：
+                #    进入代码块后，P(```) 随已输出长度递增，但【封顶 99%】——
+                #    即越写越倾向收尾，却永远保留 5% 继续写的可能，
+                #    不会硬性逼停。出现 ``` 后【不停止生成】，让模型继续
+                #    在块外输出说明（在那里自然收尾）。
+                #
+                #  为什么不用 "<回答>" 当出口（走过的弯路）：
+                #    <回答> 是【引导模型进入直答模式】的结构标记，
+                #    拿它当停止符会截断正常回答；实测用它当偏置目标时，
+                #    模型会开始往代码里吐 `<回答>` 文本（`A list of <回答>` 刷屏）。
+                #
+                #  为什么用"按概率反解 logit"而不是直接加常数偏置：
+                #    直接加 logit 常数时，"加多少"与"实际概率"是非线性关系，
+                #    长度一长就压不住（或反过来压爆）。按目标概率反解才能精确
+                #    控制到 95% 这个上限。
+                if closing_tid >= 0 and _code_len > 0 and _at_line_start:
+                    # ★ 只在【行首】施加（2026-10-10 修，踩坑后加）
+                    #   踩坑：不分位置地把反引号概率抬到 95%，代码被污染成
+                    #         `u'])  /  generate_`print()  /  `bubble_sort(...)`
+                    #         —— 反引号在代码里天然高频（字典 {'a'}、字符串模板），
+                    #         单独抬它的概率等于到处乱吐。
+                    #   正解：闭合围栏一定出现在【行首】，而代码行首几乎不会是
+                    #         反引号 ⇒ 只在行首施加偏置，既能把围栏逼出来，
+                    #         又不会污染代码内部。
+                    _mx = arr.max()
+                    if np.isfinite(_mx):
+                        _ex = np.exp(arr - _mx)
+                        _tot = _ex.sum()
+                        _pc = float(_ex[closing_tid]) / _tot if _tot > 0 else 0.0
+                        # 目标概率：随长度线性上升到 CODE_CLOSE_MAX_P，封顶
+                        _pt = min(CODE_CLOSE_MAX_P,
+                                  _pc + _code_len * CODE_CLOSE_GAIN)
+                        if _pt > _pc:
+                            # 解所需 logit：需要 (sum_ex - ex_c) * _pt/(1-_pt) 作为新的 ex_c
+                            _rest = _tot - float(_ex[closing_tid])
+                            if _rest > 0 and _pt < 1.0:
+                                _ex_need = _rest * _pt / (1.0 - _pt)
+                                _bias = float(np.log(_ex_need)) - float(np.log(float(_ex[closing_tid])))
+                                arr[closing_tid] += _bias * CODE_CLOSE_SMOOTH
 
             tid = sample_numpy(arr, temp, top_k, top_p, vocab,
                                p=params, recent=_recent,
                                decode_fn=_dry_raw_decode,
                                turn_recent=_turn_ids,
                                # ★ Soft-Stop（长度递增收尾偏置）
-                               #   比例阈值在这里换算成绝对值：at_remain 是"剩余多少"
-                               #   （相对 max_tok），after 是"已生成多少"。
-                               #   eos_set 已含 eos + 轮次边界标记（ChatSession 里合成）。
+                               #   代码块内传空 eos_ids 使其自动失效，避免催停半截代码
                                max_tok=max_tok, step=step,
-                               eos_ids=eos_set)
+                               eos_ids=(set() if _in_code else eos_set))
 
             # EOS check (after min_tokens) — 支持多 EOS token
-            if tid in eos_set and step >= min_tok: break
+            if tid in eos_set and step >= min_tok:
+                _stop_reason = 'EOS id=%d at step %d' % (tid, step)
+                break
 
             _con = _con + 1 if tid == _lid else 0; _lid = tid
             _recent.append(tid)
             _turn_ids.append(tid)
             if len(_recent) > 12: _recent = _recent[-12:]
-            if len(_recent) >= 6 and step >= min_tok:
-                if _recent[-2:] == _recent[-4:-2] == _recent[-6:-4]: break
-            if len(_recent) >= 9 and step >= min_tok:
-                if _recent[-3:] == _recent[-6:-3] == _recent[-9:-6]: break
-            # ★ 模板复读检测（2026-10-10 加）
-            #   训练语料的表单模板会成段重复（'[简称]|[机构名称]|[职称]|…'），
-            #   特征是【8-gram 连续重复 3 次】。原 3/2-gram 检测抓不到长结构。
-            if len(_turn_ids) >= 24 and step >= min_tok:
-                a3 = _turn_ids[-24:-16]
-                a2 = _turn_ids[-16:-8]
-                a1 = _turn_ids[-8:]
-                if a1 == a2 == a3: break
+            # ★ 复读检测在代码块内让路（2026-10-10）：代码里 `arr[i]`、`print(`、
+            #   `for x in` 这类片段天然高频重复，用对话场景的 n-gram 阈值会误杀。
+            #   代码块内只保留 max_tokens 硬上限与"同一 token 连续 15 次"兜底。
+            if not _in_code:
+                if len(_recent) >= 6 and step >= min_tok:
+                    if _recent[-2:] == _recent[-4:-2] == _recent[-6:-4]:
+                        _stop_reason = '2-gram repeat at step %d' % step; break
+                if len(_recent) >= 9 and step >= min_tok:
+                    if _recent[-3:] == _recent[-6:-3] == _recent[-9:-6]:
+                        _stop_reason = '3-gram repeat at step %d' % step; break
+                # ★ 模板复读检测（2026-10-10 加）
+                #   训练语料的表单模板会成段重复（'[简称]|[机构名称]|[职称]|…'），
+                #   特征是【8-gram 连续重复 3 次】。原 3/2-gram 检测抓不到长结构。
+                if len(_turn_ids) >= 24 and step >= min_tok:
+                    a3 = _turn_ids[-24:-16]
+                    a2 = _turn_ids[-16:-8]
+                    a1 = _turn_ids[-8:]
+                    if a1 == a2 == a3:
+                        _stop_reason = '8-gram repeat at step %d' % step; break
 
             ts = engine.decode(tid)
             if ts:
                 resp += ts; _so_far += ts
+                # ★ 更新围栏代码块状态（2026-10-10 加，两处踩坑后重写）
+                #
+                #  坑①（时序）：必须在解码出 ts 之后【立即】更新，并让后续所有守卫
+                #      读【更新后】的 _in_code。原实现把 _in_code 在循环开头算好，
+                #      生成围栏那一步它还是 False ⇒ 保护晚一拍。
+                #  坑②（分词）：本模型的词表把 ``` 拆成两个 token ——
+                #      '``'(22450) + '`'(73)。实测 e.encode('```')
+                #      → [(22450, '``'), (73, '`')]。
+                #      所以 `if '```' in ts` 永远不成立，围栏状态根本没翻转。
+                #      ⇒ 改为累计【连续反引号计数】，>=3 即视为围栏。
+                for _ch in ts:
+                    if _ch == '`':
+                        _ticks += 1
+                    else:
+                        _ticks = 0
+                    if _ticks >= 3:
+                        _fence_open ^= 1     # 到 3 个就翻转，并把计数清零
+                        _ticks = 0
+                _at_line_start = ts.endswith('\n')
+                _in_code = _fence_open == 1
+                if _in_code:
+                    _code_len += 1
+                else:
+                    _code_len = 0
+                # ★ 代码块内【适度】恢复惩罚（2026-10-10 加，实测调出来）
+                #
+                #  演进（两个极端都试过，都不行）：
+                #    ① 完全不让路 → ascii-flood 在 step 15 把代码腰斩
+                #                   （输出停在 `def generate_random_`）
+                #    ② 完全让路   → 围栏能写完了，但模型陷入
+                #                   "def generate_random_xxx" 复读（458 token 全是变体）
+                #  正解：代码块内【保留 DRY 与重复惩罚】，只让路"硬停止启发式"：
+                #    - 让路：ascii-flood / 2/3/8-gram 硬 break / Soft-Stop
+                #    - 保留并加强：DRY 与 repeat_penalty（只调分数、不硬切，正适合挡代码复读）
+                #  对照 llama.cpp 调参台默认值（它代码写得完整的原因）：
+                #    repeat_penalty 1.25 / frequency_penalty 0.25 / dry_multiplier 4.5
+                #    —— 比我们原来的 1.05 / 0 / 0.8 猛得多。
+                if _in_code and not _code_overrides:
+                    _saved_params = {k: params.get(k) for k in
+                                     ('repeat_penalty', 'dry_multiplier', 'frequency_penalty')}
+                    params['repeat_penalty'] = CODE_REPEAT_PENALTY
+                    params['dry_multiplier'] = CODE_DRY_MULTIPLIER
+                    params['frequency_penalty'] = CODE_FREQ_PENALTY
+                    _code_overrides = True
+                elif _code_overrides and not _in_code:
+                    for _k, _v in _saved_params.items():
+                        if _v is None:
+                            params.pop(_k, None)
+                        else:
+                            params[_k] = _v
+                    _code_overrides = False
                 # Stop on training format / ChatML control token leakage
                 if any(m in _so_far for m in stop_patterns):
                     for m in stop_patterns:
@@ -1104,10 +1313,25 @@ def generate(engine, input_ids, params, eos_id, eos_set=None, kv=None):
                             _so_far = _so_far[:idx]
                             break
                     break
-                # Non-Chinese flood detection
-                if step >= min_tok and step >= 15 and len(_so_far) >= 30:
+                # ★★ Non-Chinese flood detection（2026-10-10 重写）
+                #
+                #  原实现：最近 30 个字符里 ASCII 字母 > 18 个就 break。
+                #  问题：这是为【中文对话】设计的启发式，用来挡住模型跑偏成
+                #        英文复读；但 Python/C/JS 代码天然全是 ASCII 字母 ——
+                #        "import random\ndef generate_random():" 一出现就触发，
+                #        导致【写代码时被腰斩】。
+                #        实测：用户问"用python写个小游戏代码"，
+                #              输出 16~80 token 就断在半句代码上。
+                #  修复：① 进入 ``` 围栏代码块后不检测（代码本来就该是 ASCII）；
+                #        ② 未在代码块时也把阈值放宽到 24/30，
+                #           避免 "好的，我帮你写一个 demo.py 文件" 这类中英混排误杀。
+                if (_in_code is False and _fence_open == 0
+                        and step >= min_tok and step >= 15
+                        and len(_so_far) >= 30):
                     tail = _so_far[-30:]
-                    if sum(1 for c in tail if c.isascii() and c.isalpha()) > 18: break
+                    _na = sum(1 for c in tail if c.isascii() and c.isalpha())
+                    if _na > 24:
+                        _stop_reason = 'ascii-flood %d/30 at step %d' % (_na, step); break
                 yield ts
 
             na = (ctypes.c_int32 * 1)(tid)
@@ -1126,7 +1350,16 @@ def generate(engine, input_ids, params, eos_id, eos_set=None, kv=None):
             if kv is not None:
                 kv.ids.append(tid)
             cur += 1
-            if cur >= max_seq: break
+            if cur >= max_seq:
+                _stop_reason = 'hit max_seq(%d)' % max_seq
+                break
+        else:
+            _stop_reason = 'hit max_tokens(%d)' % max_tok
+        if _trace:
+            print('\n%s[stop] %s  (生成 %d tok, 围栏状态 %s)%s'
+                  % (C.YLW, _stop_reason or '未记录', step + 1,
+                     '代码块内' if (_fence_open & 1) else '代码块外', C.RST),
+                  file=sys.stderr, flush=True)
     finally:
         if own_cache:
             lib.tg_kvcache_free(cache)

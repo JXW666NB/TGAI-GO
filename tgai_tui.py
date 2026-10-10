@@ -24,6 +24,72 @@ from tgai_chat import (C, TGEngine, ChatSession, generate,   # noqa: E402
                        DRY_BREAKERS)
 
 # ══════════════════════════════════════════════════════════════
+#  视觉层 —— 全部委托给 tgai_ui（在终端里渲染「GUI 聊天窗口」观感）
+#
+#  为什么抽成独立模块：
+#    业务逻辑（命令 / 调参 / 生成循环）与"怎么画"分离，
+#    改视觉只动 tgai_ui.py，不动这个已经稳定跑通的 TUI 主流程。
+#  风格参考：小狸 CLI / Claude Code —— 不用聊天气泡，靠
+#    前缀字形 + 色块 + Markdown 样式区分角色与结构。
+# ══════════════════════════════════════════════════════════════
+from tgai_ui import (Frame, MdStream, md_render, md_print,      # noqa: E402
+                     term_width, dw, wrap, trunc_pad)           # noqa: E402
+import tgai_ui as U                                            # noqa: E402
+
+# 窗框（全局单例，宽度随终端取一次）
+FRAME = Frame(title='TGAI GO', right='')
+
+
+def ui_begin(model_name, right=''):
+    """画窗口顶栏 + 状态行（模型加载完成后调用一次）"""
+    FRAME.right = right
+    FRAME.top()
+
+
+def ui_rule(label=''):
+    FRAME.rule(label)
+
+
+def ui_row(text='', color=''):
+    FRAME.row(text, color)
+
+
+def ui_status(pairs):
+    """状态摘要：一行关键参数 + 一行操作提示（替代原先刷屏的加载日志）"""
+    parts = ['%s%s%s %s' % (U.META, k, U.RST, v) for k, v in pairs]
+    FRAME.row('')
+    FRAME.row('  ' + '   '.join(parts))
+    FRAME.row('  ' + U.META + '/help 命令 · /params 调参 · /exit 退出' + U.RST)
+    FRAME.row('')
+
+
+def ui_user(text):
+    """用户消息（无气泡，前缀字形区分）"""
+    FRAME.row('')
+    print('%s%s%s %s%s❯ You%s  %s' % (U.LINE, U.V, U.RST, U.USER, U.BLD, U.RST, text))
+    FRAME.row('')
+
+
+def ui_ai_start():
+    """助手回复起始行；返回流式渲染器（内容区宽 = 窗口内宽 - 6）"""
+    print('%s%s%s %s%s◆ TGAI%s' % (U.LINE, U.V, U.RST, U.AI, U.BLD, U.RST))
+    pfx = '%s%s%s   ' % (U.LINE, U.V, U.RST)
+    return MdStream(width=FRAME.W - 6, prefix=pfx)
+
+
+def ui_ai_meta(cnt, sec, tps, note=''):
+    s = '  %d tok · %.1fs · %.1f tok/s' % (cnt, sec, tps)
+    if note:
+        s += ' · ' + note
+    FRAME.row('')
+    FRAME.row(s, U.META)
+
+
+def ui_end():
+    FRAME.bottom()
+
+
+# ══════════════════════════════════════════════════════════════
 #  参数表（TUI 的核心：所有可调参数集中在这里，/set 与 /params 共用）
 # ══════════════════════════════════════════════════════════════
 PARAM_SPEC = [
@@ -300,11 +366,9 @@ def main():
                     choices=list(PRESETS.keys()), help='启动预设')
     args = ap.parse_args()
 
-    print(f"{C.CYN}{C.BLD}")
-    print('  ╔══════════════════════════════════════════╗')
-    print('  ║        TGAI GO  ·  交互式对话 TUI         ║')
-    print('  ╚══════════════════════════════════════════╝')
-    print(f'{C.RST}')
+    # ── 视觉：先开窗（避免加载期"黑屏等半天"），加载完再补状态行 ──
+    _mname = os.path.basename(args.model or '') or '(自动)'
+    ui_begin(_mname, right='加载中…')
 
     engine = TGEngine(dll_path=args.dll)
     engine.load(args.model, extend_ctx=args.extend)
@@ -340,21 +404,40 @@ def main():
         if _pv != SPEC_BY_NAME[_k][2]:
             changed.add(_k)
     if _n_meta:
-        print(f"{C.DIM}模型自带采样默认值已应用: {_n_meta} 项"
-              f"（{', '.join('%s=%s' % (k, params[k]) for k in list(_meta_gd)[:4])}…）{C.RST}")
+        _applied = ', '.join('%s=%s' % (k, params[k]) for k in list(_meta_gd)[:4])
+        changed.add('__meta__')          # 仅用于状态行提示，不参与参数比较
+        _meta_note = '模型自带默认值 %d 项（%s…）' % (_n_meta, _applied)
+    else:
+        _meta_note = ''
 
     ctx = {'engine': engine, 'chat': chat, 'params': params,
            'changed': changed, 'last_stat': None, 'changed_turns': 0}
 
-    print(f"{C.DIM}预设={args.preset}  档位={getattr(chat, 'think_mode', 'direct')}"
-          f"  停止符={len(chat.eos_set)} 个{C.RST}")
-    print(f"{C.DIM}输入 {C.RST}{C.GRN}/help{C.RST}{C.DIM} 看命令；"
-          f"{C.RST}{C.GRN}/params{C.RST}{C.DIM} 调参{C.RST}\n")
+    # ── 视觉：把加载信息压成一行状态摘要（不再刷屏）──
+    _cfg = engine.cfg
+    _ctx = '%dK' % (_cfg['max_seq'] // 1024) if _cfg.get('max_seq') else '?'
+    _exp = '%d/%d' % (_cfg.get('n_experts', 0), _cfg.get('n_activated', 0)) \
+        if _cfg.get('n_experts') else 'dense'
+    _pairs = [
+        ('模型', _mname),
+        ('层', _cfg.get('n_layers', '?')),
+        ('维度', _cfg.get('d_model', '?')),
+        ('上下文', _ctx),
+        ('专家', _exp),
+        ('线程', engine.get_threads() if hasattr(engine, 'get_threads') else 4),
+        ('档位', getattr(chat, 'think_mode', 'direct')),
+        ('temp', params.get('temperature', 0.3)),
+        ('top_k', params.get('top_k', 60)),
+    ]
+    ui_rule('对话')
+    ui_status(_pairs)
+    if _meta_note:
+        ui_row('  ' + U.META + _meta_note + U.RST)
 
     try:
         while True:
             try:
-                ui = input(f"{C.GRN}You ›{C.RST} ").strip()
+                ui = input('\n' + U.USER + U.BLD + '❯ You' + U.RST + ' ').strip()
             except (EOFError, KeyboardInterrupt):
                 print()
                 break
@@ -365,32 +448,34 @@ def main():
                     break
                 continue
 
+            ui_user(ui)                       # ★ 用户消息（前缀字形区分）
             t0 = time.time()
             _, ids = chat.build_prompt(ui)
-            print(f"{C.BLU}TGAI ›{C.RST} ", end='', flush=True)
+            stream = ui_ai_start()            # ★ 助手回复（流式 Markdown 渲染）
             try:
                 out, cnt = '', 0
                 for tok in generate(engine, ids, params,
                                     eos_id=chat.eos, eos_set=chat.eos_set,
                                     kv=engine.kv_handle()):
-                    print(tok, end='', flush=True)
+                    stream.feed(tok)          # 按整行推进，边生成边渲染
                     out += tok
                     cnt += 1
+                stream.flush()
                 el = time.time() - t0
                 tps = cnt / el if el > 0 else 0.0
                 ctx['last_stat'] = {'n': cnt, 'sec': el, 'tps': tps}
-                tag = '' if out.strip() else f" {C.YLW}[空回复]{C.RST}"
-                print(f"\n{C.DIM}  {cnt} tok | {el:.1f}s | {tps:.1f} tok/s{tag}{C.RST}")
+                ui_ai_meta(cnt, el, tps, '' if out.strip() else '空回复')
                 if out.strip():
                     chat.add(ui, out.strip())
             except Exception as exc:                                # noqa: BLE001
-                print(f"\n{C.RED}[生成失败] {exc}{C.RST}")
+                print('%s   %s[生成失败] %s%s' % (U.LINE + U.V + U.RST,
+                                                  U.ERR, exc, U.RST))
     except KeyboardInterrupt:
         print()
     finally:
-        print(f"{C.DIM}释放资源...{C.RST}")
+        ui_end()
         engine.free()
-        print(f"{C.GRN}再见！{C.RST}")
+        print('%s  再见！%s' % (U.META, U.RST))
 
 
 if __name__ == '__main__':

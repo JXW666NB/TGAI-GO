@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tgai-go"
+version = "1.0.0"
+description = "TGAI GO —— 纯 Python 的 TGAI 模型推理库（CPU 引擎，零编译安装）"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "TGAI" }]
+keywords = ["tgai", "llm", "inference", "moe", "chinese", "llama"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Intended Audience :: Developers",
+]
+dependencies = [
+    # 只有 numpy：采样与张量运算用
+    "numpy>=1.20",
+]
+
+[project.optional-dependencies]
+# 外部分词器（大词表模型的兜底方案；不装也能跑内置分词器）
+tokenizer = ["tokenizers>=0.15"]
+# 开发/测试
+dev = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/tgai/tgai-go"
+Documentation = "https://github.com/tgai/tgai-go#readme"
+
+[project.scripts]
+# 命令行入口（可选）：tgai-go chat -m model.TG
+# 注意这只是薄封装，主要用法是 import tgai_go
+tgai-go = "tgai_go.__main__:main"
+
+[tool.setuptools]
+packages = ["tgai_go"]
+include-package-data = true
+zip-safe = false
+
+[tool.setuptools.package-data]
+# ★ 原生引擎随包分发：用户 pip install 后无需编译
+#   文件名由 build_wheel.py 按平台放置
+"tgai_go" = ["_native/*.dll", "_native/*.so", "_native/*.dylib", "_native/README.md"]
+
+[tool.setuptools.exclude-package-data]
+"*" = ["*.pyc", "__pycache__/*", "*.c", "*.obj", "*.lib", "*.exp"]

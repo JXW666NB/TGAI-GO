@@ -135,10 +135,20 @@ ARCH_CONFIG = {
 }
 
 # ============================================================================
-# .TG Format Constants (from tgai_format.h v1, 保持向后兼容)
+# .TG Format Constants (与 tgai_format.h / orv_tg.h 严格对齐)
 # ============================================================================
+# 输出 v3 格式: GGUF 转换后的 .TG 可直接被 GO 引擎加载 (v1/v3 均向后兼容),
+#              也可作为 pack_multi.py 的 LLM 基底打包多模态 .TG v3.
+#   v3 vs v1 差异 (仅 header 8 字节):
+#     offset 4:   version        1 → 3
+#     offset 120: modality_flags 0 → TEXT(1)   (v1 此处为 reserved=0, 等价)
+#     offset 124: extension_off  0 (无子模型扩展段, 纯文本 LLM)
+#   GO 引擎 tg_load() 接受 v1 和 v3 (tgai_engine.c:1245),
+#   v3 纯文本模式校验 modality_flags 仅含 TEXT 位 (tgai_engine.c:1258-1270).
 TG_MAGIC = 0x49414754  # "TGAI" little-endian
-TG_VERSION = 1  # 与 tgai_format.h 一致: v1 保持向后兼容
+TG_VERSION = 3          # v3 多模态格式 (向后兼容 v1: 引擎同时接受 v1/v3)
+TG_VERSION_V1 = 1       # 旧版, 仅用于读取/识别
+TG_MODALITY_TEXT = 1    # 1 << 0, 纯文本 LLM
 TG_HEADER_SIZE = 128
 TG_WEIGHT_ENTRY_SIZE = 52
 TG_MAX_NDIM = 4
@@ -208,6 +218,7 @@ class GGUFReader:
         self.version = 0
         self.n_tensors = 0
         self.n_kv = 0
+        self.tensor_data_start = 0  # tensor data 区域起始 (GGUF v3 offset 相对此处)
         self._read_header()
         self._read_metadata()
         self._read_tensor_infos()
@@ -395,6 +406,14 @@ class GGUFReader:
                 'n_elems': math.prod(dims) if dims else 0,
             }
 
+        # GGUF v3: tensor offset 是相对 tensor data 区域起始的偏移.
+        # tensor data 紧跟 tensor infos, 起始位置对齐到 self.alignment.
+        # read_tensor_data 读取时必须 seek(tensor_data_start + offset),
+        # 否则读到错误位置 (header/metadata 区域) → 权重全 0 或错位.
+        # ⚠️ 此前缺失此偏移, 导致 F32 norm 权重读到极小值→FP16 截断为0,
+        #    F16 权重读到错位数据 (巧合有值但错误), 生成全乱码.
+        self.tensor_data_start = align_offset(self.f.tell(), self.alignment)
+
     # ---------- Config Extraction ----------
     def get_config(self) -> dict:
         """
@@ -453,10 +472,10 @@ class GGUFReader:
                 f'{arch_name}.rope.freq_base', 10000.0
             ),
             'n_experts': self.metadata.get(
-                f'{arch_name}.expert_count', 1
+                f'{arch_name}.expert_count', 0
             ),
             'n_activated': self.metadata.get(
-                f'{arch_name}.expert_used_count', 1
+                f'{arch_name}.expert_used_count', 0
             ),
         }
 
@@ -486,7 +505,8 @@ class GGUFReader:
             # Unknown type: fall back to 2 bytes per element
             byte_size = n_elems * 2
 
-        self.f.seek(offset)
+        # GGUF v3: offset 是相对 tensor data 起始的偏移, 必须加上 data_start
+        self.f.seek(self.tensor_data_start + offset)
         return self.f.read(byte_size)
 
 
@@ -994,6 +1014,188 @@ def serialize_tokenizer(reader: GGUFReader, cfg: dict) -> bytes:
 
 
 # ============================================================================
+# Sidecar Tokenizer Export (HF tokenizer.json for large-vocab models)
+# ============================================================================
+def export_sidecar_tokenizer(reader: 'GGUFReader', cfg: dict, output_path: str):
+    """从 GGUF 元数据构建 HF 格式 tokenizer.json 并保存到 .TG 旁边.
+
+    背景:
+      .TG 格式的分词器段用 uint16 存储 BPE merge 对的 token ID (max 65535).
+      原生 TGAI 模型 (NB V1 vocab=32768, MINI vocab=8192) 都 ≤ 65535, 没问题.
+      但外部大词表模型 (Qwen2.5 vocab=151936) 有 24% merge 对涉及 ID > 65535,
+      被 serialize_tokenizer 直接跳过 → 引擎 BPE 编码残缺 → 生成乱码.
+
+    方案:
+      转换时额外导出一份 HF 标准 tokenizer.json (含完整 vocab + merges),
+      放在 .TG 旁边作为 sidecar. 聊天接口检测到 sidecar 就用 Python tokenizers
+      库做 encode/decode, 绕过引擎 uint16 分词器限制.
+      原生 TGAI 模型没有 sidecar, 继续走引擎内置分词器, 零影响.
+
+    参数:
+      reader: GGUFReader 实例 (含已解析的 metadata)
+      cfg: 配置字典 (含 vocab_size, bos_id, eos_id 等)
+      output_path: sidecar tokenizer.json 输出路径
+    返回:
+      成功返回 output_path, 跳过返回 None
+    """
+    try:
+        from tokenizers import Tokenizer
+        from tokenizers.models import BPE
+        from tokenizers.pre_tokenizers import ByteLevel
+        from tokenizers.decoders import ByteLevel as ByteLevelDecoder
+    except ImportError:
+        print("    [WARN] `tokenizers` 库未安装, 跳过 sidecar 分词器导出")
+        print("           安装: pip install tokenizers")
+        return None
+
+    tokens = reader.metadata.get('tokenizer.ggml.tokens', [])
+    merges = reader.metadata.get('tokenizer.ggml.merges', [])
+    model_type = reader.metadata.get('tokenizer.ggml.model', 'gpt2')
+
+    if not tokens:
+        print("    [WARN] GGUF 元数据无 tokenizer.ggml.tokens, 跳过 sidecar")
+        return None
+
+    if model_type != 'gpt2':
+        print(f"    [WARN] tokenizer model={model_type} (非 gpt2 BPE), sidecar 可能不准确")
+
+    # 构建 vocab dict: token_str -> id
+    vocab = {}
+    for i, tok in enumerate(tokens):
+        if isinstance(tok, str):
+            vocab[tok] = i
+
+    # 构建 merges list: [(a_str, b_str), ...]
+    merges_list = []
+    skipped_merges = 0
+    for m in merges:
+        if not isinstance(m, str) or ' ' not in m:
+            continue
+        parts = m.split(' ', 1)
+        if len(parts) == 2 and parts[0] in vocab and parts[1] in vocab:
+            merges_list.append((parts[0], parts[1]))
+        else:
+            skipped_merges += 1
+
+    # unk token
+    unk_id = cfg.get('unk_id', 0)
+    unk = tokens[unk_id] if 0 <= unk_id < len(tokens) and isinstance(tokens[unk_id], str) else '<unk>'
+
+    # 构建 tokenizer
+    tok = Tokenizer(BPE(vocab=vocab, merges=merges_list, unk_token=unk))
+    tok.pre_tokenizer = ByteLevel(add_prefix_space=False, use_regex=True)
+    tok.decoder = ByteLevelDecoder()
+    tok.post_processor = None  # 不自动加特殊 token, 由上层 prompt 模板控制
+
+    # ── 注册特殊 token (CONTROL + USER_DEFINED) ──
+    # GGUF 的 tokenizer.ggml.token_type 标记每个 token 的类型:
+    #   1=NORMAL, 2=UNKNOWN, 3=CONTROL, 4=USER_DEFINED, 5=UNUSED, 6=BYTE
+    # 特殊 token (type 3/4) 如 <|im_start|>, <|im_end|> 已在 vocab 中,
+    # 但 BPE 编码器不会整匹配它们 — ByteLevel 预分词器会按正则拆散后再做 BPE.
+    # 必须用 add_special_tokens() 注册, 让 tokenizer 在预分词之前整匹配这些 token.
+    # 否则 <|im_start|> 被拆成多个 byte-level 子 token → ChatML 检测失败 → 编码错误.
+    token_types = reader.metadata.get('tokenizer.ggml.token_type', [])
+    special_strs = []
+    if token_types and len(token_types) == len(tokens):
+        for i, tt in enumerate(token_types):
+            # type 3=CONTROL, 4=USER_DEFINED → 特殊 token
+            if tt in (3, 4) and isinstance(tokens[i], str):
+                special_strs.append(tokens[i])
+    if special_strs:
+        n_added = tok.add_special_tokens(special_strs)
+        print(f"    Special tokens: {len(special_strs)} registered "
+              f"({n_added} new to vocab)")
+
+    # 保存
+    tok.save(output_path)
+    fsize = os.path.getsize(output_path)
+    print(f"    Sidecar tokenizer: {output_path}")
+    print(f"      vocab={len(vocab)} merges={len(merges_list)} "
+          f"(skipped_unresolvable={skipped_merges}) size={fsize / 1024:.1f}KB")
+    return output_path
+
+
+# ============================================================================
+# RoPE Dimension Permutation: half-rotate (LLaMA/Qwen) -> interleaved (TGAI)
+# ============================================================================
+# TGAI 引擎的 RoPE 按 (i, i+1) 相邻配对旋转 (GPT-J 风格, 见 tgai_engine.c rope());
+# 而 LLaMA / Qwen2 / Mistral / Gemma / Phi 等 HF 模型用 rotate_half 风格,
+# 按 (i, i+d_k/2) 跨半配对旋转. 二者数学等价, 仅差一个输出维度的重排:
+#   设 head_dim = d_k, 原始(旋转半)布局 x 的配对为 (x[k], x[k+d_k/2]), k∈[0,d_k/2)
+#   目标(交错式)布局 y 的配对为 (y[2k], y[2k+1])
+#   令 y[2k]=x[k], y[2k+1]=x[k+d_k/2] 即可使引擎的交错式 RoPE 等价于原始旋转半 RoPE.
+#
+# 导入外部 GGUF 权重时, 必须对 Q/K 投影权重的"输出维"(行)及 Q/K bias 做 per-head
+# 重排, 否则引擎用交错式 RoPE 跑旋转半权重 → 旋转角度作用到错误元素 → attention
+# 打乱 → 输出乱码/重复 token. 这是 GGUF→.TG 转换"变成我们的样子"的关键一步.
+_PERM_CACHE = {}  # d_k -> np.ndarray perm index
+
+def _rope_perm_index(d_k: int):
+    """构建 per-head 输出维重排索引: new[i] = old[perm[i]].
+    perm[2k]=k, perm[2k+1]=k+d_k/2, k∈[0,d_k/2). d_k 必须为偶数."""
+    import numpy as np
+    if d_k in _PERM_CACHE:
+        return _PERM_CACHE[d_k]
+    if d_k % 2 != 0:
+        return None
+    perm = np.empty(d_k, dtype=np.int64)
+    half = d_k // 2
+    for k in range(half):
+        perm[2 * k]     = k
+        perm[2 * k + 1] = k + half
+    _PERM_CACHE[d_k] = perm
+    return perm
+
+
+def permute_rope_half_to_interleaved(arr, n_heads: int, d_k: int):
+    """对 Q/K 投影输出维做 旋转半→交错式 per-head 重排.
+    arr: 1D [n_heads*d_k] (bias) 或 2D [n_heads*d_k, in_dim] (weight).
+    返回重排后的 numpy 数组 (同 shape); 若形状不符则原样返回 (安全回退)."""
+    import numpy as np
+    perm = _rope_perm_index(d_k)
+    if perm is None or n_heads * d_k != (arr.size if arr.ndim == 1 else arr.shape[0]):
+        return arr
+    if arr.ndim == 1:
+        return np.ascontiguousarray(arr.reshape(n_heads, d_k)[:, perm].reshape(-1))
+    in_dim = arr.shape[1]
+    return np.ascontiguousarray(
+        arr.reshape(n_heads, d_k, in_dim)[:, perm, :].reshape(n_heads * d_k, in_dim)
+    )
+
+
+def maybe_permute_rope(mapped: str, w_bytes, dims, cfg, target_dtype: int):
+    """若 mapped 是 Q/K 投影权重或 Q/K bias, 做 RoPE 维度重排; 否则原样返回."""
+    import numpy as np
+    is_q_w = mapped.endswith('.attn.q_proj.weight')
+    is_k_w = mapped.endswith('.attn.k_proj.weight')
+    is_q_b = mapped.endswith('.attn.q_proj.bias')
+    is_k_b = mapped.endswith('.attn.k_proj.bias')
+    if not (is_q_w or is_k_w or is_q_b or is_k_b):
+        return w_bytes
+    is_q = is_q_w or is_q_b
+    n_heads = cfg['n_heads'] if is_q else cfg['n_kv_heads']
+    d_k = cfg['d_model'] // cfg['n_heads']
+    if d_k % 2 != 0 or n_heads <= 0:
+        return w_bytes
+    np_dtype = np.float16 if target_dtype == TG_DTYPE_FP16 else np.float32
+    arr = np.frombuffer(w_bytes, dtype=np_dtype).copy()
+    is_1d = (len(dims) == 1) or (arr.ndim == 1 and arr.size == n_heads * d_k)
+    if is_1d:
+        if arr.size != n_heads * d_k:
+            return w_bytes
+        out = permute_rope_half_to_interleaved(arr, n_heads, d_k)
+        return np.ascontiguousarray(out).tobytes()
+    # 2D 权重: 数据布局 [out, in] (行=out, 已由 transpose 处理过).
+    # out_dim = n_heads * d_k (已知); in_dim 由总元素数推得 (避免依赖 dims 语义).
+    out_dim = n_heads * d_k
+    if arr.size % out_dim != 0:
+        return w_bytes
+    in_dim = arr.size // out_dim
+    out = permute_rope_half_to_interleaved(arr.reshape(out_dim, in_dim), n_heads, d_k)
+    return np.ascontiguousarray(out).tobytes()
+
+
+# ============================================================================
 # GGUF Tensor Name -> TGAI Standard Name Mapping
 # ============================================================================
 def map_weight_name(gguf_name: str, arch_cfg: dict) -> str | None:
@@ -1048,17 +1250,22 @@ def map_weight_name(gguf_name: str, arch_cfg: dict) -> str | None:
         if rest == f'{o_key}.weight':
             return f'blocks.{layer_idx}.attn.out_proj.weight'
 
-        # FFN (SwiGLU)
+        # FFN (SwiGLU) — 命名对齐 ORV 导出 / 引擎稠密 FFN 查找 (init_block_cache)
+        #   ffn.w1 = gate (silu 分支)   [d_ff, d_model]
+        #   ffn.w2 = up   (直通分支)     [d_ff, d_model]
+        #   ffn.w3 = down (输出投影)      [d_model, d_ff]
+        # 引擎 n_experts==0 时查找 blocks.{i}.ffn.w1/w2/w3.weight,
+        # 故 GGUF 的 gate/up/down 必须映射到 w1/w2/w3, 否则引擎找不到 FFN 权重 → NULL 崩溃.
         gate_key = arch_cfg.get('gate', 'ffn_gate')
         up_key = arch_cfg.get('up', 'ffn_up')
         down_key = arch_cfg.get('down', 'ffn_down')
 
         if rest == f'{gate_key}.weight':
-            return f'blocks.{layer_idx}.ffn.gate.weight'
+            return f'blocks.{layer_idx}.ffn.w1.weight'
         if rest == f'{up_key}.weight':
-            return f'blocks.{layer_idx}.ffn.up.weight'
+            return f'blocks.{layer_idx}.ffn.w2.weight'
         if rest == f'{down_key}.weight':
-            return f'blocks.{layer_idx}.ffn.down.weight'
+            return f'blocks.{layer_idx}.ffn.w3.weight'
 
         # Layer norms
         ln1_key = arch_cfg.get('ln1', 'attn_norm')
@@ -1069,7 +1276,17 @@ def map_weight_name(gguf_name: str, arch_cfg: dict) -> str | None:
         if rest == f'{ln2_key}.weight':
             return f'blocks.{layer_idx}.ln2.weight'
 
-        # Skip bias tensors (TGAI engine doesn't support bias in linear layers)
+        # QKV biases — Qwen2/LLaMA attention 的 Q/K/V 投影带 bias.
+        # TGAI 引擎支持可选 bias (block_cache 查找, 缺失即跳过, 向后兼容).
+        # 这些 bias 在 maybe_permute_rope 中随 Q/K 权重一起做 RoPE 维度重排.
+        if rest == f'{q_key}.bias':
+            return f'blocks.{layer_idx}.attn.q_proj.bias'
+        if rest == f'{k_key}.bias':
+            return f'blocks.{layer_idx}.attn.k_proj.bias'
+        if rest == f'{v_key}.bias':
+            return f'blocks.{layer_idx}.attn.v_proj.bias'
+
+        # 跳过其余 bias (o_proj/FFN 在所支持的架构中无 bias)
         if rest.endswith('.bias'):
             return None
 
@@ -1152,37 +1369,23 @@ def convert_gguf_to_tg(input_path: str, output_path: str,
             traceback.print_exc()
             sys.exit(1)
 
-        # ── Transpose non-square 2D weights ──
-        # GGUF stores weights in PyTorch/HF convention (e.g. [d_model, vocab]),
-        # but TGAI engine expects the transposed layout (e.g. [vocab, d_model]).
-        # The engine's matmul does: out[n] = dot(x, w[n*K : n*K+K], K)
-        # where w is stored as [N, K] row-major.
-        # For square matrices ([D, D]), the layout is identical either way.
-        needs_transpose = (len(dims) == 2 and dims[0] != dims[1])
-        if needs_transpose:
-            import numpy as np
-            np_dtype = np.float16 if target_dtype == TG_DTYPE_FP16 else np.float32
-            elem_size = np.dtype(np_dtype).itemsize
-            old_rows, old_cols = dims[0], dims[1]
-            new_rows, new_cols = old_cols, old_rows
+        # ── GGUF dims → 引擎 [out, in] 布局 ──
+        # GGUF 存储 ne = [ne0, ne1, ...], ne0 是最内层(最快)维度。
+        # 行主序数据实际形状 = [ne1, ne0] = [out, in] (PyTorch/engine 约定)。
+        # 引擎 matmul 期望 w 为 [N, K]=[out, in] 行主序 — 数据已在正确顺序。
+        # ⚠ 旧代码用 reshape(dims)+.T 会打乱数据: reshape([ne0,ne1]) 错误解释 flat 数据,
+        #   .T 只交换轴但不修复已错位的元素 → token_embedding/k_proj/v_proj/ffn 全乱。
+        #   方阵 (q_proj [896,896]) 因 dims[0]==dims[1] 跳过转置而幸免。
+        # 修复: 只交换 dims 记录为 [ne1, ne0], 不修改 w_bytes (数据顺序本就正确)。
+        # 验证: token_embedding GGUF前5=[-0.0104,0.0408,...] 修复后 TG 应与之一致;
+        #       k_proj GGUF前5=[0.017,-0.056,...] 修复后 TG 应与之一致 (此前不匹配)。
+        if len(dims) == 2 and dims[0] != dims[1]:
+            dims = [dims[1], dims[0]]  # [ne0, ne1] → [ne1, ne0] = [out, in]
 
-            if n_elems > 50000000:
-                # Chunked transpose for very large tensors (e.g. embedding [896, 151936])
-                # Use bytearray as output directly, avoid bytes() copy
-                chunk_rows = max(1, 100000000 // (old_rows * elem_size))
-                src = np.frombuffer(w_bytes, dtype=np_dtype).reshape(old_rows, old_cols)
-                out_buf = bytearray(len(w_bytes))
-                out_view = np.frombuffer(out_buf, dtype=np_dtype).reshape(new_rows, new_cols)
-                for c in range(0, old_rows, chunk_rows):
-                    c_end = min(c + chunk_rows, old_rows)
-                    out_view[:, c:c_end] = src[c:c_end, :].T
-                del src, out_view
-                w_bytes = out_buf  # bytearray, compatible with weight_data += w_bytes
-            else:
-                arr = np.frombuffer(w_bytes, dtype=np_dtype).reshape(old_rows, old_cols)
-                w_bytes = np.ascontiguousarray(arr.T).tobytes()
-
-            dims = [new_rows, new_cols]  # swap for shape recording
+        # ── RoPE 维度重排 (Q/K 投影权重 + Q/K bias) ──
+        # 旋转半(LLaMA/Qwen) → 交错式(TGAI 引擎原生). 仅作用于 Q/K, 其余原样.
+        # 必须在 transpose 之后 (基于 [out, in] 布局对输出维 per-head 重排).
+        w_bytes = maybe_permute_rope(mapped, w_bytes, dims, cfg, target_dtype)
 
         # Pad shape to TG_MAX_NDIM (4D)
         shape_padded = list(dims)
@@ -1211,6 +1414,11 @@ def convert_gguf_to_tg(input_path: str, output_path: str,
         print(f"    [{ggml_name:>5s}] {name:45s} -> {mapped:45s} "
               f"shape={list(dims)} size={length / 1024:.1f}KB")
 
+    # ---- 3.5 Export sidecar tokenizer.json (for large-vocab models) ----
+    # 必须在 reader.close() 之前调用 (函数读取 reader.metadata)
+    sidecar_path = output_path + '.tokenizer.json'
+    export_sidecar_tokenizer(reader, cfg, sidecar_path)
+
     reader.close()
     print(f"  Converted: {converted}, Skipped: {skipped}")
 
@@ -1237,10 +1445,10 @@ def convert_gguf_to_tg(input_path: str, output_path: str,
     # ---- 5. Write .TG file ----
     print(f"  Writing {output_path}...")
 
-    # Build header (128 bytes, v2 format)
+    # Build header (128 bytes, v3 多模态格式 — 纯文本 LLM: modality_flags=TEXT)
     header = bytearray(TG_HEADER_SIZE)
     struct.pack_into('<I', header, 0, TG_MAGIC)               # magic
-    struct.pack_into('<I', header, 4, TG_VERSION)             # version
+    struct.pack_into('<I', header, 4, TG_VERSION)             # version = 3
     struct.pack_into('<I', header, 8, target_dtype)           # weight_dtype
     struct.pack_into('<I', header, 12, cfg['n_layers'])       # n_layers
     struct.pack_into('<I', header, 16, cfg['d_model'])        # d_model
@@ -1262,8 +1470,13 @@ def convert_gguf_to_tg(input_path: str, output_path: str,
     struct.pack_into('<Q', header, 88, weight_table_count)    # weight_table_count
     struct.pack_into('<Q', header, 96, weight_data_off)       # weight_data_off
     struct.pack_into('<Q', header, 104, weight_data_len)      # weight_data_len
-    struct.pack_into('<I', header, 112, cfg['arch_type'])     # arch_type (v2)
-    struct.pack_into('<I', header, 116, cfg['n_kv_heads'])    # num_kv_heads (v2)
+    struct.pack_into('<I', header, 112, cfg['arch_type'])     # arch_type
+    struct.pack_into('<I', header, 116, cfg['n_kv_heads'])    # num_kv_heads
+    # v3 专属字段: modality_flags + extension_off (offset 120/124)
+    #   modality_flags = TEXT(1): 纯文本 LLM, GO 引擎纯文本模式通过校验
+    #   extension_off  = 0: 无子模型扩展段 (纯文本 LLM, 可后续用 pack_multi.py 追加)
+    #   bytearray 初始化为 0, extension_off 无需显式写入
+    struct.pack_into('<I', header, 120, TG_MODALITY_TEXT)     # modality_flags = TEXT
 
     # Build weight index table (52 bytes per entry)
     weight_table = bytearray()
@@ -1304,6 +1517,8 @@ def convert_gguf_to_tg(input_path: str, output_path: str,
     print(f"\n  [OK] Conversion complete!")
     print(f"    Output:  {output_path}")
     print(f"    Size:    {total_size / 1024 / 1024:.1f} MB")
+    print(f"    Format:  .TG v{TG_VERSION} (modality_flags=TEXT, 可被 GO 引擎直接加载)")
+    print(f"             后续可用 pack_multi.py 追加 DiT/VAE/Audio 子模型 → 多模态 .TG v3")
     print(f"    Weights: {weight_table_count}")
     print(f"    Dtype:   {TG_DTYPE_NAMES.get(target_dtype, str(target_dtype))}")
     print(f"    Arch:    {cfg['arch_name']} (type={cfg['arch_type']})")

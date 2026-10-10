@@ -32,10 +32,19 @@ from pathlib import Path
 from functools import reduce
 
 import torch
+import numpy as np
 
 # ─── 常量 ──────────────────────────────────────────
+# 输出 v3 格式: .pt 转换后的 .TG 可直接被 GO 引擎加载 (v1/v3 均向后兼容),
+#              也可作为 pack_multi.py 的 LLM 基底打包多模态 .TG v3.
+#   v3 vs v1 差异 (仅 header 8 字节):
+#     offset 4:   version        1 → 3
+#     offset 120: modality_flags 0 → TEXT(1)
+#     offset 124: extension_off  0 (无子模型扩展段, 纯文本 LLM)
+#   GO 引擎 tg_load() 接受 v1 和 v3 (tgai_engine.c:1245).
 MAGIC = 0x49414754  # "TGAI" little-endian
-VERSION = 1  # 与 tgai_format.h 一致
+VERSION = 3          # v3 多模态格式 (向后兼容 v1: 引擎同时接受 v1/v3)
+MODALITY_TEXT = 1    # 1 << 0, 纯文本 LLM
 HEADER_SIZE = 128
 
 ARCH_MAP = {
@@ -58,19 +67,23 @@ DTYPE_INT8 = 2
 DTYPE_INT32 = 3
 DTYPE_Q8_0 = 4  # block-wise 8-bit: 34B/block (2B scale + 32B int8)
 DTYPE_Q4_0 = 5  # block-wise 4-bit: 18B/block (2B scale + 16B packed)
+DTYPE_BF16 = 6  # ★ v4: bfloat16 (模型原生精度; 转换零损失, 不物化 FP32)
 
 DTYPE_BYTES = {
     DTYPE_FP32: 4, DTYPE_FP16: 2, DTYPE_INT8: 1, DTYPE_INT32: 4,
-    DTYPE_Q8_0: 0, DTYPE_Q4_0: 0  # block-quantized, not per-element
+    DTYPE_Q8_0: 0, DTYPE_Q4_0: 0,  # block-quantized, not per-element
+    DTYPE_BF16: 2,                 # ★ v4: 2 字节/元素
 }
 DTYPE_TORCH = {
     DTYPE_FP32: torch.float32, DTYPE_FP16: torch.float16,
     DTYPE_INT8: torch.int8, DTYPE_INT32: torch.int32,
+    DTYPE_BF16: torch.bfloat16,
 }
 
 DTYPE_NAMES = {
     DTYPE_FP32: 'FP32', DTYPE_FP16: 'FP16', DTYPE_INT8: 'INT8',
     DTYPE_INT32: 'INT32', DTYPE_Q8_0: 'Q8_0', DTYPE_Q4_0: 'Q4_0',
+    DTYPE_BF16: 'bf16',
 }
 
 
@@ -98,6 +111,72 @@ def serialize_tokenizer(tokenizer_path: str) -> bytes:
         return _serialize_tgai_tokenizer(tok, tokenizer_path)
     else:
         return _serialize_hf_tokenizer(tok)
+
+
+def _load_token_merges(tok: dict, tokenizer_path: str, token_to_id: dict) -> list:
+    """取 BPE merges 并转成 [(a_id, b_id)] 列表。
+
+    优先级：
+      1) tokenizer.json 顶层 `merges`（TGAI 打包格式，元素可能是 "a b" 字符串）
+      2) hf_path 指向的 HF tokenizer.json 的 model.merges（元素是 [a,b] 或 "a b"）
+
+    ★ 2026-10-09 加：原实现写死 n_merges=0，导致 V2.7 在 .TG 上退化成字符级分词
+      （与 llama.cpp 侧"spm 模式"是同一类病：编码偏离训练 ⇒ 复读）。
+    """
+    import os as _os
+
+    def _norm(ms):
+        out = []
+        for m in ms:
+            if isinstance(m, str):
+                parts = m.split(' ')
+                if len(parts) == 2:
+                    a, b = parts
+                else:
+                    continue
+            elif isinstance(m, (list, tuple)) and len(m) == 2:
+                a, b = m
+            else:
+                continue
+            ia, ib = token_to_id.get(a), token_to_id.get(b)
+            if ia is not None and ib is not None:
+                out.append((ia, ib))
+        return out
+
+    # 1) 顶层 merges
+    top = tok.get('merges')
+    if top:
+        r = _norm(top)
+        if r:
+            return r
+
+    # 2) hf_path 指向的文件
+    hf_path = tok.get('hf_path')
+    if hf_path and tok.get('has_hf'):
+        base = _os.path.dirname(tokenizer_path)
+        cands = [_os.path.join(base, _os.path.basename(hf_path))]
+        b2 = base
+        for _ in range(4):
+            cands.append(_os.path.join(b2, hf_path))
+            b2 = _os.path.dirname(b2)
+        for p in cands:
+            if _os.path.exists(p):
+                try:
+                    import json as _json
+                    with open(p, encoding='utf-8') as f:
+                        hf = _json.load(f)
+                    ms = hf.get('model', {}).get('merges', [])
+                    # HF 的 vocab 可能更全（含 added_tokens），补进查找表
+                    hv = hf.get('model', {}).get('vocab', {})
+                    for k, v in hv.items():
+                        token_to_id.setdefault(k, v)
+                    r = _norm(ms)
+                    if r:
+                        return r
+                except Exception:                                # noqa: BLE001
+                    pass
+
+    return []
 
 
 def _serialize_tgai_tokenizer(tok: dict, tokenizer_path: str) -> bytes:
@@ -143,23 +222,25 @@ def _serialize_tgai_tokenizer(tok: dict, tokenizer_path: str) -> bytes:
     bos_id = token_to_id.get('<BOS>', 2)
     eos_id = token_to_id.get('<EOS>', 3)
 
+    # ─── BPE merges（2026-10-09 修正）─────────────────────────
+    # 原实现【写死 n_merges=0】以兼容"当年 hf_path 未加载成功、走字符级回退"
+    # 的旧模型。但 V2.7 及之后【训练确实用了 HF BPE】（merges 生效），
+    # 写死 0 会让 C 引擎 bpe_apply 直接返回 ⇒ 退化成字符级 ⇒ 编码偏离训练
+    # ⇒ 复读/乱码。
+    #   实测（V1 phone 模型，本就无 merges，不受影响）：
+    #     引擎 'TGAI' → [61,48,42,50] (4 个字节)   HF → [24651,10323]
+    # ⇒ 改为【按词表实际情况决定】：有 merges 就写，没有才禁用。
+    merges_pairs = _load_token_merges(tok, tokenizer_path, token_to_id)
+
     buf = bytearray()
     buf += struct.pack('<I', vocab_size)
-    buf += struct.pack('<I', len(merges))
-
-    # merges
-    for m in merges:
-        if isinstance(m, str):
-            parts = m.split(' ')
-            if len(parts) == 2 and parts[0] in token_to_id and parts[1] in token_to_id:
-                buf += struct.pack('<HH', token_to_id[parts[0]], token_to_id[parts[1]])
-            else:
-                buf += struct.pack('<HH', 0, 0)
-        elif isinstance(m, (list, tuple)) and len(m) == 2:
-            if m[0] in token_to_id and m[1] in token_to_id:
-                buf += struct.pack('<HH', token_to_id[m[0]], token_to_id[m[1]])
-            else:
-                buf += struct.pack('<HH', 0, 0)
+    buf += struct.pack('<I', len(merges_pairs))
+    for _a, _b in merges_pairs:
+        buf += struct.pack('<HH', _a, _b)
+    if merges_pairs:
+        print(f"    BPE merges: 写入 {len(merges_pairs)} 条 (词表自带, 引擎将走真 BPE)")
+    else:
+        print(f"    BPE merges: 无 (写 0) → C 引擎走字符级分词（兼容老模型）")
 
     # vocab strings (按 id 顺序)
     for tid in range(vocab_size):
@@ -171,6 +252,33 @@ def _serialize_tgai_tokenizer(tok: dict, tokenizer_path: str) -> bytes:
         buf += utf8
 
     buf += struct.pack('<IIII', pad_id, unk_id, bos_id, eos_id)
+
+    # ─── ★ 特殊标记表（2026-10-09 加，P0-2）─────────────────────
+    # 训练用的 HF tokenizer 有 9 个 added_tokens（<用户> <TGAI> <思考> <回答>
+    # <系统> <记忆> <工具表> <TGH> <工具结果>），编码时必须【整段匹配为单 token】，
+    # 否则会被拆成 < 用 户 > 四个字符 ⇒ 对话格式彻底失效（实测 10/10 不一致）。
+    #
+    # 格式（追加在 eos_id 之后，老引擎读到此处即结束 ⇒ 向后兼容）：
+    #   u32 n_special
+    #   for each: u16 id, u16 len, u8 len bytes (UTF-8)
+    sp = tok.get('special_tokens') or []
+    sp_pairs = []
+    for name in sp:
+        tid = token_to_id.get(name)
+        if tid is None:
+            continue
+        b = name.encode('utf-8')
+        if len(b) > 0xFFFF:
+            continue
+        sp_pairs.append((tid, b))
+    buf += struct.pack('<I', len(sp_pairs))
+    for tid, b in sp_pairs:
+        buf += struct.pack('<HH', tid, len(b))
+        buf += b
+    if sp_pairs:
+        print(f"    特殊标记表: 写入 {len(sp_pairs)} 个 (id 范围 "
+              f"{min(t for t,_ in sp_pairs)}..{max(t for t,_ in sp_pairs)})")
+
     return bytes(buf)
 
 
@@ -272,45 +380,42 @@ def quantize_q8_0(weight: torch.Tensor) -> tuple:
 
 
 def quantize_q4_0(weight: torch.Tensor) -> tuple:
-    """
-    Q4_0 block-wise 4-bit 量化 (GGML 兼容格式)。
+    """Q4_0 block-wise 4-bit 量化（GGML 兼容格式）★ VECTORIZED_Q4
+
     每 32 个权重一组：2B fp16 scale + 16B packed 4-bit。
-    4-bit 值中心化为 (q + 8) 存储为 unsigned，反量化时 (q - 8) * scale。
-    返回 (bytes, [])。
+    反量化：out = (q - 8) * scale。
+
+    ★ 2026-10-10 向量化重写：
+      原实现每个字节调一次 .item()（V2.7 共 15.2 亿次）⇒ 实测 25.6 小时。
+      现在一次性 reshape 成 [blocks, 32] 全部用 numpy 运算 ⇒ 预期分钟级。
     """
-    if weight.dtype != torch.float32:
-        weight = weight.float()
-    w = weight.reshape(-1).contiguous()
+    w = weight.detach().to(torch.float32).reshape(-1)
     n = w.numel()
-    blocks = (n + QK - 1) // QK
-    out = bytearray()
+    QK_ = 32
+    blocks = (n + QK_ - 1) // QK_
+    pad = blocks * QK_ - n
+    if pad:
+        w = torch.cat([w, torch.zeros(pad, dtype=torch.float32)])
+    wb = w.numpy().reshape(blocks, QK_)              # [blocks, 32]
 
-    for b in range(blocks):
-        start = b * QK
-        end = min(start + QK, n)
-        block_vals = w[start:end]
+    # 块内 max_abs → scale = max_abs / 7（0 时用 1.0，与引擎解码一致）
+    max_abs = np.abs(wb).max(axis=1)                 # [blocks]
+    scale = np.where(max_abs > 0, max_abs / 7.0, 1.0).astype(np.float32)
 
-        if end - start < QK:
-            block_vals = torch.cat([block_vals,
-                                    torch.zeros(QK - (end - start), dtype=torch.float32)])
+    # 量化 → round → clamp[-8,7] → +8 变 [0,15]，uint8
+    q = np.rint(wb / scale[:, None]).clip(-8, 7).astype(np.int8) + 8
+    q = q.astype(np.uint8)                           # [blocks, 32]
 
-        max_abs = block_vals.abs().max().item()
-        # 4-bit signed range: -8 to 7
-        scale = max_abs / 7.0 if max_abs > 0 else 1.0
+    # 打包：每 2 个 4-bit 一个字节，low = 前一个，high = 后一个
+    qq = q.reshape(blocks, 16, 2)
+    packed = (qq[:, :, 0] | (qq[:, :, 1] << 4)).astype(np.uint8)   # [blocks, 16]
 
-        # fp16 scale (2 bytes)
-        out += torch.tensor([scale], dtype=torch.float16).numpy().tobytes()
-
-        # quantize → [-8, 7], shift by 8 → [0, 15] unsigned
-        q = torch.round(block_vals / scale).clamp(-8, 7).to(torch.int8) + 8
-
-        # pack 2 x 4-bit per byte: low nibble = q[j], high nibble = q[j+1]
-        for j in range(0, QK, 2):
-            low = q[j].item() & 0x0F
-            high = q[j + 1].item() & 0x0F
-            out.append((high << 4) | low)
-
-    return bytes(out), []
+    # 每块 = 2B fp16 scale + 16B packed
+    sc = scale.astype(np.float16).view(np.uint16).astype('<u2')     # [blocks]
+    out = np.empty((blocks, 18), dtype=np.uint8)
+    out[:, 0:2] = sc.view(np.uint8).reshape(blocks, 2)
+    out[:, 2:18] = packed
+    return out.tobytes(), []
 
 
 def quantize_int8(weight: torch.Tensor) -> tuple:
@@ -347,6 +452,11 @@ def weight_to_bytes(weight: torch.Tensor, target_dtype: int) -> tuple:
         return quantize_q8_0(weight)
     elif target_dtype == DTYPE_Q4_0:
         return quantize_q4_0(weight)
+    elif target_dtype == DTYPE_BF16:
+        # ★ numpy 没有 bfloat16 dtype！必须用 torch 取位模式再转 uint16。
+        #   （踩过的坑：直接 .numpy() 会报 "module 'numpy' has no attribute 'bfloat16'"）
+        w = weight.to(torch.bfloat16).contiguous()
+        return w.view(torch.uint16).numpy().tobytes(), scales
     elif target_dtype == DTYPE_FP32:
         w = weight.float().contiguous()
         return w.numpy().tobytes(), scales
@@ -375,7 +485,12 @@ def convert(checkpoint_path: str, output_path: str, tokenizer_path: str, target_
 
     # 1. 加载 checkpoint
     print("  加载 checkpoint...")
-    ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+    # ★ 修复（2026-10-09）：必须 mmap=True。
+    #   原实现全量载入：5.65GB BF16 在 map_location='cpu' 下会物化成 FP32
+    #   (~11.3GB)，再加下面的 weight_data 缓冲(5.65GB) => 17GB，本机 15.4GB 必 OOM。
+    #   mmap 后张量按需读页，峰值内存降到 ~1 个张量。
+    ckpt = torch.load(checkpoint_path, map_location='cpu',
+                      weights_only=False, mmap=True)
     cfg = ckpt['model_config']
     state_dict = ckpt['model_state_dict']
 
@@ -385,6 +500,66 @@ def convert(checkpoint_path: str, output_path: str, tokenizer_path: str, target_
     print(f"  配置: layers={cfg['n_layers']} d_model={cfg['d_model']} "
           f"heads={cfg['n_heads']} kv_heads={num_kv_heads} vocab={cfg['vocab_size']} "
           f"experts={cfg['n_experts']}×top{cfg['n_activated']}")
+
+    # ─── 校验: tokenizer vocab_size 必须与模型 vocab_size 一致 ──────────
+    # 防止用错 tokenizer (如 10M 模型的 vocab=8192 用到 0.86B 模型 vocab=32768)
+    # 历史教训: 转换时误用 checkpoints/TGAI MINI/tokenizer.json 导致
+    #           .TG 内置 tokenizer vocab=8192, 但权重 vocab=32768,
+    #           手机端用 .TG 内置 tokenizer → encode/decode 错位 → 乱码。
+    print("  校验 tokenizer vocab_size...")
+    with open(tokenizer_path, 'r', encoding='utf-8') as f:
+        tok_check = json.load(f)
+    if 'vocab_size' in tok_check and 'id_to_token' in tok_check:
+        tok_vocab = tok_check['vocab_size']
+        tok_fmt = 'TGAI'
+    elif 'model' in tok_check:
+        tok_vocab = len(tok_check.get('model', {}).get('vocab', {}))
+        tok_fmt = 'HuggingFace'
+    else:
+        tok_vocab = -1
+        tok_fmt = '未知'
+    model_vocab = cfg['vocab_size']
+    print(f"    tokenizer: {tok_fmt} vocab={tok_vocab}")
+    print(f"    模型:      vocab={model_vocab}")
+    if tok_vocab != model_vocab:
+        print(f"\n[FATAL] tokenizer vocab_size ({tok_vocab}) ≠ 模型 vocab_size ({model_vocab})!")
+        print(f"  这会导致 .TG 内置 tokenizer 与权重不匹配, 推理时 encode/decode 错位 → 乱码。")
+        print(f"  请检查 --tokenizer 参数:")
+        print(f"    - 0.86B 模型 (vocab=32768): checkpoints/tokenizer.json (1.39 MB)")
+        print(f"    - 10M  模型 (vocab=8192):  checkpoints/TGAI MINI/tokenizer.json (331 KB)")
+        raise ValueError(
+            f"tokenizer vocab_size ({tok_vocab}) != 模型 vocab_size ({model_vocab})。"
+            f"用错 tokenizer 会导致乱码, 请用匹配模型的 tokenizer.json。"
+        )
+    print(f"    [OK] vocab_size 一致 ({tok_vocab}), 不会乱码")
+
+    # ─── 提取 special token ids (用于填充 TGHeader) ──────────
+    # TGHeader 字段顺序是 pad/bos/eos/unk (见 tgai_format.h:126-129),
+    # 不是 pad/unk/bos/eos。之前写死 0,1,2,3 当成 pad/unk/bos/eos,
+    # 导致 header.bos_token_id 拿到 unk 的值, header.eos_token_id 拿到
+    # bos 的值, header.unk_token_id 拿到 eos 的值 — 错位一格。
+    # 后果: tg_config() 返回的 cfg[14] (eos_token_id) 实际是 bos_id,
+    # CLI/手机端按错的 eos_id 检测 EOS → <EOS> 字符串泄漏到输出。
+    # 修复: 从 tokenizer.json 提取真实 special ids, 按 TGHeader 字段顺序写入。
+    token_to_id_hdr = {}
+    if tok_fmt == 'TGAI':
+        id_to_token_hdr = tok_check.get('id_to_token', {})
+        token_to_id_hdr = {v: int(k) for k, v in id_to_token_hdr.items()}
+    elif tok_fmt == 'HuggingFace':
+        token_to_id_hdr = dict(tok_check.get('model', {}).get('vocab', {}))
+        for t in tok_check.get('added_tokens', []):
+            token_to_id_hdr[t['content']] = t['id']
+    # 兼容大小写: 优先大写, 回退小写
+    def _get_special(names, default):
+        for n in names:
+            if n in token_to_id_hdr:
+                return int(token_to_id_hdr[n])
+        return default
+    h_pad = _get_special(['<PAD>', '<pad>'], 0)
+    h_bos = _get_special(['<BOS>', '<bos>'], 2)
+    h_eos = _get_special(['<EOS>', '<eos>'], 3)
+    h_unk = _get_special(['<UNK>', '<unk>'], 1)
+    print(f"    header special ids (pad/bos/eos/unk): {h_pad}/{h_bos}/{h_eos}/{h_unk}")
 
     # 2. 序列化 tokenizer
     print("  序列化 tokenizer...")
@@ -413,8 +588,12 @@ def convert(checkpoint_path: str, output_path: str, tokenizer_path: str, target_
         while len(shape) < MAX_NDIM:
             shape.append(1)
 
-        offset = len(weight_data)
+        # ★ TG_STREAM_WRITE：不再把数据攒进内存缓冲，只记录元信息
+        #   （原实现 offset = len(weight_data) + weight_data.extend(w_bytes)
+        #     会累积 5.65 GB；流式版数据第二遍才逐张量写盘）
+        offset = 0
         length = len(w_bytes)
+        del w_bytes                      # 立即释放，峰值内存 ≈ 单张量
 
         weight_entries.append({
             'name': name,
@@ -426,7 +605,7 @@ def convert(checkpoint_path: str, output_path: str, tokenizer_path: str, target_
             'shape': shape[:MAX_NDIM],
             'scales': scales,
         })
-        weight_data += w_bytes
+        # ★ 流式：数据不再攒内存（见上方 offset 注释）
 
         print(f"    {name:50s} dtype={dtype} shape={list(param.shape)} "
               f"size={length/1024:.1f}KB")
@@ -444,6 +623,8 @@ def convert(checkpoint_path: str, output_path: str, tokenizer_path: str, target_
         weight_table_off = tokenizer_off + tokenizer_len
 
     weight_table_count = len(weight_entries)
+    # ★ 流式：第二遍按名字查元信息
+    _meta_by_name = {e['name']: e for e in weight_entries}
     weight_table_bytes = weight_table_count * WEIGHT_ENTRY_SIZE
 
     weight_data_off = weight_table_off + weight_table_bytes
@@ -452,7 +633,11 @@ def convert(checkpoint_path: str, output_path: str, tokenizer_path: str, target_
         pad = 16 - (weight_data_off % 16)
         weight_data_off += pad
 
-    weight_data_len = len(weight_data)
+    # ★ 流式：总长度由各张量字节数累加得出（不依赖内存缓冲）
+    weight_data_len = sum(e['length'] for e in weight_entries)
+    # 权重数据尾部对齐到 16 字节（与原实现一致）
+    if weight_data_len % 16:
+        weight_data_len += 16 - weight_data_len % 16
 
     # 5. 写文件头
     header = bytearray(HEADER_SIZE)
@@ -465,7 +650,7 @@ def convert(checkpoint_path: str, output_path: str, tokenizer_path: str, target_
                      cfg['vocab_size'], cfg['max_seq_len'],
                      cfg['n_experts'], cfg['n_activated'],
                      int(cfg.get('rope_theta', 10000)),
-                     0, 1, 2, 3)  # pad/unk/bos/eos (后续会被 tokenizer 覆盖)
+                     h_pad, h_bos, h_eos, h_unk)  # TGHeader 字段顺序: pad/bos/eos/unk
     # tokenizer offsets
     struct.pack_into('<QQ', header, 64, tokenizer_off, tokenizer_len)
     # weight table
@@ -474,6 +659,11 @@ def convert(checkpoint_path: str, output_path: str, tokenizer_path: str, target_
     struct.pack_into('<QQ', header, 96, weight_data_off, weight_data_len)
     # v2: arch_type + num_kv_heads at offset 112
     struct.pack_into('<II', header, 112, arch_type, num_kv_heads)
+    # v3 专属字段: modality_flags + extension_off (offset 120/124)
+    #   modality_flags = TEXT(1): 纯文本 LLM, GO 引擎纯文本模式通过校验
+    #   extension_off  = 0: 无子模型扩展段 (纯文本 LLM, 可后续用 pack_multi.py 追加)
+    #   bytearray 初始化为 0, extension_off 无需显式写入
+    struct.pack_into('<I', header, 120, MODALITY_TEXT)  # modality_flags = TEXT
 
     # 6. 写权重索引表
     weight_table = bytearray()
@@ -489,24 +679,74 @@ def convert(checkpoint_path: str, output_path: str, tokenizer_path: str, target_
             struct.pack_into('<f', entry, 48, e['scales'][0])
         weight_table += entry
 
-    # 7. 合并写入
-    print(f"  写入文件 {output_path}...")
+    # 7. 合并写入（★ 流式：先写占位，再逐个张量写盘，最后回填）
+    print(f"  写入文件 {output_path}...（流式写盘，峰值内存 ≈ 单张量）")
     with open(output_path, 'wb') as f:
-        f.write(header)
+        f.write(header)                      # 先写占位 header（稍后回填 len）
         f.write(tok_bytes)
-        # 对齐 padding
         cur = HEADER_SIZE + len(tok_bytes)
         if cur < weight_table_off:
             f.write(b'\x00' * (weight_table_off - cur))
-        f.write(weight_table)
+        f.write(weight_table)                # 先写占位权重表（offset 稍后回填）
         cur = weight_table_off + len(weight_table)
         if cur < weight_data_off:
             f.write(b'\x00' * (weight_data_off - cur))
-        f.write(weight_data)
+
+        # ── 第二遍：逐张量转换并直接落盘 ──
+        base = f.tell()
+        assert base == weight_data_off, 'weight_data_off 与实际写入位置不符'
+        skip_names2 = {'lm_head.weight'}
+        for k, (name, param) in enumerate(state_dict.items()):
+            if name in skip_names2:
+                continue
+            if not isinstance(param, torch.Tensor):
+                continue
+            ent = _meta_by_name.get(name)
+            if ent is None:
+                continue
+            dt = ent['dtype']
+            data, _sc = weight_to_bytes(param, dt)
+            ent['offset'] = f.tell() - base
+            if len(data) != ent['length']:
+                raise RuntimeError(
+                    '张量 %s 长度不一致: 预算 %d 实际 %d'
+                    % (name, ent['length'], len(data)))
+            f.write(data)
+            del data
+            if (k + 1) % 200 == 0:
+                print(f"    已写 {k + 1}/{len(state_dict)} 个张量")
+
+        # 尾部对齐
+        endp = f.tell() - base
+        if endp % 16:
+            f.write(b'\x00' * (16 - endp % 16))
+        actual_len = f.tell() - base
+
+        # ── 回填 header 的 weight_data_len ──
+        f.seek(96)
+        f.write(struct.pack('<QQ', weight_data_off, actual_len))
+
+        # ── 回填权重表的 offset ──
+        f.seek(weight_table_off)
+        tbl2 = bytearray()
+        for e in weight_entries:
+            entry = bytearray(WEIGHT_ENTRY_SIZE)
+            struct.pack_into('<QQ', entry, 0, e['hash'], e['offset'])
+            struct.pack_into('<Q', entry, 16, e['length'])
+            struct.pack_into('<II', entry, 24, e['dtype'], e['ndim'])
+            struct.pack_into('<IIII', entry, 32,
+                             e['shape'][0], e['shape'][1], e['shape'][2], e['shape'][3])
+            if e['scales']:
+                struct.pack_into('<f', entry, 48, e['scales'][0])
+            tbl2 += entry
+        f.write(tbl2)
+        weight_data_len = actual_len
 
     total_size = os.path.getsize(output_path)
     print(f"\n[OK] 转换完成!")
     print(f"  文件大小: {total_size/1024/1024:.1f} MB")
+    print(f"  格式: .TG v{VERSION} (modality_flags=TEXT, 可被 GO 引擎直接加载)")
+    print(f"         后续可用 pack_multi.py 追加 DiT/VAE/Audio 子模型 → 多模态 .TG v3")
     print(f"  权重数: {weight_table_count}")
     print(f"  Tokenizer: {tokenizer_len/1024:.1f} KB")
     print(f"  权重数据: {weight_data_len/1024/1024:.1f} MB")
@@ -519,8 +759,8 @@ def main():
     parser.add_argument('--output', type=str, required=True, help='输出 .TG 文件路径')
     parser.add_argument('--tokenizer', type=str, required=True, help='tokenizer.json 路径')
     parser.add_argument('--dtype', type=str, default='fp16',
-                        choices=['fp32', 'fp16', 'int8', 'q8_0', 'q4_0'],
-                        help='精度: fp32/fp16(默认)/int8(旧全局)/q8_0/q4_0')
+                        choices=['fp32', 'fp16', 'int8', 'q8_0', 'q4_0', 'bf16'],
+                        help='精度: fp32/fp16(默认)/bf16(模型原生,零损失)/int8/q8_0/q4_0')
     parser.add_argument('--arch', type=str, default='tgai_moe',
                         choices=['tgai_moe', 'llama', 'mistral', 'qwen2', 'gemma', 'phi3', 'chatglm'],
                         help='架构类型 (默认 tgai_moe)')
@@ -528,7 +768,7 @@ def main():
 
     dtype_map = {
         'fp32': DTYPE_FP32, 'fp16': DTYPE_FP16, 'int8': DTYPE_INT8,
-        'q8_0': DTYPE_Q8_0, 'q4_0': DTYPE_Q4_0,
+        'q8_0': DTYPE_Q8_0, 'q4_0': DTYPE_Q4_0, 'bf16': DTYPE_BF16,
     }
     target_dtype = dtype_map[args.dtype]
     arch_type = ARCH_MAP.get(args.arch, 0)

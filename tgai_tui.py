@@ -64,10 +64,13 @@ def ui_status(pairs):
 
 
 def ui_user(text):
-    """用户消息（无气泡，前缀字形区分）"""
-    FRAME.row('')
+    """用户消息（无气泡，前缀字形区分）
+
+    ★ 这里【只打印一次】：输入框本身已经把用户输入回显过了，
+      若再打一遍就会出现"❯ You 你好"连续两条的重复观感
+      （实测踩坑：以前输入框只有裸 input()，回显在框内不算重复）。
+    """
     print('%s%s%s %s%s❯ You%s  %s' % (U.LINE, U.V, U.RST, U.USER, U.BLD, U.RST, text))
-    FRAME.row('')
 
 
 def ui_ai_start():
@@ -433,19 +436,36 @@ def main():
     ui_status(_pairs)
     if _meta_note:
         ui_row('  ' + U.META + _meta_note + U.RST)
+    ui_row('')
+
+    # 底部状态栏内容（运行中会带上"上轮速度"）
+    _nthr = engine.get_threads() if hasattr(engine, 'get_threads') else 4
+    _bar_mid = '%s · %s · %d线程' % (_mname, _ctx, _nthr)
 
     try:
+        _eof = 0
         while True:
+            # ── 底部输入框（xiaoli 风格：框在屏幕下方，光标停在框内）──
             try:
-                ui = input('\n' + U.USER + U.BLD + '❯ You' + U.RST + ' ').strip()
+                ui = U.input_box(hint='输入消息 …',
+                                 extra='/help 命令 · /exit 退出').strip()
             except (EOFError, KeyboardInterrupt):
+                # ★ stdin 结束（管道/重定向）时 input() 立刻抛 EOFError。
+                #   踩坑：原实现只 print() 不 break ⇒ 管道测试时死循环刷屏。
+                #   这里区分：连读 3 次都空 ⇒ 视为输入源结束，退出。
                 print()
-                break
+                _eof += 1
+                if _eof >= 3:
+                    break
+                continue
+            _eof = 0
             if not ui:
+                U.status_bar(left='就绪', mid=_bar_mid, right='/exit 退出')
                 continue
             if ui.startswith('/'):
                 if not handle_command(ui, ctx):
                     break
+                U.status_bar(left='就绪', mid=_bar_mid, right='/exit 退出')
                 continue
 
             ui_user(ui)                       # ★ 用户消息（前缀字形区分）
@@ -467,9 +487,15 @@ def main():
                 ui_ai_meta(cnt, el, tps, '' if out.strip() else '空回复')
                 if out.strip():
                     chat.add(ui, out.strip())
+                # 底部状态栏刷新（显示上一轮的实际速度，像 xiaoli 那样）
+                _bar_mid = ('%s · %s · %d线程 · 上轮 %.1f tok/s'
+                            % (_mname, _ctx, _nthr, tps))
+                U.status_bar(left='就绪', mid=_bar_mid, right='/exit 退出')
+                ui_row('')
             except Exception as exc:                                # noqa: BLE001
                 print('%s   %s[生成失败] %s%s' % (U.LINE + U.V + U.RST,
                                                   U.ERR, exc, U.RST))
+                U.status_bar(left='出错', mid=_bar_mid, right='/exit 退出')
     except KeyboardInterrupt:
         print()
     finally:

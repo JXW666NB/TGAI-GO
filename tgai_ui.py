@@ -108,8 +108,14 @@ def wrap(text, width):
     return res
 
 
-def term_width(minw=54, maxw=96, fallback=78):
-    """终端可用宽度（坑③）"""
+def term_width(minw=54, maxw=158, fallback=100):
+    """终端可用宽度（坑③）
+
+    ★ maxw 从 96 放宽到 158（2026-10-10）：用户在宽屏终端里反馈
+      "可以顶到边吗" —— 原来硬上限 96 列，宽屏下左右各留一大片空白。
+      现在跟随终端宽度，只在极端宽屏（>158）时才收敛，
+      因为再宽单行文本反而不好读。
+    """
     try:
         c = shutil.get_terminal_size((fallback, 24)).columns
     except Exception:
@@ -376,6 +382,70 @@ def md_print(text, width=76, indent='', prefix=''):
 
 
 # ══════════════════════════════════════════════════════════════
+#  底部输入框 + 状态栏（2026-10-10 加，用户要求"输入框在下面，类似 xiaoli"）
+#
+#  视觉（参考小狸 CLI）：
+#      ╭──────────────────────────────────────────────╮
+#      │ ❯ 输入消息 … （/help 命令 · /params 调参）    │
+#      ╰──────────────────────────────────────────────╯
+#      就绪 │ v27_merged_bf16.TG · 8K · 4线程 │ /exit 退出
+#
+#  实现要点：
+#    输入框画完后用 ANSI 把光标移回中间行，用户就在框内打字；
+#    下次再画之前先向上擦掉 3 行（框高），避免框越堆越多。
+# ══════════════════════════════════════════════════════════════
+INBOX = _c(110)      # 输入框边线（蓝）
+INBOX_BG = _c(236)   # 状态栏底色
+
+
+def input_box(width=None, hint='输入消息 …', extra=''):
+    """画出底部输入框，把光标停在框内，返回用户输入
+
+    宽屏适配：框宽跟随终端，顶到边。
+    """
+    W = width or term_width() - 2
+    inner = max(20, W - 4)
+
+    def line_border(l, m, r, label=''):
+        lab = (' %s%s%s ' % (META, label, RST + INBOX)) if label else ''
+        n = max(0, W - 2 - dw(lab))
+        print('%s%s%s%s%s%s%s' % (INBOX, l, H, lab, H * n, r, RST))
+
+    line_border(TL, H, TR)
+    tip = '%s%s❯%s %s%s%s' % (USER, BLD, RST + INBOX, META, hint, RST + INBOX)
+    tail = ('  %s%s%s' % (META, extra, RST + INBOX)) if extra else ''
+    pad = max(0, inner - dw(tip) - dw(tail))
+    print('%s%s%s %s%s%s %s%s' % (INBOX, V, RST, tip, ' ' * pad, tail, INBOX, V + RST))
+    line_border(BL, H, BR)
+    # 此时光标在底边下一行行首；回到中间行、并移到框内（边框1+空格1+提示后1）
+    col = dw(tip) + 3
+    _sys.stdout.write('\033[A\r\033[%dC' % col)
+    _sys.stdout.flush()
+    try:
+        s = input()
+    finally:
+        # input() 回车后光标已在新行；向上擦掉该行并回到原位
+        # （不动上面的框：TUI 是滚动式输出，框保留在历史里是正常的）
+        _sys.stdout.write('\033[A\r\033[K')
+        _sys.stdout.flush()
+    return s
+
+
+def status_bar(width=None, left='就绪', mid='', right=''):
+    """底部状态栏（反白底，像 xiaoli 那样压在屏幕最底）"""
+    W = width or term_width() - 2
+    segs = []
+    if left:
+        segs.append('%s%s%s' % (BLD, left, RST + INBOX_BG))
+    if mid:
+        segs.append(mid)
+    txt = '  %s  ' % ' │ '.join(segs)
+    r = ('  %s  ' % right) if right else ''
+    pad = max(0, W - dw(txt) - dw(r))
+    print('%s%s%s%s%s' % (INBOX_BG, txt, ' ' * pad, r, RST))
+
+
+# ══════════════════════════════════════════════════════════════
 #  流式 Markdown（模拟打字机）
 #
 #  问题：Markdown 是块结构，逐 token 打印会让 **粗体** 中间出现断点、
@@ -406,38 +476,59 @@ class MdStream:
         self.live = live
         self.buf = ''
         self.infence = False
-        self._live_n = 0        # 实时区已占用的行数（用于回退）
+        self._live_n = 0        # 实时区已占用的行数
+        self._live_done = ''    # 已画出的内容（用于增量比对）
+        self._padv = dw(prefix) if prefix else 0
         self._last_blank = False
 
     # ── 实时区 ──
     def _clear_live(self):
+        """回退到实时区起始处（用于落定时擦掉重绘）"""
         if self._live_n > 0:
             self.sys_write('\r\033[K')
             for _ in range(self._live_n - 1):
                 self.sys_write('\033[A\r\033[K')
             self._live_n = 0
+        self._live_done = ''
 
     def sys_write(self, s):
         _sys.stdout.write(s)
         _sys.stdout.flush()
 
     def _draw_live(self):
-        """把当前未完成的行以纯文本形式实时画出
+        """把当前未完成的行以纯文本形式实时画出（增量追加，不整行重画）
+
+        ★ 性能关键（2026-10-10 修）：
+          原实现每收到一个 token 就清掉重画【整行】—— 行长 90 列时
+          每个 token 要重画 90 列，长回答下重绘量爆炸（实测一次回答
+          产生几十 MB 控制序列，管道里直接把日志刷爆）。
+          改为：只把 buf 里【尚未画出的那部分】追加输出；
+                只有发生折行（宽度越界）时才换到新行继续追加。
+          这样每个 token 只画它自己那几个字符 ⇒ O(1) 而非 O(行长)。
 
         ★ 折行宽度要用 avail = width - dw(prefix)：
-          踩坑：曾直接用 self.width 折行，但实际画出来的是 prefix + 文本，
-          可用列数少了 prefix 的宽度 ⇒ 文本提前折行，
-          观感上出现"会写代 / 码、会"这种莫名断行。
+          踩坑：曾直接用 self.width 折行，但画出来的是 prefix + 文本，
+          可用列数少了 prefix 的宽度 ⇒ 文本提前折行，出现莫名断行。
         """
         if not self.live or self.infence or not self.buf:
             return
-        self._clear_live()
-        avail = max(16, self.width - dw(self.prefix))
+        avail = max(16, self.width - self._padv)
         segs = wrap(self.buf, avail) or ['']
-        for i, s in enumerate(segs):
-            self.sys_write('%s%s%s' % (self.prefix if i == 0 else ' ' * dw(self.prefix),
-                                       s, '\n' if i < len(segs) - 1 else ''))
-        self._live_n = len(segs)
+        while self._live_n < len(segs):
+            i = self._live_n
+            if i > 0:
+                self.sys_write('\n')
+            body = segs[i]
+            # 最后一行是"正在长"的那行：只追加新增部分
+            if i == len(segs) - 1:
+                prev = self._live_done
+                if body.startswith(prev):
+                    body = body[len(prev):]
+                else:
+                    body = body            # 内容变了（极少数）⇒ 整行补画
+                self._live_done = segs[i]
+            self.sys_write((self.prefix if i == 0 else ' ' * self._padv) + body)
+            self._live_n += 1
 
     # ── 对外接口 ──
     def feed(self, chunk):

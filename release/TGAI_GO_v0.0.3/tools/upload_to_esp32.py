@@ -277,9 +277,9 @@ class UploadWorker(QThread):
                 "--chip", chip,
                 "--port", self.port,
                 "--baud", str(self.baud),
-                "--before", "default-reset",
-                "--after", "hard-reset",
-                "write-flash",
+                "--before", "default_reset",
+                "--after", "hard_reset",
+                "write_flash",
                 hex(self.partition_offset),
                 str(lfs_img)
             )
@@ -800,9 +800,9 @@ class MainWindow(QMainWindow):
                 len(list(esp_dir.rglob("esptool.exe"))) > 0
             )
 
+        mixly_dir = self.txt_mixly.text().strip()
         if not has_mklfs_bundled or not has_esp_bundled:
             # 自带工具不完整，检查 Mixly 目录
-            mixly_dir = self.txt_mixly.text().strip()
             has_mklfs_mixly, has_esp_mixly = self.scan_tools_static(mixly_dir) if mixly_dir else (False, False)
             missing = []
             if not has_mklfs_bundled and not has_mklfs_mixly:

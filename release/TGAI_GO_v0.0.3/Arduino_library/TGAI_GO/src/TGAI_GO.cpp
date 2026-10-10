@@ -1188,6 +1188,7 @@ TGAI_GO::TGAI_GO()
       _max_seq_len(0), _vocab_size(0), _d_model(0),
       _eos_id(0), _bos_id(0),
       _file_data(NULL), _file_loaded(false),
+      _sd_mounted(false), _sd_is_mmc(false), _sd_cs_pin(-1),
       _model_count(0)
 {
     memset(_last_error, 0, sizeof(_last_error));
@@ -1457,6 +1458,230 @@ bool TGAI_GO::begin(const char* tg_path) {
     return true;
 }
 
+/* ─── begin from SD card (SPI or SD_MMC) ────────── */
+bool TGAI_GO::_load_from_sd(const char* tg_path, const TGAISDConfig* sd) {
+#ifdef ESP32
+    if (!tg_path || !sd) return false;
+
+    /* Mount SD card */
+    bool mount_ok = false;
+
+    if (sd->use_sdmmc) {
+        /* SD_MMC 4-bit mode — uses fixed pins (2,4,12,13,14,15 on most boards) */
+        if (sd->freq_khz > 0) {
+            mount_ok = SD_MMC.setPins(sd->sck_pin > 0 ? sd->sck_pin : -1,
+                                      sd->miso_pin > 0 ? sd->miso_pin : -1,
+                                      sd->mosi_pin > 0 ? sd->mosi_pin : -1,
+                                      sd->cs_pin > 0 ? sd->cs_pin : -1);
+            if (!mount_ok) {
+                mount_ok = SD_MMC.begin("/sdcard", false, false, sd->freq_khz);
+            } else {
+                /* Pins set, try begin without path override */
+                mount_ok = SD_MMC.begin();
+            }
+        } else {
+            mount_ok = SD_MMC.begin();
+        }
+        if (mount_ok) {
+            Serial.printf("[TGAI] SD_MMC mounted OK\n");
+            _sd_is_mmc = true;
+        }
+    } else {
+        /* SPI mode */
+        SPI.begin(sd->sck_pin > 0 ? (uint8_t)sd->sck_pin : (uint8_t)18,
+                  sd->miso_pin > 0 ? (uint8_t)sd->miso_pin : (uint8_t)19,
+                  sd->mosi_pin > 0 ? (uint8_t)sd->mosi_pin : (uint8_t)23,
+                  sd->cs_pin > 0 ? (uint8_t)sd->cs_pin : (uint8_t)5);
+
+        mount_ok = SD.begin(sd->cs_pin > 0 ? sd->cs_pin : 5,
+                            (sd->freq_khz > 0) ? (uint32_t)sd->freq_khz * 1000 : (uint32_t)4000000);
+        if (mount_ok) {
+            Serial.printf("[TGAI] SD SPI mounted OK (CS=%d, freq=%d kHz)\n",
+                          sd->cs_pin > 0 ? sd->cs_pin : 5, sd->freq_khz > 0 ? sd->freq_khz : 4000);
+            _sd_is_mmc = false;
+        }
+    }
+
+    if (!mount_ok) {
+        _set_error("SD card mount failed");
+        return false;
+    }
+
+    _sd_mounted = true;
+    _sd_cs_pin = sd->cs_pin;
+
+    /* Log card info */
+    {
+        uint8_t ct = _sd_is_mmc ? SD_MMC.cardType() : SD.cardType();
+        uint64_t cs = _sd_is_mmc ? SD_MMC.cardSize() : SD.cardSize();
+        Serial.printf("[TGAI] SD card: type=%d size=%llu MB\n",
+                      (int)ct, (unsigned long long)(cs / (1024 * 1024)));
+    }
+
+    /* Open model file from SD */
+    File f;
+    if (_sd_is_mmc) {
+        f = SD_MMC.open(tg_path, "r");
+    } else {
+        f = SD.open(tg_path, "r");
+    }
+
+    if (!f) {
+        char err_buf[128];
+        snprintf(err_buf, sizeof(err_buf), "Model file not found on SD: %s", tg_path);
+        _set_error(err_buf);
+        _unmount_sd();
+        return false;
+    }
+
+    size_t fsize = f.size();
+    if (fsize < TG_HEADER_SIZE) {
+        _set_error("SD file too small for .TG header");
+        f.close();
+        _unmount_sd();
+        return false;
+    }
+
+    /* === Parse header FIRST — allocate KV cache before loading model === */
+    uint8_t hdr[TG_HEADER_SIZE];
+    if (f.read(hdr, TG_HEADER_SIZE) != TG_HEADER_SIZE) {
+        _set_error("Failed to read .TG header from SD");
+        f.close();
+        _unmount_sd();
+        return false;
+    }
+
+    int nl_val      = *(int32_t*)(hdr + 12);
+    int nh_val      = *(int32_t*)(hdr + 20);
+    int d_model_val = *(int32_t*)(hdr + 16);
+    int max_seq_val = *(int32_t*)(hdr + 32);
+    if (max_seq_val > TG_EMBED_DEFAULT_MAX_SEQ) max_seq_val = TG_EMBED_DEFAULT_MAX_SEQ;
+    int dk_val     = d_model_val / nh_val;
+    size_t per_layer = (size_t)nh_val * max_seq_val * dk_val;
+    size_t kv_total  = (size_t)nl_val * per_layer * 2 * sizeof(float);
+
+    Serial.printf("[TGAI] d=%d L=%d H=%d max_seq=%d KV=%u B file=%u B\n",
+        d_model_val, nl_val, nh_val, max_seq_val, (unsigned)kv_total, (unsigned)fsize);
+
+    /* Allocate KV cache FIRST — before model data fragments PSRAM */
+    float* kv_k = (float*)tg_embed_calloc(1, kv_total);
+    if (!kv_k) {
+        _set_error("SD: KV cache allocation failed");
+        f.close();
+        _unmount_sd();
+        return false;
+    }
+    float* kv_v = kv_k + (size_t)nl_val * per_layer;
+    Serial.printf("[TGAI] KV OK, PSRAM free after KV=%u\n",
+#ifdef TG_EMBED_ESP32
+                  (unsigned)ESP.getFreePsram()
+#else
+                  0
+#endif
+    );
+
+    /* Read full model file from SD */
+    f.seek(0);
+    uint8_t* data = (uint8_t*)tg_embed_malloc(fsize);
+    if (!data) {
+        _set_error("SD: Failed to allocate memory for model");
+        tg_embed_free(kv_k);
+        f.close();
+        _unmount_sd();
+        return false;
+    }
+
+    size_t read_bytes = 0;
+    while (read_bytes < fsize && f.available()) {
+        size_t chunk = f.read(data + read_bytes, fsize - read_bytes);
+        if (chunk == 0) break;
+        read_bytes += chunk;
+    }
+    f.close();
+
+    /* We can close SD after reading — model is in PSRAM now.
+     * Keep it mounted for scanModels(), unmount in end(). */
+    /* Actually keep it mounted — user may want to scan for other models */
+
+    if (read_bytes != fsize) {
+        _set_error("SD: Failed to read complete model file");
+        tg_embed_free(kv_k);
+        tg_embed_free(data);
+        return false;
+    }
+
+    /* Now load model from the memory buffer */
+    TGEmbedModel* m = embed_model_load(data, fsize, _last_error, sizeof(_last_error));
+    if (!m) {
+        tg_embed_free(kv_k);
+        tg_embed_free(data);
+        return false;
+    }
+
+    m->raw_data = data;
+    m->raw_size = fsize;
+
+    _cache = (TGKVCache*)calloc(1, sizeof(TGCacheInfo2));
+    if (!_cache) {
+        _set_error("SD: Cache metadata allocation failed");
+        tg_embed_free(kv_k);
+        tg_embed_free(data);
+        embed_model_free(m);
+        return false;
+    }
+
+    {
+        TGCacheInfo2* c = (TGCacheInfo2*)_cache;
+        c->k       = kv_k;
+        c->v       = kv_v;
+        c->nl      = nl_val;
+        c->nh      = nh_val;
+        c->dk      = dk_val;
+        c->max_seq = max_seq_val;
+        memset(c->pos, 0, (size_t)nl_val * sizeof(int));
+    }
+
+    _model   = (TGModel*)m;
+    _model_size  = fsize;
+    _max_seq_len = max_seq_val;
+    _vocab_size  = (int)m->header.vocab_size;
+    _d_model     = (int)m->header.d_model;
+    _eos_id      = (int)m->header.eos_token_id;
+    _bos_id      = (int)m->header.bos_token_id;
+    _ready       = true;
+    _file_loaded = true;
+    _file_data   = data;
+    strncpy(_loaded_model_name, tg_path, sizeof(_loaded_model_name) - 1);
+    _loaded_model_name[sizeof(_loaded_model_name) - 1] = '\0';
+
+    Serial.printf("[TGAI] SD model loaded: %s (%u KB)\n", tg_path, (unsigned)(fsize / 1024));
+    return true;
+#else
+    (void)tg_path; (void)sd;
+    _set_error("SD card not supported on this platform");
+    return false;
+#endif
+}
+
+/* ─── begin from SD card (public API) ────────────── */
+bool TGAI_GO::begin(const char* tg_path, const TGAISDConfig* sd) {
+    end();
+
+    if (!sd) {
+        /* No SD config — fall back to LittleFS only */
+        return begin(tg_path);
+    }
+
+    /* Try SD card load */
+    if (_load_from_sd(tg_path, sd)) {
+        return true;
+    }
+
+    /* SD failed — try LittleFS as fallback */
+    Serial.println("[TGAI] SD load failed, trying LittleFS fallback...");
+    return begin(tg_path);
+}
+
 /* ─── Tokenizer wrappers ──────────────────────────────── */
 int TGAI_GO::encode(const char* text, int* tokens, int max_tokens) {
     if (!_ready || !_model) return -1;
@@ -1639,6 +1864,21 @@ void TGAI_GO::reset() {
 }
 
 /* ─── Free resources ────────────────────────────────────── */
+void TGAI_GO::_unmount_sd() {
+#ifdef ESP32
+    if (_sd_mounted) {
+        if (_sd_is_mmc) {
+            SD_MMC.end();
+        } else {
+            SD.end();
+        }
+        _sd_mounted = false;
+        _sd_is_mmc = false;
+        _sd_cs_pin = -1;
+    }
+#endif
+}
+
 void TGAI_GO::_free_resources() {
     if (_model) {
         TGEmbedModel* m = (TGEmbedModel*)_model;
@@ -1662,6 +1902,7 @@ void TGAI_GO::_free_resources() {
 
 void TGAI_GO::end() {
     _free_resources();
+    _unmount_sd();
     _ready = false;
     _model_size = 0;
     _max_seq_len = 0;
@@ -1672,56 +1913,72 @@ void TGAI_GO::end() {
 
 /* ─── Model scanning & loading by index ─────────────── */
 
-int TGAI_GO::scanModels() {
-    _model_count = 0;
-
-    /* LittleFS is already mounted by Arduino framework — do NOT call begin() again.
-     * Calling begin(true) on an already-mounted FS can corrupt internal state. */
-    if (!LittleFS.exists("/")) {
-        /* Only try mounting if not already available */
-        if (!LittleFS.begin(false)) {
-            _set_error("LittleFS mount failed during scan");
-            return 0;
-        }
-    }
-
-    File root = LittleFS.open("/");
+/* Helper: scan .TG files from an Arduino FS directory */
+static int _scan_fs_dir(FS& fs, const char* label, char model_names[8][64], int& count) {
+    File root = fs.open("/");
     if (!root) {
-        _set_error("Failed to open root for scanning");
+        Serial.printf("[TGAI] %s: failed to open root\n", label);
         return 0;
     }
 
-    Serial.println("===== 扫描 .TG 模型 =====");
     File f = root.openNextFile();
-    char fname_buf[64]; /* avoid String heap allocation */
-    while (f && _model_count < 8) {
+    char fname_buf[64];
+    while (f && count < 8) {
         const char* fname = f.name();
         if (fname) {
             strncpy(fname_buf, fname, sizeof(fname_buf) - 1);
             fname_buf[sizeof(fname_buf) - 1] = '\0';
             int len = strlen(fname_buf);
-            /* Case-insensitive .TG extension check */
             int is_tg = (len > 3 &&
-                (fname_buf[len-3] == '.' || fname_buf[len-3] == '.') &&
+                (fname_buf[len-3] == '.') &&
                 (fname_buf[len-2] == 'T' || fname_buf[len-2] == 't') &&
                 (fname_buf[len-1] == 'G' || fname_buf[len-1] == 'g'));
             if (is_tg) {
-                strncpy(_model_names[_model_count], fname_buf, 63);
-                _model_names[_model_count][63] = '\0';
-                _model_count++;
-                Serial.printf("  %d. %s (%u KB)\n", _model_count,
-                    _model_names[_model_count - 1],
-                    (unsigned)(f.size() / 1024));
+                strncpy(model_names[count], fname_buf, 63);
+                model_names[count][63] = '\0';
+                count++;
+                Serial.printf("  %d. %s (%u KB) [%s]\n", count,
+                    model_names[count - 1],
+                    (unsigned)(f.size() / 1024), label);
             }
         }
         f.close();
         f = root.openNextFile();
     }
     root.close();
+    return count;
+}
+
+int TGAI_GO::scanModels() {
+    _model_count = 0;
+
+    Serial.println("===== 扫描 .TG 模型 =====");
+
+    /* 1. LittleFS (internal flash) */
+    if (!LittleFS.exists("/")) {
+        if (!LittleFS.begin(false)) {
+            Serial.println("[TGAI] LittleFS: not available");
+        }
+    }
+    if (LittleFS.exists("/")) {
+        _scan_fs_dir(LittleFS, "LittleFS", _model_names, _model_count);
+    }
+
+    /* 2. SD card (if mounted externally by user or by our begin()) */
+#ifdef ESP32
+    if (_sd_mounted) {
+        if (_sd_is_mmc) {
+            _scan_fs_dir(SD_MMC, "SD_MMC", _model_names, _model_count);
+        } else {
+            _scan_fs_dir(SD, "SD", _model_names, _model_count);
+        }
+    }
+#endif
 
     if (_model_count == 0) {
         Serial.println("  未找到 .TG 模型文件");
     }
+    Serial.printf("  共找到 %d 个模型\n", _model_count);
     Serial.println("===========================");
     return _model_count;
 }

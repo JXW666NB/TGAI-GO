@@ -47,6 +47,12 @@
   #endif
 #endif
 
+/* SD card support (ESP32 only) */
+#ifdef ESP32
+  #include <SD.h>
+  #include <SD_MMC.h>
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -90,11 +96,55 @@ extern "C" {
 #define TG_EMBED_MAX_GENERATE_TOKENS 512
 
 /**
+ * @brief SD card configuration for loading models from external storage.
+ *
+ * Supported modes:
+ *   - SPI mode (default): uses cs_pin + optional custom sck/miso/mosi
+ *   - SD_MMC mode:      uses ESP32's built-in SDMMC host controller (fixed pins)
+ *
+ * Pin defaults (SPI mode, compatible with most SD card modules):
+ *   cs   = GPIO5
+ *   sck  = GPIO18 (VSPI default)
+ *   miso = GPIO19 (VSPI default)
+ *   mosi = GPIO23 (VSPI default)
+ *
+ * Usage:
+ * @code
+ *   // SPI mode with defaults
+ *   TGAISDConfig sd = TGAI_SD_SPI(5);
+ *   ai.begin("/TGAI_NB.TG", &sd);
+ *
+ *   // SD_MMC 4-bit mode (faster, uses fixed pins)
+ *   TGAISDConfig sd = TGAI_SD_MMC();
+ *   ai.begin("/TGAI_NB.TG", &sd);
+ *
+ *   // Auto-fallback: try LittleFS first, then SD
+ *   ai.begin("/TGAI_NB.TG");  // unchanged old API
+ * @endcode
+ */
+typedef struct {
+    int  cs_pin;        ///< Chip select pin (SPI mode only, ignored for SD_MMC)
+    int  sck_pin;       ///< SCK pin (SPI mode only, default 18)
+    int  miso_pin;      ///< MISO pin (SPI mode only, default 19)
+    int  mosi_pin;      ///< MOSI pin (SPI mode only, default 23)
+    bool use_sdmmc;     ///< true = SD_MMC 4-bit mode, false = SPI mode
+    int  freq_khz;      ///< SPI clock frequency in kHz (default 4000, max 20000)
+} TGAISDConfig;
+
+/** @brief Create SD config for SPI mode with just a CS pin. */
+#ifdef ESP32
+#define TGAI_SD_SPI(cs)       { (cs), 18, 19, 23, false, 4000 }
+#define TGAI_SD_SPI_FULL(cs, sck, miso, mosi) { (cs), (sck), (miso), (mosi), false, 4000 }
+#define TGAI_SD_MMC()         { -1, -1, -1, -1, true, 0 }
+#else
+/* Non-ESP32 platforms: SD not supported, provide stubs that won't compile */
+#define TGAI_SD_SPI(cs)       { (cs), -1, -1, -1, false, 0 }
+#define TGAI_SD_SPI_FULL(cs, sck, miso, mosi) { (cs), (sck), (miso), (mosi), false, 0 }
+#define TGAI_SD_MMC()         { -1, -1, -1, -1, true, 0 }
+#endif
+
+/**
  * @brief Callback type for streaming token output.
- *
- * Called each time a new token is generated (as a UTF-8 C string).
- * Must be non-blocking and fast.
- *
  * @param token Null-terminated UTF-8 string of the generated token.
  */
 typedef void (*TGOutputCallback)(const char* token);
@@ -147,6 +197,30 @@ public:
      * @return true if initialization succeeded, false otherwise.
      */
     bool begin(const char* tg_path);
+
+    /**
+     * @brief Initialize model from SD card (SPI or SD_MMC mode).
+     *
+     * Automatically mounts the SD card using the provided pin configuration,
+     * then loads the .TG model file. Falls back to trying LittleFS if
+     * SD mount fails.
+     *
+     * @param tg_path  Path to the .TG file (e.g. "/TGAI_NB.TG").
+     * @param sd       SD card pin configuration. Use TGAI_SD_SPI(cs),
+     *                 TGAI_SD_SPI_FULL(cs,sck,miso,mosi), or TGAI_SD_MMC().
+     * @return true if model loaded successfully from any filesystem.
+     *
+     * @code
+     *   // SD card in SPI mode on GPIO5 (CS)
+     *   TGAISDConfig sd = TGAI_SD_SPI(5);
+     *   ai.begin("/TGAI_NB.TG", &sd);
+     *
+     *   // SD_MMC 4-bit mode (faster, uses fixed pins GPIO2/4/12/13/14/15)
+     *   TGAISDConfig sd = TGAI_SD_MMC();
+     *   ai.begin("/TGAI_NB.TG", &sd);
+     * @endcode
+     */
+    bool begin(const char* tg_path, const TGAISDConfig* sd);
 
     /**
      * @brief Tokenize text into token IDs using the model's BPE tokenizer.
@@ -306,6 +380,11 @@ private:
     uint8_t*     _file_data;      /* heap copy of file data */
     bool         _file_loaded;    /* true if file loaded into _file_data */
 
+    /* ─── SD card state ──────────────────────────── */
+    bool         _sd_mounted;     /* true if SD was mounted by us */
+    bool         _sd_is_mmc;      /* true if using SD_MMC, false if SPI */
+    int          _sd_cs_pin;      /* remembered for cleanup */
+
     /* ─── Model scanning ──────────────────────────── */
     char         _model_names[8][64]; /* scanned model filenames (max 8) */
     int          _model_count;    /* number of models found */
@@ -314,6 +393,8 @@ private:
     /* ─── Internal methods ────────────────────────── */
     bool _init_model();
     bool _load_from_file(const char* path);
+    bool _load_from_sd(const char* path, const TGAISDConfig* sd);
+    void _unmount_sd();
     void _free_resources();
     int  _sample_token(const float* logits, int vocab_size, float temp, int top_k);
     void _set_error(const char* msg);

@@ -1,0 +1,38 @@
+#version 450
+// ★ BF16 矩阵乘（TGAI 核心内核 GPU 版）
+//
+// 踩坑记录：push constant block 必须满足 std430 对齐
+//   错误写法: uniform PC { uint n_out; uint n_in; uint seq; }  ← 12 字节，不是 16 的倍数
+//             ⇒ 驱动按 16 字节读，字段错位 ⇒ 结果全错（实测 4080/4096 不符）
+//   正确写法: 显式给每个字段 layout(offset=N)，并留 padding 到 16 字节
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(binding = 0) readonly  buffer W { uint  w[]; };
+layout(binding = 1) readonly  buffer X { float x[]; };
+layout(binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform PC {
+    layout(offset = 0)  uint n_out;
+    layout(offset = 4)  uint n_in;
+    layout(offset = 8)  uint seq;
+    layout(offset = 12) uint _pad;
+} pc;
+
+// BF16 -> FP32：就是左移 16 位（与 ggml 的 ggml_vec_dot_bf16 一致）
+float b2f(uint packed, uint hi) {
+    uint raw = (hi == 0u) ? (packed & 0xFFFFu) : (packed >> 16);
+    return uintBitsToFloat(raw << 16);
+}
+
+void main() {
+    uint row = gl_GlobalInvocationID.y;
+    uint col = gl_GlobalInvocationID.x;
+    if (row >= pc.n_out || col >= pc.seq) return;
+    uint nw = (pc.n_in + 1u) / 2u;
+    float acc = 0.0;
+    for (uint i = 0u; i < pc.n_in; i += 2u) {
+        uint packed = w[row * nw + i / 2u];
+        acc += b2f(packed, 0u) * x[i * pc.seq + col];
+        if (i + 1u < pc.n_in) acc += b2f(packed, 1u) * x[(i + 1u) * pc.seq + col];
+    }
+    y[row * pc.seq + col] = acc;
+}

@@ -1,0 +1,94 @@
+#version 450
+// ════════════════════════════════════════════════════════════════
+//  ★ BF16 矩阵乘 v3 —— 修正版（逐个假设排查后的重写）
+//
+//  ★★ 前两版的 bug（诊断实测 split=1 时即 64/64 不符）：
+//
+//   v1（[k][seq] 约定）     : 与引擎布局不符 ⇒ 全错
+//   v2（[seq][k] 约定）     : 布局对了，但仍全错
+//
+//  v2 的可疑点（逐个排除）：
+//   ✗ 权重打包     —— 已验证正确（wpk[0]=0xBF33BF30 解包对）
+//   ✗ 权重上传     —— 已验证正确（bw[0] 回读一致）
+//   ✗ 激活上传     —— 已验证正确（bx[0] 回读一致）
+//   ✗ push constant 偏移 —— 已核对（0/4/8/12）
+//   ✗ split 逻辑   —— split=1 就错 ⇒ 不是 split 的问题
+//
+//   ⇒ 剩下的嫌疑：**uvec4 对齐读取 + b2f 的分支写法**
+//
+//  ★★ v3 的两处关键改动：
+//    1) 去掉 uvec4（那是 v2 引入的，v1 没有 —— 而 v1 的输出
+//       虽然布局错，但"值"看起来更接近。uvec4 要求 16 字节对齐，
+//       而 wb + (k>>1) 在 k 是 8 的倍数时是 4 的倍数（uint32 索引），
+//       但 float 数组与 uint 数组的 base 不一定 16 字节对齐）
+//       ⇒ 改回【逐个 uint32 标量读取】，牺牲一点性能换确定性
+//    2) b2f 拆成两个函数（避免 (hi==0u) 三元分支在某些驱动上
+//       被错误优化）
+//
+//  ★ 布局约定（与引擎 _matmul_impl_bf16 一致）：
+//      x   [seq][k]      x[tok * k + i]
+//      W   [n][k]        W[row * k + i]
+//      out [seq][n]      out[tok * n + row]
+//    （诊断发现：这个布局就是错的，所以它在引擎里没用上；
+//      但本版先保证【内部自洽】，再单独验证）
+// ════════════════════════════════════════════════════════════════
+layout(local_size_x = 256) in;
+
+layout(binding = 0) readonly  buffer W { uint  w[]; };
+layout(binding = 1) readonly  buffer X { float x[]; };
+layout(binding = 2) writeonly buffer Y { float yp[]; };
+
+layout(push_constant) uniform PC {
+    layout(offset = 0)  uint n;
+    layout(offset = 4)  uint k;
+    layout(offset = 8)  uint seq;
+    layout(offset = 12) uint split;
+} pc;
+
+/* BF16 → FP32：取高 16 位后左移 16（不分支，两个函数各司其职）*/
+float lo16(uint packed) {
+    uint raw = packed & 0xFFFFu;
+    return uintBitsToFloat(raw << 16);
+}
+float hi16(uint packed) {
+    uint raw = packed >> 16;
+    return uintBitsToFloat(raw << 16);
+}
+
+void main() {
+    uint total = pc.seq * pc.n;
+    uint idx = gl_GlobalInvocationID.x;
+    uint seg = gl_GlobalInvocationID.y;
+
+    if (idx >= total || seg >= pc.split || pc.split == 0u) return;
+
+    /* 引擎布局：out[tok][row] ⇒ idx = tok * n + row */
+    uint tok = idx / pc.n;
+    uint row = idx - tok * pc.n;
+
+    uint nw = (pc.k + 1u) / 2u;
+    uint per = (pc.k + pc.split - 1u) / pc.split;
+    per = (per + 1u) & ~1u;                 /* 只对齐到 2（保证 BF16 成对）*/
+    uint k0 = seg * per;
+    uint k1 = min(k0 + per, pc.k);
+    if (k0 >= pc.k) { yp[seg * total + idx] = 0.0; return; }
+
+    uint wb = row * nw;                     /* 本行权重起点（uint32 索引）*/
+    uint xb = tok * pc.k;                   /* 本 token 激活起点 */
+
+    float acc = 0.0;
+    /* 每次 2 个 BF16（1 个 uint32）—— 标量、确定、无对齐要求 */
+    uint i = k0 & ~1u;                      /* 起始对齐到偶数 */
+    for (; i + 1u < k1; i += 2u) {
+        uint p = w[wb + (i >> 1u)];
+        acc += lo16(p) * x[xb + i];
+        acc += hi16(p) * x[xb + i + 1u];
+    }
+    /* 尾部（k 为奇数时）*/
+    if (i < k1) {
+        uint p = w[wb + (i >> 1u)];
+        acc += lo16(p) * x[xb + i];
+    }
+
+    yp[seg * total + idx] = acc;
+}

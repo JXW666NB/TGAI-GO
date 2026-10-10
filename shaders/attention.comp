@@ -1,0 +1,112 @@
+#version 450
+// ════════════════════════════════════════════════════════════════
+//  TGAI GO 推理内核 ⑤ —— Attention（单 query token + KV cache）
+//
+//  数学（每个 head 独立）：
+//    score[j] = (q · K[j]) / sqrt(head_dim)        j = 0..n_kv-1
+//    p = softmax(score)                            （因果：j <= pos）
+//    out = sum_j p[j] * V[j]
+//
+//  ★★ 设计决策（第二版，第一版全错后的修正）：
+//    第一版把「点积 + 树形归约」放在循环里，每次迭代都 barrier，
+//    结果全错（1024/1024 不符，GPU 值像是"所有 score 相等"）。
+//    根因：barrier 在条件分支内 + 归约写共享内存的时序过于微妙。
+//
+//    第二版原则：**一个线程算一个完整的 score**，彻底消除归约竞态。
+//      · score[j]：每线程串行 d 循环（head_dim=64 ⇒ 64 次 FMA）
+//      · 本块最大值/指数和：每线程各自串行扫共享内存数组
+//        （所有线程结果一致 ⇒ 无需归约，也就没有竞态）
+//      · 输出：每线程负责 out[tid]
+//    代价是并行度略低，但**绝对正确**。性能优化留到正确性验证之后。
+//
+//  绑定：
+//    binding 0 : Q    查询 [n_heads * head_dim]
+//    binding 1 : KVC  KV cache [2 * max_seq * kv_dim]（0=K, 1=V）
+//    binding 2 : OUT  输出 [n_heads * head_dim]
+//  推送常量（32 字节）：
+//    0  uint  n_heads      4  uint  n_kv_heads   8  uint  head_dim
+//    12 uint  n_kv         16 uint  pos          20 float scale
+//    24 uint  max_seq      28 uint  pad
+// ════════════════════════════════════════════════════════════════
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly  buffer QB  { float q[];   };
+layout(binding = 1) readonly  buffer KVC { float kvc[]; };
+layout(binding = 2) writeonly buffer OB  { float outx[]; };
+
+layout(push_constant) uniform PC {
+    layout(offset = 0)  uint  n_heads;
+    layout(offset = 4)  uint  n_kv_heads;
+    layout(offset = 8)  uint  head_dim;
+    layout(offset = 12) uint  n_kv;
+    layout(offset = 16) uint  pos;
+    layout(offset = 20) float scale;
+    layout(offset = 24) uint  max_seq;
+    layout(offset = 28) uint  pad;
+} pc;
+
+#define TILE 128
+shared float s_sc[TILE];
+
+void main() {
+    uint head = gl_WorkGroupID.x;
+    uint tid  = gl_LocalInvocationID.x;
+    if (head >= pc.n_heads || tid >= pc.head_dim) return;
+
+    uint hd = pc.head_dim;
+    uint kv_dim = pc.n_kv_heads * hd;
+    uint kvh = head / max(1u, pc.n_heads / pc.n_kv_heads);
+
+    uint kbase0 = kvh * hd;
+    uint vbase0 = 1u * pc.max_seq * kv_dim + kvh * hd;
+
+    float m = -3.4e38;
+    float s = 0.0;
+    float acc = 0.0;
+
+    for (uint t0 = 0u; t0 < pc.n_kv; t0 += TILE) {
+        uint tend = min(t0 + TILE, pc.n_kv);
+        uint tlen = tend - t0;
+
+        /* 阶段 A：score[j]，每线程算一个完整的 j（无归约）*/
+        for (uint j = tid; j < tlen; j += 64u) {
+            uint gj = t0 + j;
+            if (gj > pc.pos) { s_sc[j] = -3.4e38; continue; }
+            uint kb = 0u * pc.max_seq * kv_dim + gj * kv_dim + kbase0;
+            float dot = 0.0;
+            for (uint d = 0u; d < hd; d++) {
+                dot += q[head * hd + d] * kvc[kb + d];
+            }
+            s_sc[j] = dot * pc.scale;
+        }
+        barrier();
+
+        /* 阶段 B：本块最大值 —— 每线程各自串行扫，结果必然一致 */
+        float bmx = -3.4e38;
+        for (uint j = 0u; j < tlen; j++) bmx = max(bmx, s_sc[j]);
+
+        float mnew = max(m, bmx);
+        float corr = exp(m - mnew);
+        m = mnew;
+
+        /* 阶段 C：指数与和 —— 同样每线程各自串行，结果一致 */
+        float bsum = 0.0;
+        for (uint j = 0u; j < tlen; j++) {
+            float e = exp(s_sc[j] - m);
+            s_sc[j] = e;
+            bsum += e;
+        }
+        barrier();
+
+        /* 阶段 D：累加输出（每线程负责 out[tid]）*/
+        acc *= corr;
+        for (uint j = 0u; j < tlen; j++) {
+            uint gj = t0 + j;
+            acc += s_sc[j] * kvc[vbase0 + gj * kv_dim + tid];
+        }
+        s = s * corr + bsum;
+        barrier();
+    }
+
+    outx[head * hd + tid] = (s > 0.0) ? (acc / s) : 0.0;
+}

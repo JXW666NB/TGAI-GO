@@ -19,6 +19,7 @@
 #include "tgai_engine.h"
 
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -44,6 +45,12 @@
     #include <sys/mman.h>
 #endif
 
+/* ARMv8.2-A dotprod 运行时检测 (Q4_0 整数点积加速用) */
+#if defined(__aarch64__)
+    #include <sys/auxv.h>
+    #include <asm/hwcap.h>
+#endif
+
 /* ─── SIMD 检测 ──────────────────────────────────
  * 只在实际编译器报告对应指令集可用时启用, 避免在 TCC/MSVC 等不支持
  * intrinsics 头文件的环境下出错。需要 -mavx2 / -mfpu=neon 等编译标志。
@@ -61,12 +68,76 @@
     #define TG_HAS_AVX2 0
 #endif
 
-/* ─── 多线程支持 ────────────────────────────────── */
+/* ─── 多线程支持 (持久线程池) ──────────────────────
+ * 设计要点:
+ *   - 线程池一次性创建 (懒初始化), 之后每次任务仅 condvar 唤醒,
+ *     避免每任务 pthread_create/join (decode 每 token 数百次并行调用,
+ *     线程创建开销会完全吞掉并行收益)
+ *   - 主线程也参与一块任务 (充分利用所有核)
+ *   - 线程数在首次并行时按 g_nthreads 固定; g_nthreads<=1 或任务过小时单线程
+ *   - TG_SINGLE_THREAD (嵌入式/简化编译) 时整个块不编译 */
 #if !defined(TG_SINGLE_THREAD)
+#if defined(_WIN32) && !defined(__MINGW32__) && !defined(__MINGW64__)
+    /* ══════════════════════════════════════════════════════════════════
+     * Win32 线程兼容层（2026-10-09 加，为让 MSVC 能编译本引擎）
+     *
+     * 为什么需要：
+     *   本引擎多线程全用 pthread（持久线程池）。Windows 上原产物是 MinGW 编的
+     *   （dumpbin 实测导入 libwinpthread-1.dll），而 MSVC 没有 pthread.h。
+     *   为用 MSVC 拿到 AVX2 + /O2 + UCRT（对齐 llama.cpp 的性能基线），
+     *   这里把 pthread 用到的 10 个 API 映射到 Win32 原生原语：
+     *       mutex  -> CRITICAL_SECTION
+     *       cond   -> CONDITION_VARIABLE (SleepConditionVariableCS)
+     *       thread -> _beginthreadex / WaitForSingleObject
+     *   业务代码零改动。MinGW(gcc/clang) 走原 pthread 路径，行为不变。
+     *
+     * ★ CRITICAL_SECTION / CONDITION_VARIABLE 不能像 pthread 那样静态初始化，
+     *   所以 tg_pool_ensure() 里补了运行时初始化（见该函数开头）。
+     * ══════════════════════════════════════════════════════════════════ */
+    #include <windows.h>
+    #include <process.h>
+
+    #define TG_MAX_THREADS 16
+
+    typedef CRITICAL_SECTION pthread_mutex_t;
+    typedef CONDITION_VARIABLE pthread_cond_t;
+    typedef void* pthread_t;
+
+    /* 占位：零初始化。真正初始化在 tg_pool_ensure() 里做。 */
+    #define PTHREAD_MUTEX_INITIALIZER {0}
+    #define PTHREAD_COND_INITIALIZER  {0}
+
+    static inline int pthread_mutex_lock(pthread_mutex_t* m) {
+        EnterCriticalSection(m); return 0;
+    }
+    static inline int pthread_mutex_unlock(pthread_mutex_t* m) {
+        LeaveCriticalSection(m); return 0;
+    }
+    static inline int pthread_cond_wait(pthread_cond_t* c, pthread_mutex_t* m) {
+        SleepConditionVariableCS(c, m, INFINITE); return 0;
+    }
+    static inline int pthread_cond_broadcast(pthread_cond_t* c) {
+        WakeAllConditionVariable(c); return 0;
+    }
+    static inline int pthread_create(pthread_t* t, const void* attr,
+                                     void* (*fn)(void*), void* arg) {
+        (void)attr;
+        uintptr_t h = _beginthreadex(NULL, 0,
+                                     (unsigned(__stdcall*)(void*))fn, arg, 0, NULL);
+        if (h == 0) return -1;
+        *t = (pthread_t)h;
+        return 0;
+    }
+    static inline int pthread_join(pthread_t t, void** ret) {
+        (void)ret;
+        HANDLE h = (HANDLE)t;
+        WaitForSingleObject(h, INFINITE);
+        CloseHandle(h);
+        return 0;
+    }
+#else
     #include <pthread.h>
-    #define TG_MAX_THREADS 8
-    static pthread_t g_threads[TG_MAX_THREADS];
-    static int g_nthreads = 0;
+#endif
 
     typedef struct {
         int start, end, stride;
@@ -74,41 +145,299 @@
         void (*fn)(int, void*);
     } ThreadTask;
 
-    static ThreadTask g_tasks[TG_MAX_THREADS];
+    /* ★ 原子自增：MSVC 用 _InterlockedIncrement，pthread 平台用 __sync_add_and_fetch */
+    #if defined(_MSC_VER)
+        #include <intrin.h>
+        #define TG_ATOMIC_INC(p)  _InterlockedIncrement((volatile long*)(p))
+        #define TG_CPU_PAUSE()    _mm_pause()
+    #elif defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__))
+        #define TG_ATOMIC_INC(p)  __sync_add_and_fetch((p), 1)
+        #define TG_CPU_PAUSE()    __builtin_ia32_pause()
+    #else
+        #define TG_ATOMIC_INC(p)  __sync_add_and_fetch((p), 1)
+        #define TG_CPU_PAUSE()    ((void)0)
+    #endif
 
-    static void* tg_thread_worker(void* arg) {
-        ThreadTask* t = (ThreadTask*)arg;
-        for (int i = t->start; i < t->end; i += t->stride) {
-            t->fn(i, t->data);
+    static pthread_t g_threads[TG_MAX_THREADS];
+    static ThreadTask g_tasks[TG_MAX_THREADS];
+    static int g_nthreads = 0;
+    static int g_pool_ready = 0;
+    static int g_pool_workers = 0;   /* 实际创建的线程数 (创建后固定) */
+
+    static pthread_mutex_t g_pool_mtx = PTHREAD_MUTEX_INITIALIZER;
+    static pthread_cond_t  g_pool_cond = PTHREAD_COND_INITIALIZER;
+    static volatile int g_pool_busy = 0;   /* 1 = 有任务 */
+    static volatile int g_pool_gen  = 0;   /* 任务代数: 每轮 +1, 区分新旧任务 */
+    static volatile int g_pool_shutdown = 0; /* 1 = 线程池关闭 (DLL 卸载前必须调用) */
+    /* ★ 2026-10-09 优化：
+     *   g_pool_done 改为原子计数（InterlockedIncrement / _InterlockedIncrement），
+     *   worker 完成时【不进临界区】，也【不唤醒其它 worker】。
+     *   g_pool_task_cond : worker 等新任务用（broadcast）
+     *   g_pool_done_cond : 主线程等所有 worker 完成用（由最后一个完成的 worker 唤醒） */
+    static volatile long g_pool_done = 0;
+    static pthread_cond_t g_pool_task_cond = PTHREAD_COND_INITIALIZER;
+    static pthread_cond_t g_pool_done_cond = PTHREAD_COND_INITIALIZER;
+    static int g_pool_active = 0;          /* 本轮参与任务的 worker 数 */
+
+    static void* tg_pool_worker(void* arg) {
+        long tid = (long)arg;
+        int my_gen = -1;
+        for (;;) {
+            pthread_mutex_lock(&g_pool_mtx);
+            /* 等待任务; 关闭标志置位则退出 (DLL 卸载安全) */
+            while (!g_pool_busy && !g_pool_shutdown) {
+                pthread_cond_wait(&g_pool_task_cond, &g_pool_mtx);
+            }
+            if (g_pool_shutdown) {
+                pthread_mutex_unlock(&g_pool_mtx);
+                return NULL;
+            }
+            /* 等待新任务: 代数已更新 (避免重复执行同一轮任务) */
+            while (my_gen == g_pool_gen) {
+                pthread_cond_wait(&g_pool_task_cond, &g_pool_mtx);
+                if (g_pool_shutdown) {
+                    pthread_mutex_unlock(&g_pool_mtx);
+                    return NULL;
+                }
+            }
+            my_gen = g_pool_gen;
+            ThreadTask t = g_tasks[tid];
+            pthread_mutex_unlock(&g_pool_mtx);
+
+            for (int i = t.start; i < t.end; i += t.stride) {
+                t.fn(i, t.data);
+            }
+
+            /* ★ 完成通知（优化）：不进临界区、不惊动其它 worker。
+             *   InterlockedIncrement 自带 full barrier ⇒ worker 写出的结果对
+             *   主线程可见（Release 语义）。只有【最后一个】完成者去唤醒主线程。 */
+            if (TG_ATOMIC_INC(&g_pool_done) == (long)g_pool_active) {
+                pthread_mutex_lock(&g_pool_mtx);
+                pthread_cond_broadcast(&g_pool_done_cond);   /* 只唤醒等结果的主线程 */
+                pthread_mutex_unlock(&g_pool_mtx);
+            }
         }
         return NULL;
     }
 
+    static void tg_pool_ensure(void) {
+#if defined(_WIN32) && !defined(__MINGW32__) && !defined(__MINGW64__)
+    /* ★ MSVC: CRITICAL_SECTION / CONDITION_VARIABLE 必须运行时初始化 */
+    {
+        static LONG _pool_once = 0;
+        if (InterlockedCompareExchange(&_pool_once, 1, 0) == 0) {
+            InitializeCriticalSection(&g_pool_mtx);
+            InitializeConditionVariable(&g_pool_cond);        /* worker 等任务 */
+            InitializeConditionVariable(&g_pool_task_cond);   /* ★ 同上（新名） */
+            InitializeConditionVariable(&g_pool_done_cond);   /* ★ 主线程等结果 */
+        }
+    }
+#endif
+        if (g_pool_ready) return;
+        pthread_mutex_lock(&g_pool_mtx);
+        if (!g_pool_ready) {
+            if (g_nthreads < 1) g_nthreads = 1;
+            g_pool_workers = g_nthreads;
+            for (int t = 0; t < g_pool_workers; t++) {
+                pthread_create(&g_threads[t], NULL, tg_pool_worker, (void*)(long)t);
+            }
+            g_pool_ready = 1;
+        }
+        pthread_mutex_unlock(&g_pool_mtx);
+    }
+
+    /* 关闭线程池并等待线程退出。
+     * 必须在 DLL 被 FreeLibrary 前调用 (python/ctypes 进程退出等场景),
+     * 否则 worker 线程会访问已卸载的 DLL 静态内存 → 崩溃。 */
+    static void tg_pool_shutdown(void) {
+        pthread_mutex_lock(&g_pool_mtx);
+        g_pool_shutdown = 1;
+        g_pool_busy = 0;
+        pthread_cond_broadcast(&g_pool_task_cond);
+        pthread_cond_broadcast(&g_pool_done_cond);   /* 唤醒可能在等结果的主线程 */
+        pthread_mutex_unlock(&g_pool_mtx);
+        for (int t = 0; t < g_pool_workers; t++) {
+            pthread_join(g_threads[t], NULL);
+        }
+        g_pool_ready = 0;
+        g_pool_workers = 0;
+        g_pool_shutdown = 0;
+    }
+
+    /* ★ 默认线程上限（2026-10-09 加）
+     *
+     * 原实现直接返回【逻辑核数】，导致在 8核16线程 的机器上默认开 16 个线程，
+     * 但实测（_phone_v1q4.tg，每线程数独立进程）：
+     *     1线程 10.0 / 2线程 16.0 / 4线程 17.2 / 8线程 12.5 / 16线程 10.2 tok/s
+     * 超过 4 线程后同步争用（单全局锁 + cond broadcast）反而拖慢，16 线程比 4 线程慢 41%。
+     *
+     * ⇒ 默认取 min(逻辑核, 4)，既避免过度并行，也不浪费少核设备。
+     *   需要更多线程仍可显式调用 tg_set_nthreads(n) 覆盖。 */
+    #define TG_DEFAULT_MAX_THREADS 4
+
+    static int tg_physical_cores(void) {
+    #if defined(_WIN32)
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        return (int)si.dwNumberOfProcessors;
+    #else
+        long n = sysconf(_SC_NPROCESSORS_ONLN);
+        return n > 0 ? (int)n : 4;
+    #endif
+    }
+
+    static int tg_detect_cores(void) {
+        int n = tg_physical_cores();
+        if (n < 1) n = 1;
+        if (n > TG_DEFAULT_MAX_THREADS) n = TG_DEFAULT_MAX_THREADS;   /* ★ 默认封顶 */
+        return n;
+    }
+
+    /* ★ 线程数懒初始化（2026-10-09 提出为独立函数）
+     *
+     * 原实现把这个逻辑写在 tg_parallel() 内部，但【调用方】_matmul_impl 是先用
+     * `if (g_nthreads > 1)` 判断再决定要不要调 tg_parallel 的 —— 于是：
+     *   没调用过 tg_set_nthreads 时 g_nthreads == 0
+     *   ⇒ 判断恒假 ⇒ 永远走单线程回退
+     *   ⇒ g_nthreads 也永远得不到初始化（先有鸡还是先有蛋）
+     * 实测后果：默认配置下 decode 6.9 tok/s，显式设 4 线程是 13.6~14.3 tok/s。
+     *
+     * ⇒ 必须在使用 g_nthreads 之前调用本函数。 */
+    static void tg_nthreads_ensure(void) {
+        if (g_nthreads <= 0) {
+            int c = tg_detect_cores();
+            if (c < 1) c = 1;
+            if (c > TG_MAX_THREADS) c = TG_MAX_THREADS;
+            g_nthreads = c;
+        }
+    }
+
     static void tg_parallel(int n, void (*fn)(int, void*), void* data) {
-        if (g_nthreads <= 1 || n < g_nthreads) {
+        tg_nthreads_ensure();   /* 复用统一逻辑 */
+        int nt = g_pool_ready ? g_pool_workers : g_nthreads;
+        if (nt <= 1 || n < nt) {
             for (int i = 0; i < n; i++) fn(i, data);
             return;
         }
-        int chunk = (n + g_nthreads - 1) / g_nthreads;
-        for (int t = 0; t < g_nthreads; t++) {
+        tg_pool_ensure();
+
+        /* 任务描述写入必须在锁内: worker 在锁内读 g_tasks, 锁外写是数据竞争
+         * (编译器可重排, worker 可能读到部分更新的任务 → 越界/崩溃) */
+        pthread_mutex_lock(&g_pool_mtx);
+        /* nt+1 块划分: worker tid 负责块 tid, 主线程负责最后一块 [nt*chunk, n)。
+         * 关键约束: 任务必须两两不重叠, 且主线程必须等 done==nt (所有 worker
+         * 完成) 才能返回。否则 (旧实现 task 0 被主线程与 worker 0 双重执行,
+         * done 只等 nt-1) 主线程会提前返回 → 调用方 free 输出 buffer 时仍有
+         * worker 在写入 → use-after-free 崩溃 (MoE 专家并行必现)。 */
+        int nchunk = nt + 1;
+        int chunk = (n + nchunk - 1) / nchunk;
+        if (chunk < 1) chunk = 1;
+        for (int t = 0; t < nt; t++) {
             g_tasks[t].start = t * chunk;
-            g_tasks[t].end = (t + 1) * chunk;
+            g_tasks[t].end   = (t + 1) * chunk;
             if (g_tasks[t].end > n) g_tasks[t].end = n;
+            if (g_tasks[t].start > g_tasks[t].end) g_tasks[t].start = g_tasks[t].end;
             g_tasks[t].stride = 1;
-            g_tasks[t].data = data;
-            g_tasks[t].fn = fn;
-            if (g_tasks[t].start < g_tasks[t].end)
-                pthread_create(&g_threads[t], NULL, tg_thread_worker, &g_tasks[t]);
+            g_tasks[t].data   = data;
+            g_tasks[t].fn     = fn;
         }
-        for (int t = 0; t < g_nthreads; t++) {
-            if (g_tasks[t].start < g_tasks[t].end)
-                pthread_join(g_threads[t], NULL);
+        g_pool_gen++;            /* 新代数: 唤醒 worker 执行本轮任务 */
+        g_pool_done = 0;
+        g_pool_active = nt;      /* ★ 本轮应完成的 worker 数（末位完成者据此判断） */
+        g_pool_busy = 1;
+        pthread_cond_broadcast(&g_pool_task_cond);
+        pthread_mutex_unlock(&g_pool_mtx);
+
+        /* 主线程参与最后一块任务 (块 nt), 与所有 worker 任务不重叠 */
+        int main_start = nt * chunk;
+        if (main_start > n) main_start = n;
+        for (int i = main_start; i < n; i++) {
+            fn(i, data);
         }
+
+        /* ★ 等待所有 worker 完成（优化版）
+         *   worker 干完通常只差几微秒，先自旋（_mm_pause 降低功耗与总线压力），
+         *   自旋失败再退到条件变量睡眠。避免每次都进内核。 */
+        {
+            const int SPIN = 20000;
+            int spun = 0;
+            while ((long)g_pool_done < (long)nt) {
+                if (++spun > SPIN) break;
+                TG_CPU_PAUSE();
+            }
+            if ((long)g_pool_done < (long)nt) {
+                pthread_mutex_lock(&g_pool_mtx);
+                while ((long)g_pool_done < (long)nt) {
+                    pthread_cond_wait(&g_pool_done_cond, &g_pool_mtx);
+                }
+                pthread_mutex_unlock(&g_pool_mtx);
+            }
+        }
+        pthread_mutex_lock(&g_pool_mtx);
+        g_pool_busy = 0;
+        pthread_mutex_unlock(&g_pool_mtx);
     }
 #endif
 
 /* ─── NEON 辅助函数 ─────────────────────────────── */
 #if TG_HAS_NEON
+/* 跨平台 NEON 128-bit 水平求和 (4 lane → 标量)
+ *
+ * vaddvq_f32 / vaddvq_s32 是 ARMv8-A (AArch64) 专属指令,
+ * ARMv7-A (armeabi-v7a) NEON 不支持, 但 vpadd (pairwise add) 是 NEON v7 标准
+ * 指令, 所有带 NEON 的 ARMv7-A 都有。
+ *
+ * 策略:
+ *   - AArch64 (arm64-v8a): 直接用硬件 vaddvq (1 周期)
+ *   - AArch32 ARMv7-A (armeabi-v7a): vpadd 两次完成 4→2→1 归约 (~3 周期)
+ *
+ * vpadd_f32(a, b): [a0,a1] + [b0,b1] → [a0+a1, b0+b1]
+ *   step1: [v0,v1,v2,v3] → vpadd(low, high) → [v0+v1, v2+v3]
+ *   step2: 再 vpadd 自身 → [v0+v1+v2+v3, _]
+ */
+static inline float tg_vaddvq_f32(float32x4_t v) {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    return vaddvq_f32(v);
+#else
+    float32x2_t lo = vget_low_f32(v);
+    float32x2_t hi = vget_high_f32(v);
+    float32x2_t s   = vpadd_f32(lo, hi);          /* [v0+v1, v2+v3] */
+    return vget_lane_f32(vpadd_f32(s, s), 0);    /* v0+v1+v2+v3 */
+#endif
+}
+
+static inline int32_t tg_vaddvq_s32(int32x4_t v) {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    return vaddvq_s32(v);
+#else
+    int32x2_t lo = vget_low_s32(v);
+    int32x2_t hi = vget_high_s32(v);
+    int32x2_t s  = vpadd_s32(lo, hi);
+    return vget_lane_s32(vpadd_s32(s, s), 0);
+#endif
+}
+
+/* ARMv8.2-A dotprod 运行时检测 (Q4_0 整数点积内核用):
+ * 函数级开启 dotprod 后, 老设备 (Cortex-A73 等无 dotprod) 执行会 SIGILL,
+ * 必须运行时检测再决定走 dotprod 内核还是标量回退。
+ *
+ * 注意: arm64 (AArch64) 的 dotprod 支持位是 AT_HWCAP 的 HWCAP_ASIMDDP
+ * (bit 20); HWCAP2_ASIMDDOT 是 32 位 ARM (ARMv7) 的定义, 此处不能用。
+ * NDK 的 asm/hwcap.h 若未提供 HWCAP_ASIMDDP, 手动补齐 (内核 UAPI 值)。 */
+#if defined(__aarch64__)
+    #ifndef HWCAP_ASIMDDP
+        #define HWCAP_ASIMDDP (1UL << 20)
+    #endif
+#endif
+static int tg_cpu_has_asimddot(void) {
+#if defined(__aarch64__)
+    unsigned long hw = getauxval(AT_HWCAP);
+    return (hw & HWCAP_ASIMDDP) != 0;
+#else
+    return 0;
+#endif
+}
+
 /* NEON 内积: 2 路展开(8 floats/iter) + 寄存器水平求和 */
 static inline float neon_dot(const float* a, const float* b, int n) {
     float32x4_t acc0 = vdupq_n_f32(0);
@@ -124,16 +453,29 @@ static inline float neon_dot(const float* a, const float* b, int n) {
         i += 4;
     }
     acc0 = vaddq_f32(acc0, acc1);
-    float s = vaddvq_f32(acc0);
+    float s = tg_vaddvq_f32(acc0);
     for (; i < n; i++) s += a[i] * b[i];
     return s;
 }
 
+/* neon_dot_q4_0 需要 ARMv8.2-A dotprod 指令 (vdotq_s32)。
+ * - 全局编译开启 +dotprod (-march=armv8.2-a+dotprod) 时 __ARM_FEATURE_DOTPROD 已定义;
+ * - 否则在 aarch64 上用函数级 target("+dotprod") 只给本函数开启 (不影响文件其他部分),
+ *   并在运行时用 HWCAP_ASIMDDP 检测, 老设备自动回退标量 (不会 SIGILL);
+ * - armeabi-v7a 无 dotprod 指令, 整个函数不编译 (tg_dot_q4 运行时调度也不会调用它)。 */
+#if defined(__ARM_FEATURE_DOTPROD) || defined(__aarch64__)
+#if defined(__ARM_FEATURE_DOTPROD)
 /* NEON Q4_0 直接点积: FP32 input × Q4_0 weight (无中间反量化)
  * Q4_0 格式: [FP16 scale (2B)] [packed 4-bit (16B = 32 vals)] 每 block
  * 策略: 输入每32个量化到 Q8_0, 用 vdotq_s32 做整数点积, 最后乘 scale */
 static float neon_dot_q4_0(const float* x, const uint8_t* q4, const float* scales,
                            int n) {
+#else
+/* aarch64 默认编译: 函数级开启 dotprod (不影响文件其他部分), 运行时检测回退 */
+__attribute__((target("+dotprod")))
+static float neon_dot_q4_0(const float* x, const uint8_t* q4, const float* scales,
+                           int n) {
+#endif
     float sum = 0;
     int blocks = (n + 31) / 32;
     for (int b = 0; b < blocks; b++) {
@@ -196,12 +538,13 @@ static float neon_dot_q4_0(const float* x, const uint8_t* q4, const float* scale
             sum += (float)xi_v * (float)((int)nib - 8) * scale_x * scale_w;
         }
         /* NEON 累积结果 */
-        int32_t acc_s = vaddvq_s32(acc);
+        int32_t acc_s = tg_vaddvq_s32(acc);
         sum += (float)acc_s * scale_x * scale_w;
     }
     return sum;
 }
-#endif
+#endif /* __ARM_FEATURE_DOTPROD || __aarch64__ (neon_dot_q4_0) */
+#endif /* __ARM_NEON */
 
 /* AVX2 内积: 2 路展开(16 floats/iter) */
 #if TG_HAS_AVX2
@@ -230,6 +573,76 @@ static inline float avx2_dot(const float* a, const float* b, int n) {
 }
 #endif
 
+/* ══════════════════════════════════════════════════════════════
+ *  BF16 直算点积（2026-10-10 加）
+ *
+ *  动机（实测）：V2.7 BF16 文件 5.64 GB → 展开 FP32 = 11.3 GB（2x 膨胀）。
+ *  V3 7B 是 14 GB → 28 GB，30B 是 60 GB → 120 GB ⇒ 大模型完全不可行。
+ *  llama.cpp 用 ggml_vec_dot_bf16 原生计算（权重恒 2 字节），我们照做。
+ *
+ *  微基准（tools/bench_bf16.c）：
+ *    [4096,1024] FP32 1.013ms → BF16 0.569ms = 1.78x，内存省 50%
+ *    [3584,896]  FP32 0.600ms → BF16 0.404ms = 1.49x，内存省 50%
+ *    数值逐位完全相同（bf16→fp32 只是左移 16 位，算的是同一批值）
+ *
+ *  为什么更快：本机实测引擎只发挥 3.03 GB/s（可用 8.60 GB/s）⇒ 带宽受限，
+ *  读的字节少一半直接换来吞吐。这与"A 的 hash 优化"同源（都是减少工作集）。
+ * ══════════════════════════════════════════════════════════════ */
+typedef uint16_t tg_bf16;
+
+/* 单元素 bf16 → fp32（左移 16 位；与 bf16_to_f32 等价，此处内联避免依赖顺序） */
+static inline float tg_bf16_to_f32(uint16_t h) {
+    union { uint32_t u; float f; } v;
+    v.u = ((uint32_t)h) << 16;
+    return v.f;
+}
+
+static inline float bf16_dot(const float* x, const uint16_t* w, int n) {
+#if TG_HAS_AVX2
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 16 <= n; i += 16) {
+        __m128i w16a = _mm_loadu_si128((const __m128i*)(w + i));
+        __m256i w32a = _mm256_slli_epi32(_mm256_cvtepu16_epi32(w16a), 16);
+        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x + i),
+                               _mm256_castsi256_ps(w32a), acc0);
+        __m128i w16b = _mm_loadu_si128((const __m128i*)(w + i + 8));
+        __m256i w32b = _mm256_slli_epi32(_mm256_cvtepu16_epi32(w16b), 16);
+        acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(x + i + 8),
+                               _mm256_castsi256_ps(w32b), acc1);
+    }
+    for (; i + 8 <= n; i += 8) {
+        __m128i w16 = _mm_loadu_si128((const __m128i*)(w + i));
+        __m256i w32 = _mm256_slli_epi32(_mm256_cvtepu16_epi32(w16), 16);
+        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x + i),
+                               _mm256_castsi256_ps(w32), acc0);
+    }
+    __m256 acc = _mm256_add_ps(acc0, acc1);
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    __m128 s128 = _mm_add_ps(lo, hi);
+    s128 = _mm_hadd_ps(s128, s128);
+    s128 = _mm_hadd_ps(s128, s128);
+    float s = _mm_cvtss_f32(s128);
+    for (; i < n; i++) s += x[i] * tg_bf16_to_f32(w[i]);
+    return s;
+#else
+    /* 标量回退（嵌入式/无 AVX2） */
+    float s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+    int i = 0, n4 = n & ~3;
+    for (; i < n4; i += 4) {
+        s0 += x[i]     * tg_bf16_to_f32(w[i]);
+        s1 += x[i + 1] * tg_bf16_to_f32(w[i + 1]);
+        s2 += x[i + 2] * tg_bf16_to_f32(w[i + 2]);
+        s3 += x[i + 3] * tg_bf16_to_f32(w[i + 3]);
+    }
+    float s = (s0 + s1) + (s2 + s3);
+    for (; i < n; i++) s += x[i] * tg_bf16_to_f32(w[i]);
+    return s;
+#endif
+}
+
 /* AVX2 Q4_0 直接点积:
  * FP32 input × Q4_0 weight (对标 llama.cpp ggml_vec_dot_q4_0)
  *
@@ -246,7 +659,8 @@ static inline float avx2_dot(const float* a, const float* b, int n) {
 #if TG_HAS_AVX2
 static inline float avx2_dot_q4_0(const float* __restrict x,
                                    const uint8_t* __restrict q4_raw,
-                                   const float* __restrict scales, int n) {
+                                   const float* __restrict scales,
+                                   const int16_t* __restrict sumwi, int n) {
     float sum = 0;
     const int blocks = (n + 31) / 32;
 
@@ -294,7 +708,7 @@ static inline float avx2_dot_q4_0(const float* __restrict x,
         /* 3. 整数点积: sum(xi_u[j] * wi[j])
          *    xi_u = xi + 128 (unsigned)  →  maddubs 要求第一个操作数 unsigned
          *    sum(xi_u * wi) = sum(xi * wi) + 128 * sum(wi)
-         *    → 真正点积 = maddubs 结果 - 128 * Σwi */
+         *    → 真正点积 = maddubs 结果 - 128 * Σwi (Σwi 已在加载时预计算) */
         __m256i xi_v  = _mm256_loadu_si256((const __m256i*)xi);
         __m256i xi_u  = _mm256_sub_epi8(xi_v, off128);           /* xi + 128 */
         __m256i dot16 = _mm256_maddubs_epi16(xi_u, wi);          /* 16-bit pairs */
@@ -308,17 +722,13 @@ static inline float avx2_dot_q4_0(const float* __restrict x,
         sum128 = _mm_hadd_epi32(sum128, sum128);
         int dot = _mm_cvtsi128_si32(sum128);
 
-        /* 5. 修正: 减 128 * Σwi */
-        int sum_wi = 0;
-        for (int j = 0; j < 32; j++) {
-            uint8_t nib = (q4_block[j / 2] >> ((j % 2) * 4)) & 0x0F;
-            sum_wi += (int)nib - 8;
-        }
-        dot -= 128 * sum_wi;
+        /* 5. 修正: 减 128 * Σwi (预计算, 免去每 block 标量扫描) */
+        dot -= 128 * sumwi[b];
 
-        /* 6. float 累加: dot * scale_w / 127
-         * (输入量化时已用 inv_scale, dot = Σ(xi·wi), 无需再乘 inv_scale) */
-        sum += (float)dot * scale_w / 127.0f;
+        /* 6. float 累加: dot * scale_w * max_x / 127
+         * (xi = round(x*127/max_x), dot = Σ(xi·wi) ≈ (127/max_x)·Σ(x·wi),
+         * 故 Σ(x·wi)·scale_w = dot·max_x·scale_w/127, 需乘 max_x 恢复真值) */
+        sum += (float)dot * scale_w * max_x / 127.0f;
     }
     return sum;
 }
@@ -347,15 +757,124 @@ static inline float tg_dot(const float* a, const float* b, int n) {
 }
 
 /* Q4_0 直接点积: FP32 input × Q4_0 weight (零反量化, 省 4x 内存带宽)
- * 路径选择: NEON > AVX2 > 标量 */
-static inline float tg_dot_q4(const float* x, const uint8_t* q4_raw,
-                               const float* scales, int n) {
-#if TG_HAS_NEON
-    return neon_dot_q4_0(x, q4_raw, scales, n);
-#elif TG_HAS_AVX2
-    return avx2_dot_q4_0(x, q4_raw, scales, n);
+ * 路径选择: NEON dotprod (运行时检测) > AVX2 > 标量
+ *
+ * neon_dot_q4_0 用了 vdotq_s32 (ARMv8.2-A dotprod 指令):
+ * - NDK 默认编译不开启 dotprod (兼容老设备), 通过函数级 target("+dotprod")
+ *   只给该函数开启指令; 但老设备 (无 HWCAP2_ASIMDDOT) 执行 dotprod 指令
+ *   会 SIGILL, 因此必须运行时检测 tg_cpu_has_asimddot(), 不支持则走标量回退。
+ * - 即使未来全局开启 -march=armv8.2-a+dotprod (定义 __ARM_FEATURE_DOTPROD),
+ *   运行时检测依然保留, 保证老设备安全。 */
+/* ══════════════════════════════════════════════════════════════
+ *  Q4K 双级 4-bit 直接点积（2026-10-10 加）
+ *
+ *  为什么加（实测容量账，见 docs/ESP32S3嵌入式MoE优化方案）：
+ *    ESP32-S3 N16R8 权重预算仅 4~5MB ⇒ 每一 bit 都要省。
+ *    Q4K = 4.3125 bit/权重 vs Q4_0 = 4.5 bit/权重（省 4.2%），
+ *    且用 8 个子块 scale 换来更细的缩放 ⇒ 同体积下精度更好。
+ *
+ *  格式（每 256 权重一个超块，138 B）：
+ *    [fp16 super_scale : 2B]
+ *    [sub_scale int8 × 8 : 8B]     sub_ssc = sub_int / 128 * super_ssc
+ *    [packed 4-bit × 128 : 128B]   q ∈ {0..15}, w = (q - 8) * sub_ssc
+ *
+ *  ★ 交叉验证（tools/q4k_cross.c）：Python 量化 → C 解码
+ *      SQNR = 20.61 dB，MAE = 0.006042（与 Python 参考完全一致）
+ *
+ *  ⚠️ 关键坑：子块 scale 相对超块的比值约 0.3~0.5，
+ *     写 int(round(ratio)) 会被截断成 0 ⇒ 子块权重全归零 ⇒ SQNR 3dB。
+ *     必须定点化：round(ratio * 128)。解码时 /128。
+ * ══════════════════════════════════════════════════════════════ */
+#define TG_Q4K_SUPER 256
+#define TG_Q4K_SUB    32
+#define TG_Q4K_NSUB    8
+#define TG_Q4K_BLOCK (2 + TG_Q4K_NSUB + TG_Q4K_SUPER / 2)   /* 138 */
+#define TG_Q4K_SUBFIX 128.0f
+
+static inline float tg_dot_q4k(const float* x, const uint8_t* raw, int n) {
+    int sblocks = (n + TG_Q4K_SUPER - 1) / TG_Q4K_SUPER;
+    float sum = 0.0f;
+    for (int sb = 0; sb < sblocks; sb++) {
+        const uint8_t* blk = raw + (size_t)sb * TG_Q4K_BLOCK;
+        float ssc = f16_to_f32((uint16_t)(blk[0] | (blk[1] << 8)));
+        const uint8_t* d = blk + 2 + TG_Q4K_NSUB;
+        int base = sb * TG_Q4K_SUPER;
+        int rem = (base + TG_Q4K_SUPER <= n) ? TG_Q4K_SUPER : (n - base);
+        float acc = 0.0f;
+        for (int k = 0; k < TG_Q4K_NSUB; k++) {
+            float sub = (float)blk[2 + k] / TG_Q4K_SUBFIX * ssc;
+            float a = 0.0f;
+            int kb = k * TG_Q4K_SUB;
+            int kmax = (kb + TG_Q4K_SUB <= rem) ? TG_Q4K_SUB : (rem - kb);
+#if TG_HAS_AVX2
+            /* AVX2: 一次处理 8 个权重（4 字节 = 8 个 nibble） */
+            int j = 0;
+            __m256 vacc = _mm256_setzero_ps();
+            for (; j + 8 <= kmax; j += 8) {
+                /* 取 4 字节 → 8 个 4-bit → 展开成 8 个 float 的 (q-8) */
+                uint32_t w4;
+                memcpy(&w4, d + (kb + j) / 2, 4);
+                __m128i b = _mm_cvtsi32_si128((int)w4);
+                __m128i lo = _mm_and_si128(b, _mm_set1_epi8(0x0F));
+                __m128i hi = _mm_and_si128(_mm_srli_epi16(b, 4), _mm_set1_epi8(0x0F));
+                /* ★ 修（2026-10-10）：_mm_cvtepu8_epi32 只吃 4 字节 ⇒ 每 8 个权重
+                 *   只有 4 个正确、后 4 个变 0（隔离测试 test_avx2_nibble.c 复现过）。
+                 *   改用 256 位版 _mm256_cvtepu8_epi32，一次吃 8 字节 = 8 个 int32。 */
+                __m128i inter = _mm_unpacklo_epi8(lo, hi);      /* [lo0,hi0,lo1,hi1,...] 8 字节有效 */
+                __m256i v8i = _mm256_cvtepu8_epi32(inter);      /* 8 个 int32 */
+                v8i = _mm256_sub_epi32(v8i, _mm256_set1_epi32(8));   /* q-8 */
+                vacc = _mm256_fmadd_ps(_mm256_loadu_ps(x + base + kb + j),
+                                       _mm256_cvtepi32_ps(v8i), vacc);
+            }
+            /* 水平求和 */
+            __m128 lo2 = _mm256_castps256_ps128(vacc);
+            __m128 hi2 = _mm256_extractf128_ps(vacc, 1);
+            __m128 s128 = _mm_add_ps(lo2, hi2);
+            s128 = _mm_hadd_ps(s128, s128);
+            s128 = _mm_hadd_ps(s128, s128);
+            a += _mm_cvtss_f32(s128);
+            for (; j < kmax; j++) {
+                int idx = kb + j;
+                int q = (idx & 1) ? (d[idx >> 1] >> 4) : (d[idx >> 1] & 0x0F);
+                a += x[base + idx] * (float)(q - 8);
+            }
 #else
-    /* 标量回退 (低端设备) */
+            for (int j = 0; j < kmax; j++) {
+                int idx = kb + j;
+                int q = (idx & 1) ? (d[idx >> 1] >> 4) : (d[idx >> 1] & 0x0F);
+                a += x[base + idx] * (float)(q - 8);
+            }
+#endif
+            acc += a * sub;
+        }
+        sum += acc;
+    }
+    return sum;
+}
+
+/* Q4_0 / Q4K 统一入口：按 dtype 选内核（两者都存 cached_q4_raw）
+ * ⚠️ 调用方需保证 raw 指向的确实是该 dtype 的数据。 */
+static inline float tg_dot_q4_any(const float* x, const uint8_t* raw,
+                                  const float* scales, const int16_t* sumwi,
+                                  int n, int is_q4k) {
+    if (is_q4k) { (void)scales; (void)sumwi; return tg_dot_q4k(x, raw, n); }
+    return tg_dot_q4(x, raw, scales, sumwi, n);
+}
+
+static inline float tg_dot_q4(const float* x, const uint8_t* q4_raw,
+                               const float* scales, const int16_t* sumwi, int n) {
+#if TG_HAS_NEON && (defined(__ARM_FEATURE_DOTPROD) || defined(__aarch64__))
+    /* 仅当硬件支持 ARMv8.2-A dotprod 才走 NEON 整数点积, 否则落到标量回退 */
+    if (tg_cpu_has_asimddot()) {
+        (void)sumwi;
+        return neon_dot_q4_0(x, q4_raw, scales, n);
+    }
+#endif
+#if TG_HAS_AVX2
+    return avx2_dot_q4_0(x, q4_raw, scales, sumwi, n);
+#else
+    /* 标量回退 (低端设备), 无 maddubs 偏移, 不需要 sumwi */
+    (void)sumwi;
     float sum = 0;
     int blocks = (n + 31) / 32;
     for (int b = 0; b < blocks; b++) {
@@ -377,7 +896,7 @@ static inline float tg_dot_q4(const float* x, const uint8_t* q4_raw,
             uint8_t nib = (q4_block[j/2] >> ((j%2)*4)) & 0x0F;
             s += (float)xi * (float)((int)nib - 8);
         }
-        sum += s * scale_w / 127.0f;
+        sum += s * scale_w * max_x / 127.0f;
     }
     return sum;
 #endif
@@ -411,6 +930,19 @@ static inline float f16_to_f32(tg_f16 h) {
     return v.f;
 }
 
+/* ★ bfloat16 -> float32（2026-10-09 加，C：BF16 支持）
+ *
+ * bf16 的高 16 位就是 fp32 的高 16 位 ⇒ 左移 16 位即得，零精度损失。
+ * （与 fp16 不同：bf16 的指数位与 fp32 相同，没有 denormal 问题。）
+ *
+ * 动机：TGAI checkpoint 原生就是 BF16 ⇒ .TG 支持 BF16 后转换可零类型转换、
+ *       不物化 FP32（缓解转换内存压力），且逐位无损。 */
+static inline float bf16_to_f32(uint16_t h) {
+    union { uint32_t u; float f; } v;
+    v.u = ((uint32_t)h) << 16;
+    return v.f;
+}
+
 /* ─── 错误处理 ────────────────────────────────── */
 static char g_err_msg[256] = {0};
 static void set_err(const char* msg) {
@@ -422,20 +954,56 @@ const char* tg_last_error(void) { return g_err_msg; }
 /* ─── 多线程控制 API ──────────────────────────── */
 #if !defined(TG_SINGLE_THREAD)
 void tg_set_nthreads(int n) {
+    /* n<=0 表示自动检测核心数 (与原注释意图一致, 此前误设为 1) */
+    /* n<=0 显式请求"自动"：这里给【全部逻辑核】（尊重用户显式意图），
+     * 与默认懒初始化（tg_detect_cores，已封顶 4）区分开。 */
+    if (n <= 0) n = tg_physical_cores();
     if (n < 1) n = 1;
     if (n > TG_MAX_THREADS) n = TG_MAX_THREADS;
     g_nthreads = n;
 }
 
 int tg_get_nthreads(void) { return g_nthreads; }
+
+
+
+/* 终止线程池并等待线程退出。
+ * 必须在进程退出 / DLL 卸载前调用, 否则 worker 线程访问已卸载内存会崩溃。
+ * 调用后线程池可重建 (下次并行自动重新创建)。 */
+void tg_engine_shutdown(void) { tg_pool_shutdown(); }
 #else
 void tg_set_nthreads(int n) { (void)n; }
 int tg_get_nthreads(void) { return 1; }
+void tg_engine_shutdown(void) {}
 #endif
 
-/* 调试输出 (立即刷新, 崩溃时不丢日志) */
+/* 调试输出 (立即刷新, 崩溃时不丢日志)
+ *
+ * 两级日志:
+ *   dbg_err()  — 错误/警告, 始终输出 (OOM / ERROR / WARN)
+ *   dbg()      — 详细调试, 由环境变量 TGAI_DEBUG 控制 (默认关闭)
+ *                 TGAI_DEBUG=1 / on / true → 开启; 其余 → 关闭
+ * 避免聊天时 [fwd]/[tg_load]/[preload] 等日志刷屏.
+ */
 #include <stdarg.h>
+#include <stdlib.h>
+static int dbg_verbose_enabled(void) {
+    const char* v = getenv("TGAI_DEBUG");
+    if (!v) return 0;
+    return v[0] == '1' || v[0] == 'o' || v[0] == 'O' ||
+           v[0] == 't' || v[0] == 'T' || v[0] == 'y' || v[0] == 'Y';
+}
 static void dbg(const char* fmt, ...) {
+    if (!dbg_verbose_enabled()) return;
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    fputs(buf, stderr);
+    fflush(stderr);
+}
+static void dbg_err(const char* fmt, ...) {
     char buf[512];
     va_list ap;
     va_start(ap, fmt);
@@ -465,18 +1033,56 @@ typedef struct {
     const float* q_w;
     const float* k_w;
     const float* v_w;
+    /* QKV 偏置 (可选, 向后兼容): Qwen2/LLaMA 等 attn 投影带 bias, TGAI 原生模型无 bias.
+     * 加载 .TG 时若缺少 blocks.{i}.attn.q_proj.bias 等条目, 此处保持 NULL,
+     * transformer_block 中以 NULL 判定跳过 bias 加法, 不影响旧模型.
+     * GGUF→.TG 转换器已对 Q/K bias 做 RoPE 维度重排, 此处直接相加即可. */
+    const float* q_bias;
+    const float* k_bias;
+    const float* v_bias;
     const float* out_w;
     const float* router_w;
+    /* ★ QB 路由偏置 (2026-10-09 加，TGAI 2.7 必需)
+     *
+     * TGAI V2.7 用 quantile balancing（model_config.moe_balance='both'），
+     * 每层有 blocks.{i}.moe._qb_bias [n_experts]。语义：router logits 先加本偏置，
+     * 再做 top-k 选择（softmax 之前）。
+     *
+     * 向后兼容：老模型（V1/V2/V2.5/V2.6/mini）没有这个权重 ⇒ 保持 NULL ⇒
+     * 路由处判空跳过，行为与加此特性之前完全一致，零开销。 */
+    const float* qb_bias;
     const float* expert_w1[16];
     const float* expert_w2[16];
     const float* expert_w3[16];
     int n_experts;
 
+    /* 稠密 FFN 权重 (n_experts==0 时使用, Task 20c.3)
+     * ORV 导出命名: blocks.{i}.ffn.w1/w2/w3.weight
+     *   ffn_w1: [d_ff, d_model]  (gate, SwiGLU 的 silu 分支)
+     *   ffn_w2: [d_ff, d_model]  (up,   SwiGLU 的直通分支)
+     *   ffn_w3: [d_model, d_ff]  (down, 输出投影)
+     * 与 MoE 专家的 w1/w2/w3 数学等价, 仅缺少 router/top-k。 */
+    const float* ffn_w1;
+    const float* ffn_w2;
+    const float* ffn_w3;
+
+    /* ★ BF16 直算数据（2026-10-10 加，use_bf16_direct=1 时使用）
+     * MoE 专家占 V2.7 权重的 93.1% ⇒ 这里存 BF16 原始指针（2 字节/元素），
+     * 前向时用 bf16_dot 在寄存器内解包 ⇒ 内存省 50% + 带宽省 50%。 */
+    const uint16_t* bf16_q, *bf16_k, *bf16_v, *bf16_out, *bf16_router;
+    const uint16_t* bf16_expert_w1[16], *bf16_expert_w2[16], *bf16_expert_w3[16];
+
     /* Q4_0 直接点积数据 (当 use_q4_direct=1 时使用) */
     const uint8_t* q4_q, *q4_k, *q4_v, *q4_out, *q4_router;
     const float* q4_q_s, *q4_k_s, *q4_v_s, *q4_out_s, *q4_router_s;
+    const int16_t* q4_q_sw, *q4_k_sw, *q4_v_sw, *q4_out_sw, *q4_router_sw;
     const uint8_t* q4_expert_w1[16], *q4_expert_w2[16], *q4_expert_w3[16];
     const float* q4_expert_w1_s[16], *q4_expert_w2_s[16], *q4_expert_w3_s[16];
+    const int16_t* q4_expert_w1_sw[16], *q4_expert_w2_sw[16], *q4_expert_w3_sw[16];
+    /* Q4_0 稠密 FFN (Task 20c.3) */
+    const uint8_t* q4_ffn_w1, *q4_ffn_w2, *q4_ffn_w3;
+    const float* q4_ffn_w1_s, *q4_ffn_w2_s, *q4_ffn_w3_s;
+    const int16_t* q4_ffn_w1_sw, *q4_ffn_w2_sw, *q4_ffn_w3_sw;
 } BlockWeights;
 
 /* ─── 模型结构 ────────────────────────────────── */
@@ -511,17 +1117,49 @@ struct TGModel {
     float** cached_weights;
     int*    cached_counts;   /* 每个权重的元素个数 */
     const uint8_t** cached_q4_raw;    /* Q4_0 原始数据 (不分配) */
+    /* ★ BF16 原始数据指针（2026-10-10 加，MoE 专属优化的关键）
+     * 与 cached_q4_raw 并列：BF16 权重保持 2 字节，点积时寄存器内解包。
+     * 收益：内存省 50%，速度 1.5~1.8x（本机带宽受限），数值逐位相同。
+     * 对 V2.7 而言，这条路径覆盖 93.1% 的权重（MoE 专家）。 */
+    const uint16_t** cached_bf16_raw;
     float** cached_q4_scales;          /* Q4_0 block-wise scales (分配) */
+    int16_t** cached_q4_sumwi;         /* Q4_0 每 block Σwi (分配, AVX2 maddubs 偏移修正, 预计算加速) */
     int use_q4_direct;                /* 1=直接 Q4_0 点积, 0=FP32 */
+    /* ★ BF16 直算开关（2026-10-10 加）
+     * 1 = BF16 权重保持 2 字节，点积时寄存器内解包（省 50% 内存 + 更快）
+     * 0 = 旧行为（懒解码成 FP32 缓存，内存翻倍）
+     * 默认 1（对 BF16 权重）：实测省一半内存且快 1.5~1.8x。
+     * 用 TGAI_BF16_DIRECT=0 可强制关闭（便于 A/B 对照）。 */
+    int use_bf16_direct;
 
     /* Block 权重指针缓存 (跳过 hash 查找) */
     BlockWeights* block_cache;  /* [n_layers] */
 
     /* Tokenizer 数据 */
     int vocab_size;
+    /* ★ 实际词嵌入行数（2026-10-09 加，健壮性）
+     * header.vocab_size 可能与其不一致（转换出错 / 手工改 header / 词表配错权重）。
+     * 取 embedding 行时用它钳制，避免越界读把进程打崩（实测会 access violation）。 */
+    int emb_rows;
     int n_merges;
+    /* ★ 特殊标记表（2026-10-09 加，P0-2）
+     * 编码时先做贪心最长匹配：命中则整段输出该 id，不参与 BPE。
+     * 来源：.TG tokenizer 段末尾的追加表；缺失时为 0（老模型/老文件）。 */
+    int n_special;
+    int32_t* special_id;        /* [n_special] */
+    char** special_text;        /* [n_special] UTF-8 */
+    int* special_len;           /* [n_special] 字节长度 */
+    /* ★ 空格替换字符（HF normalizer: ' ' -> '▁'）。
+     * 0 表示不做替换（老模型）。 */
+    char space_str[8];
+    int space_len;
     const uint16_t* merges;        /* 原始 merge pairs: [n_merges][2] uint16 */
     const char** vocab;
+    /* ★ vocab hash 表（2026-10-09 加，A：编码提速）
+     * 开放寻址：cap 为 2 的幂，slot 存 token id（-1 = 空）。
+     * key = FNV-1a(token 字节)。编码时 O(1) 命中，替代 O(vocab) 线性扫描。 */
+    int32_t* vocab_hash;        /* [vocab_hash_cap] */
+    uint32_t vocab_hash_cap;
     char* vocab_strbuf;            /* null 结尾的 vocab 字符串连续 buffer */
 
     /* BPE merge 查找表: merges_resolved[i] = (a_id, b_id, merged_id, rank)
@@ -563,6 +1201,23 @@ void tg_enable_q4_direct(TGModel* m, int enable) {
     if (m) m->use_q4_direct = enable;
 }
 
+/* 查询 Q4_0 直接点积模式是否生效 (见 tgai_engine.h) */
+int tg_q4_direct_enabled(const TGModel* m) {
+    return (m && m->use_q4_direct) ? 1 : 0;
+}
+
+/* ★ BF16 直算开关（2026-10-10 加）
+ * 默认开启（对 BF16 权重）：权重保持 2 字节，点积时寄存器内解包。
+ * 实测：内存省 50%，速度 1.5~1.8x，数值逐位相同。
+ * 关闭后回退到旧的"懒解码成 FP32 缓存"行为。 */
+TG_EXPORT void tg_enable_bf16_direct(TGModel* m, int enable) {
+    if (m) m->use_bf16_direct = enable;
+}
+
+TG_EXPORT int tg_bf16_direct_enabled(const TGModel* m) {
+    return (m && m->use_bf16_direct) ? 1 : 0;
+}
+
 /* NTK-aware 上下文扩展: 设置目标上下文长度。
  * > max_seq_len 时启用 NTK-aware RoPE scaling,
  * 让低频维度获得更大缩放, 保留高频维度的局部感知。
@@ -579,9 +1234,10 @@ void tg_set_extend(TGModel* m, int extend_ctx) {
 struct TGKVCache {
     int max_seq_len;
     int n_layers;
-    int n_heads;
+    int n_heads;      /* Q heads (查询头数) */
+    int n_kv_heads;   /* KV heads (GQA/MQA, <= n_heads; 0 时等于 n_heads) */
     int d_k;
-    float* k;  /* [n_layers * n_heads * max_seq * d_k] */
+    float* k;  /* [n_layers * n_kv_heads * max_seq * d_k] (GQA: 按 KV head 分配, 非 Q head) */
     float* v;
     int* pos;
 };
@@ -633,16 +1289,16 @@ TG_EXPORT float* get_cached_weight(TGModel* m, const TGWeightEntry* e) {
         int n = 1;
         for (uint32_t d = 0; d < e->ndim; d++) n *= (int)e->shape[d];
         if (e->ndim > TG_MAX_NDIM) {
-            dbg("[lazy] ERROR ndim=%u > MAX_NDIM\n", e->ndim);
+            dbg_err("[lazy] ERROR ndim=%u > MAX_NDIM\n", e->ndim);
             return NULL;
         }
         float* buf = (float*)malloc((size_t)n * sizeof(float));
         if (!buf) {
-            dbg("[lazy] OOM n=%d idx=%d\n", n, idx);
+            dbg_err("[lazy] OOM n=%d idx=%d\n", n, idx);
             return NULL;
         }
         if (decode_weight_to_fp32(m, e, buf) != TG_OK) {
-            dbg("[lazy] decode failed idx=%d\n", idx);
+            dbg_err("[lazy] decode failed idx=%d\n", idx);
             free(buf);
             return NULL;
         }
@@ -693,6 +1349,10 @@ static int decode_weight_to_fp32(TGModel* m, const TGWeightEntry* e, float* out)
             }
             src += 32;
         }
+    } else if (e->dtype == TG_DTYPE_BF16) {
+        /* ★ BF16 解码（C，2026-10-09）：零精度损失 */
+        const uint16_t* src = (const uint16_t*)wptr;
+        for (int i = 0; i < n; i++) out[i] = bf16_to_f32(src[i]);
     } else if (e->dtype == TG_DTYPE_Q4_0) {
         /* Q4_0: block-wise 4-bit. 18B/block: 2B fp16 scale + 16B packed 4-bit.
          * Each byte packs 2 values: low nibble first, then high nibble.
@@ -712,10 +1372,85 @@ static int decode_weight_to_fp32(TGModel* m, const TGWeightEntry* e, float* out)
             }
         }
     } else {
-        dbg("[decode] ERROR unsupported dtype %u\n", e->dtype);
+        dbg_err("[decode] ERROR unsupported dtype %u\n", e->dtype);
         return TG_ERR_UNSUPPORTED;
     }
     return TG_OK;
+}
+
+/* ─── 可用物理内存检测 (平台相关) ────────────────
+ * 返回当前可用物理内存 (MB); 检测失败返回 0。 */
+static uint64_t tg_avail_ram_mb(void) {
+#ifdef _WIN32
+    /* 优先 64 位 GlobalMemoryStatusEx (无 4GB DWORD 上限), 用 GetProcAddress 动态
+     * 解析以兼容 TCC (kernel32.def 未导出该符号); 失败回退 GlobalMemoryStatus */
+    typedef BOOL (WINAPI *gms_ex_fn)(LPMEMORYSTATUSEX);
+    HMODULE hk = GetModuleHandleA("kernel32.dll");
+    if (hk) {
+        gms_ex_fn gms_ex = (gms_ex_fn)(void*)GetProcAddress(hk, "GlobalMemoryStatusEx");
+        if (gms_ex) {
+            MEMORYSTATUSEX msex;
+            msex.dwLength = sizeof(msex);
+            if (gms_ex(&msex)) return msex.ullAvailPhys / (1024 * 1024);
+        }
+    }
+    MEMORYSTATUS ms;
+    ms.dwLength = sizeof(ms);
+    GlobalMemoryStatus(&ms);
+    return (uint64_t)ms.dwAvailPhys / (1024 * 1024);
+#else
+    /* Linux / Android: /proc/meminfo MemAvailable (kB) */
+    FILE* f = fopen("/proc/meminfo", "r");
+    if (f) {
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+            if (strncmp(line, "MemAvailable:", 13) == 0) {
+                fclose(f);
+                return (uint64_t)strtoull(line + 13, NULL, 10) / 1024;
+            }
+        }
+        fclose(f);
+    }
+    /* macOS / 兜底: 总物理内存 (保守, 视为可用) */
+    long pages = sysconf(_SC_PHYS_PAGES);
+    long psize = sysconf(_SC_PAGE_SIZE);
+    if (pages > 0 && psize > 0)
+        return (uint64_t)((pages * psize) / (1024 * 1024));
+    return 0;
+#endif
+}
+
+/* Q4_0 直接点积自动决策 (TGAI_Q4_DIRECT=auto / 未设置时调用)
+ * 判据: FP32 反量化缓存无法在当前可用内存 (留 2GB 余量) 内放下时启用,
+ *       省 ~4x 内存并减内存带宽, 避免 OOM/换页; 否则保持反量化 FP32 (精度更高)。
+ * 模型不含 Q4_0 权重或内存检测失败时返回 0。 */
+static int q4_direct_auto(const TGModel* m) {
+    uint64_t fp32_mb = tg_preload_memory_estimate(m) / (1024 * 1024);
+    if (fp32_mb == 0) return 0;
+
+    int has_q4 = 0;
+    for (uint64_t i = 0; i < m->header.weight_table_count; i++) {
+        if (m->weight_table[i].dtype == TG_DTYPE_Q4_0) { has_q4 = 1; break; }
+    }
+    if (!has_q4) {
+        dbg("[q4_direct] auto: no Q4_0 weights, keep FP32\n");
+        return 0;
+    }
+
+    uint64_t avail_mb = tg_avail_ram_mb();
+    if (avail_mb == 0) {
+        dbg("[q4_direct] auto: memory detection failed, keep FP32 (set TGAI_Q4_DIRECT=1 to force)\n");
+        return 0;
+    }
+
+    /* 保留 2GB 给系统 + KV cache + 推理工作区 */
+    uint64_t usable_mb = avail_mb > 2048 ? avail_mb - 2048 : 0;
+    int on = (fp32_mb > usable_mb) ? 1 : 0;
+
+    dbg("[q4_direct] auto: fp32_cache=%lluMB avail=%lluMB usable=%lluMB -> %s\n",
+        (unsigned long long)fp32_mb, (unsigned long long)avail_mb,
+        (unsigned long long)usable_mb, on ? "Q4 direct ON" : "Q4 direct OFF");
+    return on;
 }
 
 /* 分配权重缓存数组 (NULL 指针, 按需解码)
@@ -732,32 +1467,75 @@ static int preload_weights(TGModel* m) {
     m->cached_counts  = (int*)calloc(count, sizeof(int));
     m->cached_q4_raw  = (const uint8_t**)calloc(count, sizeof(uint8_t*));
     m->cached_q4_scales = (float**)calloc(count, sizeof(float*));
-    m->use_q4_direct = 0;  /* 默认反量化模式 */
+    m->cached_q4_sumwi  = (int16_t**)calloc(count, sizeof(int16_t*));
+    m->cached_bf16_raw  = (const uint16_t**)calloc(count, sizeof(uint16_t*));
+    /* TGAI_Q4_DIRECT 开关 (Q4_0 直接点积):
+     *   1     = 强制启用 (省 ~4x 内存 + 减内存带宽 → 更快; 精度略降)
+     *   0     = 强制关闭 (反量化 FP32, 精度更高)
+     *   auto / 未设置 = 按当前可用内存自动判断 (见 q4_direct_auto)
+     * 必须在 init_block_cache 之前设置 — 之后按此标志填充 Q4 指针。 */
+    {
+        const char* q4env = getenv("TGAI_Q4_DIRECT");
+        int q4on = 0;
+        if (q4env && q4env[0] == '1') {
+            q4on = 1;
+            dbg("[q4_direct] manual ON (TGAI_Q4_DIRECT=1)\n");
+        } else if (q4env && q4env[0] == '0') {
+            q4on = 0;
+            dbg("[q4_direct] manual OFF (TGAI_Q4_DIRECT=0)\n");
+        } else {
+            q4on = q4_direct_auto(m);
+        }
+        m->use_q4_direct = q4on;
+    }
+    /* ★ BF16 直算默认开（2026-10-10）
+     * 实测省 50% 内存 + 快 1.5~1.8x（本机带宽受限，少读一半字节直接换吞吐）。
+     * TGAI_BF16_DIRECT=0 可关闭（回退到旧的 FP32 缓存行为，便于 A/B）。 */
+    {
+        const char* benv = getenv("TGAI_BF16_DIRECT");
+        m->use_bf16_direct = (benv && benv[0] == '0') ? 0 : 1;
+        dbg("[bf16_direct] %s\n", m->use_bf16_direct ? "ON (default)" : "OFF (env)");
+    }
     if (!m->cached_weights || !m->cached_counts ||
-        !m->cached_q4_raw || !m->cached_q4_scales) return TG_ERR_OOM;
+        !m->cached_q4_raw || !m->cached_q4_scales ||
+        !m->cached_q4_sumwi || !m->cached_bf16_raw) return TG_ERR_OOM;
 
-    /* 填充 Q4_0 原始指针和 scales (不反量化, 零额外内存拷贝) */
+    /* 填充 Q4_0 原始指针、scales 和 Σwi (不反量化, 零额外内存拷贝) */
     for (uint64_t i = 0; i < count; i++) {
         const TGWeightEntry* e = &m->weight_table[i];
+        /* ★ BF16 原始指针（零拷贝，直指 mmap/堆数据） */
+        m->cached_bf16_raw[i] = (e->dtype == TG_DTYPE_BF16)
+            ? (const uint16_t*)(m->weight_data + e->offset) : NULL;
         if (e->dtype == TG_DTYPE_Q4_0) {
             m->cached_q4_raw[i] = m->weight_data + e->offset;
             int n = 1;
             for (uint32_t d = 0; d < e->ndim; d++) n *= (int)e->shape[d];
             int blocks = (n + 31) / 32;
             m->cached_q4_scales[i] = (float*)malloc((size_t)blocks * sizeof(float));
-            if (m->cached_q4_scales[i]) {
+            m->cached_q4_sumwi[i]  = (int16_t*)malloc((size_t)blocks * sizeof(int16_t));
+            if (m->cached_q4_scales[i] && m->cached_q4_sumwi[i]) {
                 const uint8_t* raw = m->cached_q4_raw[i];
                 for (int b = 0; b < blocks; b++) {
                     m->cached_q4_scales[i][b] = f16_to_f32(*(const tg_f16*)(raw + b * 18));
+                    /* Σwi: 该 block 32 个 nibble 减 8 的和 (AVX2 maddubs 偏移修正用,
+                     * 与权重无关, 预计算避免点积时每 block 重复扫描) */
+                    const uint8_t* qb = raw + b * 18 + 2;
+                    int sw = 0;
+                    int rem = (b * 32 + 32 <= n) ? 32 : (n - b * 32);
+                    for (int j = 0; j < rem; j++) {
+                        sw += (int)((qb[j / 2] >> ((j % 2) * 4)) & 0x0F) - 8;
+                    }
+                    m->cached_q4_sumwi[i][b] = (int16_t)sw;
                 }
             }
         } else {
             m->cached_q4_raw[i] = NULL;
             m->cached_q4_scales[i] = NULL;
+            m->cached_q4_sumwi[i]  = NULL;
         }
     }
     dbg("[preload] arrays allocated, Q4_0 raw data cached\n");
-    dbg("[preload] use_q4_direct=0 (call tg_enable_q4_direct to enable)\n");
+    dbg("[preload] use_q4_direct=%d\n", m->use_q4_direct);
     return TG_OK;
 }
 
@@ -781,7 +1559,7 @@ int tg_preload_all(TGModel* m) {
         int n = 1;
         for (uint32_t d = 0; d < e->ndim; d++) n *= (int)e->shape[d];
         float* buf = (float*)malloc((size_t)n * sizeof(float));
-        if (!buf) { dbg("[preload_all] OOM at %llu\n", (unsigned long long)i); return TG_ERR_OOM; }
+        if (!buf) { dbg_err("[preload_all] OOM at %llu\n", (unsigned long long)i); return TG_ERR_OOM; }
         if (decode_weight_to_fp32(m, e, buf) != TG_OK) {
             free(buf); return TG_ERR_UNSUPPORTED;
         }
@@ -894,66 +1672,123 @@ static int init_block_cache(TGModel* m) {
     char name[128];
     for (int i = 0; i < nl; i++) {
         BlockWeights* bw = &m->block_cache[i];
+
+        /* 解析权重指针 (一次 hash 查找, 后续 O(1))
+         * Q4_0 直接点积模式 (use_q4_direct=1):
+         *   有 Q4_0 版本的权重 → 只填 Q4 原始指针, FP32 指针置 NULL
+         *   (省 ~4x 内存, 由 matmul 的 q4 分支直接使用);
+         *   无 Q4_0 版本 (norm/bias/混合精度层) → 照常 FP32 懒解码。
+         * FP32 模式: 与旧行为完全一致。 */
+        #define RESOLVE_W(dst, dst_q4, dst_q4_s, dst_q4_sw, wname) do { \
+            const TGWeightEntry* _e = find_weight(m, wname); \
+            if (m->use_q4_direct && _e && _e->dtype == TG_DTYPE_Q4_0) { \
+                bw->dst_q4   = m->cached_q4_raw[_e - m->weight_table]; \
+                bw->dst_q4_s = m->cached_q4_scales[_e - m->weight_table]; \
+                bw->dst_q4_sw = m->cached_q4_sumwi[_e - m->weight_table]; \
+                bw->dst      = NULL; \
+            } else { \
+                bw->dst = get_cached_weight(m, _e); \
+            } \
+        } while(0);
+        /* ★ BF16 直算版（2026-10-10 加）：多一个 bf16 目标参数。
+         * 只用于会命中 BF16 的大权重（q/k/v/out/router/专家 = 97% 字节）。
+         * 命中时 bf16 指针非空、dst 为 NULL；前向据此分发。 */
+        #define RESOLVE_W_BF16(dst, dst_q4, dst_q4_s, dst_q4_sw, dst_bf16, wname) do { \
+            const TGWeightEntry* _e2 = find_weight(m, wname); \
+            bw->dst_bf16 = NULL; \
+            if (m->use_q4_direct && _e2 && _e2->dtype == TG_DTYPE_Q4_0) { \
+                bw->dst_q4    = m->cached_q4_raw[_e2 - m->weight_table]; \
+                bw->dst_q4_s  = m->cached_q4_scales[_e2 - m->weight_table]; \
+                bw->dst_q4_sw = m->cached_q4_sumwi[_e2 - m->weight_table]; \
+                bw->dst       = NULL; \
+            } else if (m->use_bf16_direct && _e2 && _e2->dtype == TG_DTYPE_BF16) { \
+                bw->dst_bf16 = m->cached_bf16_raw[_e2 - m->weight_table]; \
+                bw->dst      = NULL; \
+            } else { \
+                bw->dst = get_cached_weight(m, _e2); \
+            } \
+        } while(0);
+
         snprintf(name, sizeof(name), "blocks.%d.ln1.weight", i);
         bw->ln1_w = get_cached_weight(m, find_weight(m, name));
         snprintf(name, sizeof(name), "blocks.%d.ln2.weight", i);
         bw->ln2_w = get_cached_weight(m, find_weight(m, name));
         snprintf(name, sizeof(name), "blocks.%d.attn.q_proj.weight", i);
-        bw->q_w = get_cached_weight(m, find_weight(m, name));
+        RESOLVE_W_BF16(q_w, q4_q, q4_q_s, q4_q_sw, bf16_q, name);
         snprintf(name, sizeof(name), "blocks.%d.attn.k_proj.weight", i);
-        bw->k_w = get_cached_weight(m, find_weight(m, name));
+        RESOLVE_W_BF16(k_w, q4_k, q4_k_s, q4_k_sw, bf16_k, name);
         snprintf(name, sizeof(name), "blocks.%d.attn.v_proj.weight", i);
-        bw->v_w = get_cached_weight(m, find_weight(m, name));
+        RESOLVE_W_BF16(v_w, q4_v, q4_v_s, q4_v_sw, bf16_v, name);
+        /* QKV bias 查找 (向后兼容: 缺失则 NULL, transformer_block 自动跳过).
+         * GGUF→.TG 转换器对 Qwen2/LLaMA 等架构导出 attn.q_proj.bias 等,
+         * TGAI 原生模型 (ORV export) 不导出 bias, 此处为 NULL. */
+        snprintf(name, sizeof(name), "blocks.%d.attn.q_proj.bias", i);
+        bw->q_bias = get_cached_weight(m, find_weight(m, name));
+        snprintf(name, sizeof(name), "blocks.%d.attn.k_proj.bias", i);
+        bw->k_bias = get_cached_weight(m, find_weight(m, name));
+        snprintf(name, sizeof(name), "blocks.%d.attn.v_proj.bias", i);
+        bw->v_bias = get_cached_weight(m, find_weight(m, name));
         snprintf(name, sizeof(name), "blocks.%d.attn.out_proj.weight", i);
-        bw->out_w = get_cached_weight(m, find_weight(m, name));
+        RESOLVE_W_BF16(out_w, q4_out, q4_out_s, q4_out_sw, bf16_out, name);
         snprintf(name, sizeof(name), "blocks.%d.moe.router.weight", i);
-        bw->router_w = get_cached_weight(m, find_weight(m, name));
+        RESOLVE_W_BF16(router_w, q4_router, q4_router_s, q4_router_sw, bf16_router, name);
+        /* ★ QB 路由偏置 (V2.7+; 缺失则 NULL, 老模型不受影响)。
+         * 偏置很小（[n_experts]）且必须与 F32 logits 精确相加 ⇒ 始终走 FP32 懒解码。 */
+        snprintf(name, sizeof(name), "blocks.%d.moe._qb_bias", i);
+        bw->qb_bias = get_cached_weight(m, find_weight(m, name));
         bw->n_experts = ne;
         for (int e = 0; e < ne; e++) {
             snprintf(name, sizeof(name), "blocks.%d.moe.experts.%d.w1.weight", i, e);
-            bw->expert_w1[e] = get_cached_weight(m, find_weight(m, name));
+            RESOLVE_W_BF16(expert_w1[e], q4_expert_w1[e], q4_expert_w1_s[e], q4_expert_w1_sw[e], bf16_expert_w1[e], name);
             snprintf(name, sizeof(name), "blocks.%d.moe.experts.%d.w2.weight", i, e);
-            bw->expert_w2[e] = get_cached_weight(m, find_weight(m, name));
+            RESOLVE_W_BF16(expert_w2[e], q4_expert_w2[e], q4_expert_w2_s[e], q4_expert_w2_sw[e], bf16_expert_w2[e], name);
             snprintf(name, sizeof(name), "blocks.%d.moe.experts.%d.w3.weight", i, e);
-            bw->expert_w3[e] = get_cached_weight(m, find_weight(m, name));
+            RESOLVE_W_BF16(expert_w3[e], q4_expert_w3[e], q4_expert_w3_s[e], q4_expert_w3_sw[e], bf16_expert_w3[e], name);
         }
 
-        /* 同时填充 Q4_0 直接点积数据 (如果可用) */
-        if (m->use_q4_direct) {
-            #define SET_Q4(dst, dst_s, wname) do { \
-                const TGWeightEntry* _e = find_weight(m, wname); \
-                if (_e && _e->dtype == TG_DTYPE_Q4_0) { \
-                    bw->dst = m->cached_q4_raw[_e - m->weight_table]; \
-                    bw->dst_s = m->cached_q4_scales[_e - m->weight_table]; \
-                } \
-            } while(0);
-            snprintf(name, sizeof(name), "blocks.%d.attn.q_proj.weight", i);
-            SET_Q4(q4_q, q4_q_s, name);
-            snprintf(name, sizeof(name), "blocks.%d.attn.k_proj.weight", i);
-            SET_Q4(q4_k, q4_k_s, name);
-            snprintf(name, sizeof(name), "blocks.%d.attn.v_proj.weight", i);
-            SET_Q4(q4_v, q4_v_s, name);
-            snprintf(name, sizeof(name), "blocks.%d.attn.out_proj.weight", i);
-            SET_Q4(q4_out, q4_out_s, name);
-            snprintf(name, sizeof(name), "blocks.%d.moe.router.weight", i);
-            SET_Q4(q4_router, q4_router_s, name);
-            for (int e = 0; e < ne; e++) {
-                snprintf(name, sizeof(name), "blocks.%d.moe.experts.%d.w1.weight", i, e);
-                SET_Q4(q4_expert_w1[e], q4_expert_w1_s[e], name);
-                snprintf(name, sizeof(name), "blocks.%d.moe.experts.%d.w2.weight", i, e);
-                SET_Q4(q4_expert_w2[e], q4_expert_w2_s[e], name);
-                snprintf(name, sizeof(name), "blocks.%d.moe.experts.%d.w3.weight", i, e);
-                SET_Q4(q4_expert_w3[e], q4_expert_w3_s[e], name);
+        /* 稠密 FFN 权重查找 (Task 20c.3: n_experts==0 时使用)
+         * ORV export 导出命名: blocks.{i}.ffn.w1/w2/w3.weight
+         * 与 MoE 互斥: 稠密模型无 router/experts, 只有单一 FFN。 */
+        if (ne == 0) {
+            snprintf(name, sizeof(name), "blocks.%d.ffn.w1.weight", i);
+            RESOLVE_W(ffn_w1, q4_ffn_w1, q4_ffn_w1_s, q4_ffn_w1_sw, name);
+            snprintf(name, sizeof(name), "blocks.%d.ffn.w2.weight", i);
+            RESOLVE_W(ffn_w2, q4_ffn_w2, q4_ffn_w2_s, q4_ffn_w2_sw, name);
+            snprintf(name, sizeof(name), "blocks.%d.ffn.w3.weight", i);
+            RESOLVE_W(ffn_w3, q4_ffn_w3, q4_ffn_w3_s, q4_ffn_w3_sw, name);
+            if (!m->use_q4_direct && (!bw->ffn_w1 || !bw->ffn_w2 || !bw->ffn_w3)) {
+                dbg_err("[block_cache] WARN: layer %d dense FFN weights missing (w1=%p w2=%p w3=%p)\n",
+                    i, (const void*)bw->ffn_w1, (const void*)bw->ffn_w2, (const void*)bw->ffn_w3);
             }
-            #undef SET_Q4
         }
+        #undef RESOLVE_W
     }
     dbg("[block_cache] initialized %d blocks × %d experts\n", nl, ne);
     return TG_OK;
 }
 
+/* ★ 前向声明（定义在后面，但加载时需要调用）*/
+static void vocab_hash_build(TGModel* m);
+
 /* ─── Tokenizer 加载 ──────────────────────────── */
 static int load_tokenizer(TGModel* m) {
+    /* Task 20c.3: 空 tokenizer section (tokenizer_len==0) 时, 用 header.vocab_size 兜底。
+     * ORV export 在无 --tokenizer 时导出空 section, 此时 tokenizer_data 指向非 tokenizer
+     * 内存 (如 header magic), 直接读取会导致 vocab_size 被设为垃圾值 (如 magic=0x49414754)。 */
+    if (m->header.tokenizer_len == 0) {
+        m->vocab_size = (int)m->header.vocab_size;
+        m->n_merges = 0;
+        m->merges = NULL;
+        m->vocab = NULL;
+        m->vocab_strbuf = NULL;
+        m->merge_a = NULL;
+        m->merge_b = NULL;
+        m->merge_ab = NULL;
+        m->pad_id = 0; m->unk_id = 1; m->bos_id = 2; m->eos_id = 3;
+        dbg("[load_tokenizer] empty tokenizer section, using header vocab=%d\n", m->vocab_size);
+        return TG_OK;
+    }
+
     const uint8_t* p = m->tokenizer_data;
     const uint8_t* end = p + m->header.tokenizer_len;
 
@@ -996,7 +1831,66 @@ static int load_tokenizer(TGModel* m) {
         m->unk_id = *(const uint32_t*)p; p += 4;
         m->bos_id = *(const uint32_t*)p; p += 4;
         m->eos_id = *(const uint32_t*)p; p += 4;
-    } else {
+
+    /* ★ 特殊标记表（2026-10-09 加，P0-2）
+     * 追加在 tokenizer 段末尾。老 .TG 文件没有这一段 ⇒ 用 end 边界判断，读到就停。
+     * 格式: u32 n_special; 然后 (u16 id, u16 len, u8[len] text) × n */
+    m->n_special = 0;
+    m->special_id = NULL;
+    m->special_text = NULL;
+    m->special_len = NULL;
+    if (p + 4 <= end) {
+        uint32_t nsp = *(const uint32_t*)p;
+        p += 4;
+        if (nsp > 0 && nsp < 1024) {
+            int32_t* sid = (int32_t*)malloc((size_t)nsp * sizeof(int32_t));
+            char**    stx = (char**)malloc((size_t)nsp * sizeof(char*));
+            int*      sln = (int*)malloc((size_t)nsp * sizeof(int));
+            if (sid && stx && sln) {
+                int got = 0;
+                for (uint32_t k = 0; k < nsp; k++) {
+                    if (p + 4 > end) break;
+                    uint16_t tid = *(const uint16_t*)p; p += 2;
+                    uint16_t tl  = *(const uint16_t*)p; p += 2;
+                    if (p + tl > end) break;
+                    sid[got] = (int32_t)tid;
+                    stx[got] = (char*)p;
+                    sln[got] = (int)tl;
+                    got++;
+                    p += tl;
+                }
+                m->n_special = got;
+                m->special_id = sid;
+                m->special_text = stx;
+                m->special_len = sln;
+                dbg("[load_tokenizer] special tokens: %d\n", got);
+            } else {
+                free(sid); free(stx); free(sln);
+            }
+        }
+    }
+
+    /* ★ space_token 探测（HF normalizer: ' ' -> '▁' U+2581）
+     * 词表里有就记录，编码时把 ' ' 换成它；没有则不做替换（老模型）。 */
+    m->space_str[0] = 0;
+    m->space_len = 0;
+    {
+        static const char SP[] = "\xe2\x96\x81";
+        for (int i = 0; i < m->vocab_size; i++) {
+            if (m->vocab[i] && strcmp(m->vocab[i], SP) == 0) {
+                m->space_str[0] = SP[0];
+                m->space_str[1] = SP[1];
+                m->space_str[2] = SP[2];
+                m->space_str[3] = 0;
+                m->space_len = 3;
+                break;
+            }
+        }
+        if (m->space_len) dbg("[load_tokenizer] space_token = U+2581\n");
+    }
+
+    /* ★ 建 vocab hash 表（A：编码提速） */
+    vocab_hash_build(m);    } else {
         m->pad_id = 0; m->unk_id = 1; m->bos_id = 2; m->eos_id = 3;
     }
 
@@ -1056,10 +1950,30 @@ TGModel* tg_load(const char* path, int use_mmap, TGError* out_err) {
     if (h == INVALID_HANDLE_VALUE) {
         set_err("无法打开文件"); if (out_err) *out_err = TG_ERR_FILE; free(m); return NULL;
     }
-    /* TCC 的 kernel32.def 缺少 GetFileSizeEx, 用 GetFileSize (DWORD, 32位) 代替。
-     * 对 < 4GB 的模型文件足够。 */
-    DWORD lo = GetFileSize(h, NULL);
-    m->mapped_size = (size_t)lo;
+    /* ★★ 必修 bug（2026-10-10）：GetFileSize 只返回低 32 位。
+     *
+     * 症状：V2.7 模型 6,058,097,045 B（5.64 GB）被截断成 1,763,129,749 B（1.64 GB）
+     *       ⇒ mapped_size 错误 ⇒ 超过 1.64GB 的权重偏移全部越界 ⇒ 输出乱码
+     *       （实测："▁我▁▁▁▁|▁▁▁▁:▁▁▁▁|" 这类噪声）
+     * 原因：6058097045 mod 2^32 = 1763129749，与 dbg 打印完全吻合。
+     *
+     * 修复：优先用 GetFileSizeEx 取 64 位大小；
+     *       若工具链缺该符号（如老 TCC 的 kernel32.def），
+     *       退回 GetFileSize 并用 高位返回值 拼出完整 64 位。 */
+    {
+        LARGE_INTEGER fsz;
+        if (GetFileSizeEx(h, &fsz)) {
+            m->mapped_size = (size_t)fsz.QuadPart;
+        } else {
+            DWORD hi = 0;
+            DWORD lo = GetFileSize(h, &hi);   /* 第二个参数接收高 32 位 */
+            if (lo == INVALID_FILE_SIZE && GetLastError() != NO_ERROR) {
+                set_err("GetFileSize 失败"); if (out_err) *out_err = TG_ERR_FILE;
+                CloseHandle(h); free(m); return NULL;
+            }
+            m->mapped_size = ((size_t)hi << 32) | (size_t)lo;
+        }
+    }
     HANDLE mh = CreateFileMappingA(h, NULL, PAGE_READONLY, 0, 0, NULL);
     if (!mh) {
         set_err("CreateFileMapping 失败"); if (out_err) *out_err = TG_ERR_FILE;
@@ -1112,8 +2026,9 @@ TGModel* tg_load(const char* path, int use_mmap, TGError* out_err) {
 
     /* 解析 header */
     memcpy(&m->header, m->mapped, sizeof(TGHeader));
-    dbg("[tg_load] header magic=%x version=%d layers=%u d_model=%u vocab=%u\n",
-            m->header.magic, m->header.version, m->header.n_layers, m->header.d_model, m->header.vocab_size);
+    dbg("[tg_load] header magic=%x version=%u modality_flags=0x%X layers=%u d_model=%u vocab=%u\n",
+            m->header.magic, m->header.version, m->header.modality_flags,
+            m->header.n_layers, m->header.d_model, m->header.vocab_size);
     dbg("[tg_load] tok_off=%u wt_off=%u wd_off=%u wt_count=%u tok_len=%u\n",
             m->header.tokenizer_off, m->header.weight_table_off, m->header.weight_data_off,
             m->header.weight_table_count, m->header.tokenizer_len);
@@ -1122,9 +2037,41 @@ TGModel* tg_load(const char* path, int use_mmap, TGError* out_err) {
         set_err("magic 不匹配"); if (out_err) *out_err = TG_ERR_MAGIC;
         tg_free(m); return NULL;
     }
-    if (m->header.version != TG_VERSION) {
-        set_err("版本不兼容"); if (out_err) *out_err = TG_ERR_VERSION;
+    /* 版本校验: 接受 v1 (TGAI GO 原生) 和 v3 (ORV 多模态扩展, Task 27b) */
+    if (m->header.version != TG_VERSION && m->header.version != TG_VERSION_V3) {
+        set_err("版本不兼容 (支持 v1/v3)"); if (out_err) *out_err = TG_ERR_VERSION;
         tg_free(m); return NULL;
+    }
+    /* v3 专属校验 (Task 27b): 当前只允许纯文本 (modality_flags 为 0 或仅 TEXT 位)
+     * 多模态 v3 (含 IMAGE/AUDIO/VIDEO 位):
+     *   - 纯文本模式 (默认): 拒绝加载 (保持向后兼容)
+     *   - 多模态模式 (TG_ENABLE_MM): 接受, 但只加载文本部分, 子模型由 tg_mm_load 处理
+     *
+     * ⚠ 运算符优先级陷阱 (Plan agent 审查发现):
+     *   C 的 == 优先级高于 &, 若写成 (flags & ~TG_MODALITY_TEXT == 0)
+     *   会被解析为 (flags & ((~TEXT)==0)) = (flags & 0) = 0 恒真, 永不拒绝!
+     *   必须显式括号: ((flags & ~TEXT) != 0) */
+    if (m->header.version == TG_VERSION_V3) {
+        uint32_t flags = m->header.modality_flags;
+#ifndef TG_ENABLE_MM
+        /* 纯文本模式: 拒绝多模态 (保持向后兼容, 不影响现有 .TG 读取) */
+        if ((flags & ~(uint32_t)TG_MODALITY_TEXT) != 0) {
+            char err_buf[128];
+            snprintf(err_buf, sizeof(err_buf),
+                     "v3 多模态模型暂不支持 (modality_flags=0x%X, 仅允许 TEXT); 用 -MultiFile 重新编译启用多模态", flags);
+            set_err(err_buf);
+            if (out_err) *out_err = TG_ERR_UNSUPPORTED;
+            tg_free(m); return NULL;
+        }
+        dbg("[tg_load] v3 modality_flags=0x%X (TEXT-only, OK)\n", flags);
+#else
+        /* 多模态模式: 接受所有 v3 文件, 文本部分由本函数加载, 子模型由 tg_mm_load 处理 */
+        dbg("[tg_load] v3 modality_flags=0x%X (mm 模式接受)\n", flags);
+#endif
+        if (m->header.extension_off != 0) {
+            dbg("[tg_load] v3 extension_off=%u (子模型扩展段由 tg_mm_load 解析)\n",
+                (unsigned)m->header.extension_off);
+        }
     }
 
     /* section 指针 */
@@ -1192,7 +2139,13 @@ TGModel* tg_load(const char* path, int use_mmap, TGError* out_err) {
     m->last_logits  = (float*)malloc((size_t)v * sizeof(float));  /* 输出副本 */
     m->work_ffn_a   = (float*)malloc((size_t)m->max_work_seq * dff * sizeof(float));
     m->work_ffn_b   = (float*)malloc((size_t)m->max_work_seq * dff * sizeof(float));
-    m->work_router  = (float*)malloc((size_t)m->max_work_seq * m->header.n_experts * sizeof(float));
+    /* Task 20c.3: 修 malloc(0) — 稠密模型 n_experts==0 时 malloc(0) 行为未定义
+     * (可能返回 NULL 触发误报 OOM, 或返回非 NULL 但不可用)。
+     * 分配最小 1 元素确保指针非 NULL 且合法。 */
+    {
+        size_t ne_alloc = m->header.n_experts > 0 ? m->header.n_experts : 1;
+        m->work_router  = (float*)malloc((size_t)m->max_work_seq * ne_alloc * sizeof(float));
+    }
 
     if (!m->work_x || !m->work_ln || !m->work_q || !m->work_k || !m->work_v ||
         !m->work_attn || !m->work_moe_out || !m->work_logits || !m->last_logits ||
@@ -1223,11 +2176,26 @@ void tg_free(TGModel* m) {
         free(m->cached_counts);
     }
 
+    /* Q4_0 scales / Σwi 缓存 (每权重独立分配) */
+    if (m->cached_q4_scales) {
+        for (uint64_t i = 0; i < m->header.weight_table_count; i++) {
+            free(m->cached_q4_scales[i]);
+        }
+        free(m->cached_q4_scales);
+    }
+    if (m->cached_q4_sumwi) {
+        for (uint64_t i = 0; i < m->header.weight_table_count; i++) {
+            free(m->cached_q4_sumwi[i]);
+        }
+        free(m->cached_q4_sumwi);
+    }
+
     free(m->block_cache);
 
     free(m->work_x); free(m->work_ln); free(m->work_q); free(m->work_k);
     free(m->work_v); free(m->work_attn); free(m->work_moe_out);
     free(m->work_logits); free(m->last_logits);
+    if (m->vocab_hash) { free(m->vocab_hash); m->vocab_hash = NULL; m->vocab_hash_cap = 0; }
     free(m->work_ffn_a); free(m->work_ffn_b); free(m->work_router);
 
     if (m->mapped) {
@@ -1275,7 +2243,8 @@ static int ensure_work(TGModel* m, int seq_len) {
     REALLOC_N(m->work_logits, v);
     REALLOC_N(m->work_ffn_a, dff);
     REALLOC_N(m->work_ffn_b, dff);
-    REALLOC_N(m->work_router, ne);
+    /* Task 20c.3: 稠密模型 ne==0 时分配 1 元素避免 realloc(ptr, 0) 释放指针 */
+    REALLOC_N(m->work_router, ne > 0 ? ne : 1);
 
     #undef REALLOC_N
     m->max_work_seq = new_max;
@@ -1290,9 +2259,15 @@ TGKVCache* tg_kvcache_new(const TGModel* m, int max_seq_len) {
     c->max_seq_len = max_seq_len;
     c->n_layers = (int)m->header.n_layers;
     c->n_heads = (int)m->header.n_heads;
+    /* Task 20c.3: GQA 支持 — KV cache 按 num_kv_heads 分配 (不是 n_heads)。
+     * num_kv_heads=0 (v1/旧模型) 时回退到 n_heads, 保持向后兼容。
+     * GQA 模型 (如 ORV 导出的稠密 LLM, n_kv=2 < n_heads=4) KV cache 内存减半。 */
+    c->n_kv_heads = (int)m->header.num_kv_heads;
+    if (c->n_kv_heads <= 0) c->n_kv_heads = c->n_heads;  /* 0 = 同 n_heads (向后兼容) */
+    if (c->n_kv_heads > c->n_heads) c->n_kv_heads = c->n_heads;  /* 安全上限 */
     c->d_k = (int)m->header.d_model / (int)m->header.n_heads;
 
-    size_t per_layer = (size_t)c->n_heads * max_seq_len * c->d_k;
+    size_t per_layer = (size_t)c->n_kv_heads * max_seq_len * c->d_k;
     c->k = (float*)calloc((size_t)c->n_layers * per_layer, sizeof(float));
     c->v = (float*)calloc((size_t)c->n_layers * per_layer, sizeof(float));
     c->pos = (int*)calloc((size_t)c->n_layers, sizeof(int));
@@ -1320,9 +2295,20 @@ void tg_kvcache_reset(TGKVCache* c) {
 /* 前向声明 */
 static void _matmul_impl(float* out, const float* x, const float* w,
                           const uint8_t* q4, const float* scales,
+                          const int16_t* sumwi,
                           int seq, int k, int n);
-static void matmul_q4(float* out, const float* x, const uint8_t* q4, const float* scales, int seq, int k, int n);
+static void matmul_q4(float* out, const float* x, const uint8_t* q4, const float* scales, const int16_t* sumwi, int seq, int k, int n);
+/* ★ GPU 接线桥（2026-10-10 加）
+ *   独立文件，通过 TGAI_USE_GPU=1 环境变量启用。
+ *   默认未启用 ⇒ tg_gpu_try_* 立即返回 0 ⇒ 走下面的 CPU 原路径，
+ *   保证与接线前【逐位相同】。 */
+#include "tgai_gpu_bridge.h"
+
 static void rmsnorm(float* out, const float* x, const float* weight, int seq, int d, float eps) {
+    /* ★ GPU 快速路径（默认关闭；TGAI_USE_GPU=1 启用）
+     *   返回 1 = 已由 GPU 完成 ⇒ 直接 return
+     *   返回 0 = 不可用/失败 ⇒ 落到下面的 CPU 实现（原逻辑一字未改）*/
+    if (tg_gpu_try_rmsnorm(out, x, weight, seq, d, eps)) return;
     for (int t = 0; t < seq; t++) {
         const float* xt = x + (size_t)t * d;
         float* ot = out + (size_t)t * d;
@@ -1344,7 +2330,7 @@ static void rmsnorm(float* out, const float* x, const float* weight, int seq, in
             i += 4;
         }
         acc0 = vaddq_f32(acc0, acc1);
-        ss = vaddvq_f32(acc0);
+        ss = tg_vaddvq_f32(acc0);
         for (; i < d; i++) ss += xt[i] * xt[i];
 #elif TG_HAS_AVX2
         __m256 acc0 = _mm256_setzero_ps();
@@ -1385,7 +2371,8 @@ static void rmsnorm(float* out, const float* x, const float* weight, int seq, in
 #if !defined(TG_SINGLE_THREAD)
 typedef struct {
     float* out; const float* x; const float* w;
-    const uint8_t* q4; const float* scales;
+    const uint8_t* q4; const float* scales; const int16_t* sumwi;
+    const uint16_t* bf16;                 /* ★ BF16 直算权重（2 字节/元素） */
     int seq, k, n;
 } MatmulArgs;
 
@@ -1396,7 +2383,13 @@ static void _matmul_seq_worker(int t, void* data) {
     if (a->q4) {
         for (int nn = 0; nn < a->n; nn++) {
             ot[nn] = tg_dot_q4(xt, a->q4 + (size_t)nn * ((a->k+31)/32)*18,
-                               a->scales + (size_t)nn * ((a->k+31)/32), a->k);
+                               a->scales + (size_t)nn * ((a->k+31)/32),
+                               a->sumwi + (size_t)nn * ((a->k+31)/32), a->k);
+        }
+    } else if (a->bf16) {
+        /* ★ BF16 直算：权重 2 字节，寄存器内解包 */
+        for (int nn = 0; nn < a->n; nn++) {
+            ot[nn] = bf16_dot(xt, a->bf16 + (size_t)nn * a->k, a->k);
         }
     } else {
         for (int nn = 0; nn < a->n; nn++) {
@@ -1410,9 +2403,16 @@ static void _matmul_n_worker(int nn, void* data) {
     if (a->q4) {
         const uint8_t* q4n = a->q4 + (size_t)nn * ((a->k+31)/32)*18;
         const float* scales_n = a->scales + (size_t)nn * ((a->k+31)/32);
+        const int16_t* sumwi_n = a->sumwi + (size_t)nn * ((a->k+31)/32);
         for (int t = 0; t < a->seq; t++) {
             const float* xt = a->x + (size_t)t * a->k;
-            a->out[(size_t)t * a->n + nn] = tg_dot_q4(xt, q4n, scales_n, a->k);
+            a->out[(size_t)t * a->n + nn] = tg_dot_q4(xt, q4n, scales_n, sumwi_n, a->k);
+        }
+    } else if (a->bf16) {
+        /* ★ BF16 直算（MoE 专家等大权重走这里，占 93.1%） */
+        const uint16_t* wn = a->bf16 + (size_t)nn * a->k;
+        for (int t = 0; t < a->seq; t++) {
+            a->out[(size_t)t * a->n + nn] = bf16_dot(a->x + (size_t)t * a->k, wn, a->k);
         }
     } else {
         const float* wn = a->w + (size_t)nn * a->k;
@@ -1423,22 +2423,31 @@ static void _matmul_n_worker(int nn, void* data) {
 }
 #endif
 
-/* NPU 桩函数 (无 NPU 时返回 0, 走 CPU 路径) */
+/* NPU 桩函数 (无 NPU 时返回 0, 走 CPU 路径)
+ *
+ * 当 TG_LINK_NPU_SEPARATE 定义时 (Android CMake 编译 tgai_npu.c),
+ * 跳过此桩函数, 由 tgai_npu.c 提供 NNAPI 真实现。
+ * 否则 (PC 端单独编译 tgai_engine.c), 桩函数生效, 回退 CPU。
+ */
+#if !defined(TG_LINK_NPU_SEPARATE)
 int tg_npu_matmul(float* out, const float* x, const float* w, int seq, int k, int n) {
     (void)out; (void)x; (void)w; (void)seq; (void)k; (void)n;
     return 0;
 }
+#endif
 
 /* 内部实现: matmul 统一入口 */
 static void _matmul_impl(float* out, const float* x, const float* w,
                           const uint8_t* q4, const float* scales,
+                          const int16_t* sumwi,
                           int seq, int k, int n) {
     /* NPU 加速: 大矩阵走 NNAPI (仅 FP32 路径) */
     if (!q4 && tg_npu_matmul(out, x, w, seq, k, n)) return;
 
 #if !defined(TG_SINGLE_THREAD)
+    tg_nthreads_ensure();      /* ★ 必须先初始化，否则下面的 g_nthreads>1 恒假 */
     if (g_nthreads > 1) {
-        MatmulArgs args = {out, x, w, q4, scales, seq, k, n};
+        MatmulArgs args = {out, x, w, q4, scales, sumwi, NULL, seq, k, n};
         if (seq >= g_nthreads) {
             /* prefill: 按行并行 */
             tg_parallel(seq, _matmul_seq_worker, &args);
@@ -1457,7 +2466,8 @@ static void _matmul_impl(float* out, const float* x, const float* w,
             float* ot = out + (size_t)t * n;
             for (int nn = 0; nn < n; nn++) {
                 ot[nn] = tg_dot_q4(xt, q4 + (size_t)nn * ((k+31)/32)*18,
-                                   scales + (size_t)nn * ((k+31)/32), k);
+                                   scales + (size_t)nn * ((k+31)/32),
+                                   sumwi + (size_t)nn * ((k+31)/32), k);
             }
         }
     } else {
@@ -1474,20 +2484,263 @@ static void _matmul_impl(float* out, const float* x, const float* w,
 /* Q4_0 直接点积版 matmul (省内存, 低配机用) */
 static void matmul_q4(float* out, const float* x,
                       const uint8_t* q4, const float* scales,
+                      const int16_t* sumwi,
                       int seq, int k, int n) {
-    _matmul_impl(out, x, NULL, q4, scales, seq, k, n);
+    _matmul_impl(out, x, NULL, q4, scales, sumwi, seq, k, n);
 }
 
 /* FP32 matmul 包装 */
 static void matmul(float* out, const float* x, const float* w,
                    int seq, int k, int n) {
-    _matmul_impl(out, x, w, NULL, NULL, seq, k, n);
+    _matmul_impl(out, x, w, NULL, NULL, NULL, seq, k, n);
+}
+
+/* ★ BF16 直算 matmul（2026-10-10 加）
+ *
+ * 为什么单独一个函数：bf16 路径与 q4/fp32 三者互斥，独立函数改动面最小。
+ *
+ * 收益（本机实测）：
+ *   - 内存省 50%（权重保持 2 字节，不再懒解码成 FP32）
+ *   - 速度 1.5~1.8x（本机带宽受限：实测引擎仅发挥 3.03/8.60 GB/s）
+ *   - 数值逐位相同（bf16→fp32 只是左移 16 位，算的是同一批值）
+ *
+ * 对 V2.7 而言覆盖 93.1% 的权重（MoE 专家 w1/w2/w3 = 5.25 GB / 5.64 GB）。 */
+static void _matmul_impl_bf16(float* out, const float* x, const uint16_t* wbf,
+                              int seq, int k, int n) {
+#if !defined(TG_SINGLE_THREAD)
+    tg_nthreads_ensure();
+    if (g_nthreads > 1) {
+        MatmulArgs args = {out, x, NULL, NULL, NULL, NULL, wbf, seq, k, n};
+        if (seq >= g_nthreads) {
+            tg_parallel(seq, _matmul_seq_worker, &args);
+            return;
+        } else if (n >= 256 && n > seq * 4) {
+            tg_parallel(n, _matmul_n_worker, &args);
+            return;
+        }
+    }
+#endif
+    for (int t = 0; t < seq; t++) {
+        const float* xt = x + (size_t)t * k;
+        float* ot = out + (size_t)t * n;
+        for (int nn = 0; nn < n; nn++) {
+            ot[nn] = bf16_dot(xt, wbf + (size_t)nn * k, k);
+        }
+    }
+}
+
+/* BF16 直算 matmul 包装 */
+static void matmul_bf16(float* out, const float* x, const uint16_t* w,
+                        int seq, int k, int n) {
+    /* ⚠️ mm_bf16 的 GPU 桥接已【撤下】（2026-10-10）
+     *   原因：内核输出不正确（诊断实测 split=1 时即 64/64 不符），
+     *         导致生成乱码（实测 "听据此展，有病"）。
+     *   打包与上传均已验证正确 ⇒ bug 在内核的点积逻辑，待修。
+     *   修好前不接线，保证推理正确性（稳定性第一）。
+     *   详见 docs/mm_bf16桥接诊断_20261010.md */
+    _matmul_impl_bf16(out, x, w, seq, k, n);
 }
 
 /* 点积: 优先 SIMD (用于 MoE 内联 matmul) */
 static inline float dot_4x(const float* a, const float* b, int n) {
     return tg_dot(a, b, n);
 }
+
+/* 专家权重单行点积: Q4_0 直接 (use_q4_direct 时 q4 非空) 或 FP32。
+ * w_fp32 布局 [行数, k] (每行 stride=row_stride), q4 布局 [行数, blocks*18]。 */
+static inline float moe_dot_row(const float* x, int k,
+                                const uint8_t* q4, const float* q4_s,
+                                const int16_t* q4_sw, int row,
+                                const float* w_fp32, int row_stride,
+                                const uint16_t* w_bf16) {
+    if (q4) {
+        int blocks = (k + 31) / 32;
+        return tg_dot_q4(x, q4 + (size_t)row * blocks * 18, q4_s + (size_t)row * blocks,
+                         q4_sw + (size_t)row * blocks, k);
+    }
+    /* ★ BF16 直算（MoE 专家：占 93.1% 权重，收益最大处） */
+    if (w_bf16) {
+        return bf16_dot(x, w_bf16 + (size_t)row * k, k);
+    }
+    return dot_4x(x, w_fp32 + (size_t)row * row_stride, k);
+}
+
+/* MoE 专家 FP32 matmul 并行辅助 (w1/w2 行并行 + w3 行并行)
+ * decode 时专家权重行数多 (dff=3584), 原串行循环是性能瓶颈。
+ * a/b 缓冲在专家间串行使用 (top-k 循环), 分块并行只写各自 nn 行, 安全。 */
+typedef struct {
+    const float* xt;
+    int d, dff;
+    const float* w1, *w2, *w3;
+    /* ★ BF16 直算权重指针（2026-10-10 加）
+     * MoE 专家占 V2.7 权重的 93.1% ⇒ 这里减半字节 = 端到端最大收益。 */
+    const uint16_t* b1, *b2, *b3;
+    float* a, *b, *out;
+} MoeMMArgs;
+
+static void moe_w12_worker(int nn, void* vp) {
+    MoeMMArgs* A = (MoeMMArgs*)vp;
+    A->a[nn] = tg_dot(A->xt, A->w1 + (size_t)nn * A->d, A->d);
+    A->b[nn] = tg_dot(A->xt, A->w2 + (size_t)nn * A->d, A->d);
+}
+
+static void moe_w3_worker(int nn, void* vp) {
+    MoeMMArgs* A = (MoeMMArgs*)vp;
+    A->out[nn] = tg_dot(A->a, A->w3 + (size_t)nn * A->dff, A->dff);
+}
+
+/* ★ BF16 版 MoE worker（2026-10-10 加）
+ * 与 FP32 版逐位等价，但权重只读 2 字节/元素 ⇒ 少一半内存带宽。
+ * 微基准已证：同样形状 BF16 直算比 FP32 快 1.49~1.78x。 */
+static void moe_w12_worker_bf16(int nn, void* vp) {
+    MoeMMArgs* A = (MoeMMArgs*)vp;
+    A->a[nn] = bf16_dot(A->xt, A->b1 + (size_t)nn * A->d, A->d);
+    A->b[nn] = bf16_dot(A->xt, A->b2 + (size_t)nn * A->d, A->d);
+}
+
+static void moe_w3_worker_bf16(int nn, void* vp) {
+    MoeMMArgs* A = (MoeMMArgs*)vp;
+    A->out[nn] = bf16_dot(A->a, A->b3 + (size_t)nn * A->dff, A->dff);
+}
+
+static void moe_expert_w12(const float* xt, int d, int dff,
+                           const float* w1, const float* w2, float* a, float* b) {
+    MoeMMArgs args = {xt, d, dff, w1, w2, NULL, NULL, NULL, NULL, a, b, NULL};
+#if !defined(TG_SINGLE_THREAD)
+    tg_nthreads_ensure();
+    if (g_nthreads > 1 && dff >= g_nthreads) {
+        tg_parallel(dff, moe_w12_worker, &args);
+        return;
+    }
+#endif
+    for (int nn = 0; nn < dff; nn++) {
+        a[nn] = tg_dot(xt, w1 + (size_t)nn * d, d);
+        b[nn] = tg_dot(xt, w2 + (size_t)nn * d, d);
+    }
+}
+
+/* ★ BF16 版专家 w1/w2（MoE 主路径，占 93.1% 权重） */
+static void moe_expert_w12_bf16(const float* xt, int d, int dff,
+                                const uint16_t* w1, const uint16_t* w2,
+                                float* a, float* b) {
+    MoeMMArgs args = {xt, d, dff, NULL, NULL, NULL, w1, w2, NULL, a, b, NULL};
+#if !defined(TG_SINGLE_THREAD)
+    tg_nthreads_ensure();
+    if (g_nthreads > 1 && dff >= g_nthreads) {
+        tg_parallel(dff, moe_w12_worker_bf16, &args);
+        return;
+    }
+#endif
+    for (int nn = 0; nn < dff; nn++) {
+        a[nn] = bf16_dot(xt, w1 + (size_t)nn * d, d);
+        b[nn] = bf16_dot(xt, w2 + (size_t)nn * d, d);
+    }
+}
+
+/* ★ BF16 版专家 w3 */
+static void moe_expert_w3_bf16(const float* a, int d, int dff,
+                               const uint16_t* w3, float* out) {
+    MoeMMArgs args = {NULL, d, dff, NULL, NULL, NULL, NULL, NULL, w3, (float*)a, NULL, out};
+#if !defined(TG_SINGLE_THREAD)
+    tg_nthreads_ensure();
+    if (g_nthreads > 1 && d >= g_nthreads) {
+        tg_parallel(d, moe_w3_worker_bf16, &args);
+        return;
+    }
+#endif
+    for (int nn = 0; nn < d; nn++) {
+        out[nn] = bf16_dot(a, w3 + (size_t)nn * dff, dff);
+    }
+}
+
+static void moe_expert_w3(const float* a, int d, int dff,
+                          const float* w3, float* out) {
+    MoeMMArgs args = {NULL, d, dff, NULL, NULL, w3, NULL, NULL, NULL, (float*)a, NULL, out};
+#if !defined(TG_SINGLE_THREAD)
+    tg_nthreads_ensure();
+    if (g_nthreads > 1 && d >= g_nthreads) {
+        tg_parallel(d, moe_w3_worker, &args);
+        return;
+    }
+#endif
+    for (int nn = 0; nn < d; nn++) {
+        out[nn] = tg_dot(a, w3 + (size_t)nn * dff, dff);
+    }
+}
+
+/* 输入按 32 元素块量化到 int8 (per-block max-abs), 供 Q4_0 点积复用。
+ * xi 长度 ≥ blocks*32 (尾部不足 32 补零), max_xs 长度 ≥ blocks。
+ * MoE 专家中同一输入被 w1/w2 多行复用, 量化一次即可, 避免重复开销。 */
+static inline void quantize_q4_input(const float* x, int k,
+                                     int8_t* xi, float* max_xs) {
+    int blocks = (k + 31) / 32;
+    for (int b = 0; b < blocks; b++) {
+        int rem = (b * 32 + 32 <= k) ? 32 : (k - b * 32);
+        float max_x = 0;
+        for (int j = 0; j < rem; j++) {
+            float v = x[b * 32 + j]; if (v < 0) v = -v;
+            if (v > max_x) max_x = v;
+        }
+        max_xs[b] = max_x;
+        int8_t* xb = xi + b * 32;
+        if (max_x < 1e-7f) {
+            for (int j = 0; j < 32; j++) xb[j] = 0;
+            continue;
+        }
+        float inv_scale = 127.0f / max_x;
+        for (int j = 0; j < rem; j++) {
+            int v = (int)(x[b * 32 + j] * inv_scale + 0.5f);
+            if (v > 127) v = 127; else if (v < -128) v = -128;
+            xb[j] = (int8_t)v;
+        }
+        for (int j = rem; j < 32; j++) xb[j] = 0;
+    }
+}
+
+#if TG_HAS_AVX2
+/* 已量化输入 (xi + max_xs) 的 AVX2 Q4_0 直接点积 (输入只量化一次, 多行权重复用)。
+ * 数学与 avx2_dot_q4_0 一致: sum += (dot - 128*Σwi) * scale_w * max_x / 127 */
+static inline float avx2_dot_q4_preq(const int8_t* __restrict xi,
+                                     const float* __restrict max_xs, int n,
+                                     const uint8_t* __restrict q4_raw,
+                                     const float* __restrict scales,
+                                     const int16_t* __restrict sumwi) {
+    float sum = 0;
+    const int blocks = (n + 31) / 32;
+    const __m128i mask4  = _mm_set1_epi8(0x0F);
+    const __m128i sub8   = _mm_set1_epi8(8);
+    const __m256i off128 = _mm256_set1_epi8((char)128);
+    const __m256i ones   = _mm256_set1_epi16(1);
+
+    for (int b = 0; b < blocks; b++) {
+        float max_x = max_xs[b];
+        if (max_x < 1e-7f) continue;  /* 全零块 */
+        float scale_w = scales[b];
+        const uint8_t* q4_block = q4_raw + (size_t)b * 18 + 2;
+
+        __m128i q4  = _mm_loadu_si128((const __m128i*)q4_block);
+        __m128i lo4 = _mm_sub_epi8(_mm_and_si128(q4, mask4), sub8);
+        __m128i hi4 = _mm_sub_epi8(_mm_and_si128(_mm_srli_epi32(q4, 4), mask4), sub8);
+        __m256i wi  = _mm256_set_m128i(_mm_unpackhi_epi8(lo4, hi4),
+                                       _mm_unpacklo_epi8(lo4, hi4));
+
+        __m256i xi_v = _mm256_loadu_si256((const __m256i*)(xi + b * 32));
+        __m256i xi_u = _mm256_sub_epi8(xi_v, off128);
+        __m256i dot16 = _mm256_maddubs_epi16(xi_u, wi);
+        __m256i dot32 = _mm256_madd_epi16(dot16, ones);
+
+        __m128i lo128  = _mm256_castsi256_si128(dot32);
+        __m128i hi128  = _mm256_extracti128_si256(dot32, 1);
+        __m128i sum128 = _mm_add_epi32(lo128, hi128);
+        sum128 = _mm_hadd_epi32(sum128, sum128);
+        sum128 = _mm_hadd_epi32(sum128, sum128);
+        int dot = _mm_cvtsi128_si32(sum128);
+        dot -= 128 * sumwi[b];
+        sum += (float)dot * scale_w * max_x / 127.0f;
+    }
+    return sum;
+}
+#endif
 
 /* ─── NTK-by-parts 辅助函数 (参考 llama.cpp rope_yarn) ───
  * ramp 函数: 在 [low, high] 区间内从 1 线性下降到 0
@@ -1521,18 +2774,30 @@ static inline float rope_yarn_ramp(float low, float high, int j) {
  *
  * 相比简单 NTK-aware (整体 theta 缩放), NTK-by-parts 保留高频维度的局部感知,
  * 只对低频维度做 PI 内插, 避免高频维度被错误拉伸导致乱码。
+ *
+ * YaRN 注意力温度修正 (2026-08-02 补齐, 与 model.py Python 端一致):
+ *   mscale = 0.1 * ln(scale) + 1.0, scale = extend_ctx / max_seq_len
+ *   扩展后 token 间距变大 → softmax 熵变大 → attention 涣散.
+ *   乘 mscale (>1) 收紧 logits 分布, 恢复注意力锐度.
+ *   仅启用扩展时 mscale != 1.0; 短序列 (≤ max_seq_len) 完全不受影响.
+ *   (参考 YaRN 论文 + llama.cpp rope_yarn 的 yarn_mscale)
  */
-static void rope(float* q, float* k, int seq, int n_heads, int d_k,
+static void rope(float* q, float* k, int seq, int n_heads, int n_kv_heads, int d_k,
                  int cache_pos_offset, float theta,
-                 int extend_ctx, int max_seq_len) {
+                 int extend_ctx, int max_seq_len,
+                 float* out_mscale) {
     /* NTK-by-parts 参数预计算 */
     int use_ntk = (extend_ctx > max_seq_len && max_seq_len > 0);
     float inv_scale = 1.0f;
     float dim_high = 0.0f, dim_low = 0.0f;  /* ramp 边界 (维度索引 j = i/2) */
+    float yarn_mscale = 1.0f;
 
     if (use_ntk) {
         float scale = (float)extend_ctx / (float)max_seq_len;
         inv_scale = 1.0f / scale;
+        /* YaRN 注意力温度: 收紧扩展后熵增的 softmax 分布 */
+        yarn_mscale = 0.1f * logf(scale) + 1.0f;
+        if (yarn_mscale < 1.0f) yarn_mscale = 1.0f;  /* 防御: 仅允许放大 */
 
         const float alpha_slow = 1.0f;   /* 低频边界 r=1 */
         const float beta_fast = 32.0f;   /* 高频边界 r=32 */
@@ -1552,21 +2817,19 @@ static void rope(float* q, float* k, int seq, int n_heads, int d_k,
             use_ntk = 0;  /* theta <= 1, 无法计算 log, 关闭 NTK */
         }
     }
+    if (out_mscale) *out_mscale = (use_ntk ? yarn_mscale : 1.0f);
 
     for (int t = 0; t < seq; t++) {
         int pos = cache_pos_offset + t;
+        /* Q: n_heads 个 head (布局 [seq, n_heads, d_k]) */
         for (int h = 0; h < n_heads; h++) {
             float* qh = q + ((size_t)t * n_heads + h) * d_k;
-            float* kh = k + ((size_t)t * n_heads + h) * d_k;
             for (int i = 0; i < d_k; i += 2) {
                 float freq_extrap = 1.0f / powf(theta, (float)i / d_k);
                 float freq;
                 if (use_ntk) {
                     int j = i / 2;  /* 维度索引 0, 1, 2, ..., d_k/2-1 */
                     float ramp = rope_yarn_ramp(dim_high, dim_low, j);
-                    /* ramp=1 (高频): freq = freq_extrap (不插值)
-                     * ramp=0 (低频): freq = freq_extrap / scale (完全内插)
-                     * 中间: 线性混合 */
                     float freq_interp = freq_extrap * inv_scale;
                     freq = freq_interp * (1.0f - ramp) + freq_extrap * ramp;
                 } else {
@@ -1578,6 +2841,27 @@ static void rope(float* q, float* k, int seq, int n_heads, int d_k,
                 float q0 = qh[i], q1 = qh[i+1];
                 qh[i]   = q0 * c - q1 * s;
                 qh[i+1] = q0 * s + q1 * c;
+            }
+        }
+        /* K: n_kv_heads 个 head (GQA 布局 [seq, n_kv_heads, d_k], 与 Q 分开遍历)
+         * Task 20c.3: RoPE 不可重复应用 (旋转角度累积), 故 K 独立循环遍历
+         * n_kv_heads 而非复用 n_heads 循环, 否则 GQA 下 K head 会被旋转多次出错 */
+        for (int h = 0; h < n_kv_heads; h++) {
+            float* kh = k + ((size_t)t * n_kv_heads + h) * d_k;
+            for (int i = 0; i < d_k; i += 2) {
+                float freq_extrap = 1.0f / powf(theta, (float)i / d_k);
+                float freq;
+                if (use_ntk) {
+                    int j = i / 2;
+                    float ramp = rope_yarn_ramp(dim_high, dim_low, j);
+                    float freq_interp = freq_extrap * inv_scale;
+                    freq = freq_interp * (1.0f - ramp) + freq_extrap * ramp;
+                } else {
+                    freq = freq_extrap;
+                }
+                float angle = (float)pos * freq;
+                float c = cosf(angle);
+                float s = sinf(angle);
                 float k0 = kh[i], k1 = kh[i+1];
                 kh[i]   = k0 * c - k1 * s;
                 kh[i+1] = k0 * s + k1 * c;
@@ -1622,11 +2906,33 @@ static void swiglu(TGModel* m, float* out, const float* x,
 }
 
 /* ─── 单个 Transformer Block (使用预解析 block_cache, 无 hash 查找) ── */
+/* ★ 逐层 dump（2026-10-10 加，临时诊断）
+ * 环境变量 TGAI_DUMP_DIR 指定目录；未设置时零开销。
+ * 用途：与 PyTorch 参考前向逐层比对，定位数值偏离点。 */
+static void tg_dump_f32(const char* tag, const float* p, size_t n) {
+    const char* dir = getenv("TGAI_DUMP_DIR");
+    if (!dir || !dir[0] || !p) return;
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/%s.bin", dir, tag);
+    FILE* f = fopen(path, "wb");
+    if (!f) { dbg_err("[dump] 打不开 %s\n", path); return; }
+    fwrite(p, sizeof(float), n, f);
+    fclose(f);
+    dbg("[dump] %s  n=%llu\n", tag, (unsigned long long)n);
+}
+
 static void transformer_block(TGModel* m, float* x, int seq,
                               int layer_idx, TGKVCache* cache, int cache_pos) {
     int d = (int)m->header.d_model;
     int nh = (int)m->header.n_heads;
     int dk = d / nh;
+    /* Task 20c.3: GQA 支持 — K/V 投影输出 kv_dim = n_kv_heads * d_k (非 d_model)。
+     * ORV 导出的稠密 LLM 是 GQA (n_kv=2 < n_heads=4), kv_dim=16 < d=32。
+     * 旧代码 matmul(work_k, ..., d, d) 把 k_w 当 [d,d] 越界读取, 触发访问违例崩溃。 */
+    int nkv = (int)m->header.num_kv_heads;
+    if (nkv <= 0) nkv = nh;        /* 0 = 同 n_heads (向后兼容 v1/MoE 模型) */
+    if (nkv > nh) nkv = nh;        /* 安全上限 */
+    int kv_dim = nkv * dk;         /* K/V 投影输出维度 */
     int ne = (int)m->header.n_experts;
     int na = (int)m->header.n_activated;
     int dff = (int)m->header.d_ff;
@@ -1640,28 +2946,60 @@ static void transformer_block(TGModel* m, float* x, int seq,
 
     /* Q4_0 路径: 使用原始 4-bit 数据直接点积 (减 4x 内存带宽) */
     if (m->use_q4_direct && bw->q4_q) {
-        matmul_q4(m->work_q, m->work_ln, bw->q4_q, bw->q4_q_s, seq, d, d);
-        matmul_q4(m->work_k, m->work_ln, bw->q4_k, bw->q4_k_s, seq, d, d);
-        matmul_q4(m->work_v, m->work_ln, bw->q4_v, bw->q4_v_s, seq, d, d);
+        matmul_q4(m->work_q, m->work_ln, bw->q4_q, bw->q4_q_s, bw->q4_q_sw, seq, d, d);          /* Q: [seq, d] */
+        matmul_q4(m->work_k, m->work_ln, bw->q4_k, bw->q4_k_s, bw->q4_k_sw, seq, d, kv_dim);     /* K: [seq, kv_dim] (GQA) */
+        matmul_q4(m->work_v, m->work_ln, bw->q4_v, bw->q4_v_s, bw->q4_v_sw, seq, d, kv_dim);     /* V: [seq, kv_dim] (GQA) */
+    } else if (m->use_bf16_direct && bw->bf16_q) {
+        /* ★ BF16 直算（2026-10-10 加）：权重 2 字节，带宽减半 */
+        matmul_bf16(m->work_q, m->work_ln, bw->bf16_q, seq, d, d);
+        matmul_bf16(m->work_k, m->work_ln, bw->bf16_k, seq, d, kv_dim);
+        matmul_bf16(m->work_v, m->work_ln, bw->bf16_v, seq, d, kv_dim);
     } else {
-        matmul(m->work_q, m->work_ln, bw->q_w, seq, d, d);
-        matmul(m->work_k, m->work_ln, bw->k_w, seq, d, d);
-        matmul(m->work_v, m->work_ln, bw->v_w, seq, d, d);
+        matmul(m->work_q, m->work_ln, bw->q_w, seq, d, d);                          /* Q: [seq, d] */
+        matmul(m->work_k, m->work_ln, bw->k_w, seq, d, kv_dim);                     /* K: [seq, kv_dim] (GQA) */
+        matmul(m->work_v, m->work_ln, bw->v_w, seq, d, kv_dim);                     /* V: [seq, kv_dim] (GQA) */
     }
 
-    rope(m->work_q, m->work_k, seq, nh, dk, cache_pos, theta,
-         m->extend_ctx, (int)m->header.max_seq_len);
+    /* QKV bias 加法 (可选, 在 RoPE 之前 — 标准 LLaMA/Qwen 实现顺序:
+     *   Q = (x @ W_q^T) + b_q, 然后 RoPE(Q).
+     * GGUF→.TG 转换器已对 Q/K bias 做 RoPE 维度重排, 此处直接相加即可.
+     * 向后兼容: TGAI 原生模型无 bias → bw->q_bias==NULL → 跳过, 零开销.
+     * bias 按 per-output-feature 广播: 对 seq 中每个位置 t 都加同一向量. */
+    if (bw->q_bias) {
+        for (int t = 0; t < seq; t++) {
+            float* row = m->work_q + (size_t)t * d;
+            for (int i = 0; i < d; i++) row[i] += bw->q_bias[i];
+        }
+    }
+    if (bw->k_bias) {
+        for (int t = 0; t < seq; t++) {
+            float* row = m->work_k + (size_t)t * kv_dim;
+            for (int i = 0; i < kv_dim; i++) row[i] += bw->k_bias[i];
+        }
+    }
+    if (bw->v_bias) {
+        for (int t = 0; t < seq; t++) {
+            float* row = m->work_v + (size_t)t * kv_dim;
+            for (int i = 0; i < kv_dim; i++) row[i] += bw->v_bias[i];
+        }
+    }
 
-    /* KV cache 写入 */
+    /* YaRN 注意力温度修正: rope() 输出 mscale, 应用到 QK^T 缩放.
+     * 仅启用 NTK 扩展时 mscale>1; 短序列时恒为 1.0 (与旧行为完全一致). */
+    float yarn_mscale = 1.0f;
+    rope(m->work_q, m->work_k, seq, nh, nkv, dk, cache_pos, theta,
+         m->extend_ctx, (int)m->header.max_seq_len, &yarn_mscale);
+
+    /* KV cache 写入 (GQA: 按 n_kv_heads 写入, work_k 布局 [seq, nkv, dk]) */
     int kv_len;
     if (cache) {
-        int layer_off = layer_idx * cache->n_heads * cache->max_seq_len * cache->d_k;
+        int layer_off = layer_idx * cache->n_kv_heads * cache->max_seq_len * cache->d_k;
         for (int t = 0; t < seq; t++) {
-            for (int h = 0; h < nh; h++) {
+            for (int h = 0; h < nkv; h++) {
                 float* kdst = cache->k + layer_off + ((size_t)h * cache->max_seq_len + cache_pos + t) * dk;
                 float* vdst = cache->v + layer_off + ((size_t)h * cache->max_seq_len + cache_pos + t) * dk;
-                float* ksrc = m->work_k + ((size_t)t * nh + h) * dk;
-                float* vsrc = m->work_v + ((size_t)t * nh + h) * dk;
+                float* ksrc = m->work_k + ((size_t)t * nkv + h) * dk;
+                float* vsrc = m->work_v + ((size_t)t * nkv + h) * dk;
                 memcpy(kdst, ksrc, (size_t)dk * sizeof(float));
                 memcpy(vdst, vsrc, (size_t)dk * sizeof(float));
             }
@@ -1672,24 +3010,24 @@ static void transformer_block(TGModel* m, float* x, int seq,
         kv_len = seq;
     }
 
-    /* scaled_dot_product_attention */
-    float inv_sqrt = 1.0f / sqrtf((float)dk);
+    /* scaled_dot_product_attention (GQA: Q head h → KV head kvh = h * nkv / nh)
+     * Task 20c.3: 多个 Q head 共享一个 KV head (group_size = nh / nkv)。
+     * 当 nkv == nh 时退化为标准 MHA (kvh == h)。
+     * YaRN: 扩展时 logits *= mscale (注意力温度修正, 收紧熵增分布). */
+    float inv_sqrt = (1.0f / sqrtf((float)dk)) * yarn_mscale;
     for (int t = 0; t < seq; t++) {
         for (int h = 0; h < nh; h++) {
             float* qh = m->work_q + ((size_t)t * nh + h) * dk;
-            /* 分数计算用 work_router 行做临时 scores (元素数 = kv_len) */
-            float* scores = m->work_router + (size_t)t * ne;  /* ne >= kv_len 通常不成立, 改用 work_attn 行尾 */
-            /* 改用 m->work_ffn_a 的尾部行作为 scores buffer */
-            (void)scores;
+            int kvh = h * nkv / nh;  /* GQA 映射: Q head → KV head */
             float* sc = m->work_ffn_a + (size_t)t * dff;  /* d_ff 通常 >= kv_len */
-            int layer_off = cache ? layer_idx * cache->n_heads * cache->max_seq_len * cache->d_k : 0;
+            int layer_off = cache ? layer_idx * cache->n_kv_heads * cache->max_seq_len * cache->d_k : 0;
 
             for (int ki = 0; ki < kv_len; ki++) {
                 float* kh;
                 if (cache) {
-                    kh = cache->k + layer_off + ((size_t)h * cache->max_seq_len + ki) * dk;
+                    kh = cache->k + layer_off + ((size_t)kvh * cache->max_seq_len + ki) * dk;
                 } else {
-                    kh = m->work_k + ((size_t)ki * nh + h) * dk;
+                    kh = m->work_k + ((size_t)ki * nkv + kvh) * dk;  /* work_k 布局 [seq, nkv, dk] */
                 }
                 float s = tg_dot(qh, kh, dk);
                 sc[ki] = s * inv_sqrt;
@@ -1713,9 +3051,9 @@ static void transformer_block(TGModel* m, float* x, int seq,
             for (int ki = 0; ki < kv_len; ki++) {
                 float* vh;
                 if (cache) {
-                    vh = cache->v + layer_off + ((size_t)h * cache->max_seq_len + ki) * dk;
+                    vh = cache->v + layer_off + ((size_t)kvh * cache->max_seq_len + ki) * dk;
                 } else {
-                    vh = m->work_v + ((size_t)ki * nh + h) * dk;
+                    vh = m->work_v + ((size_t)ki * nkv + kvh) * dk;  /* work_v 布局 [seq, nkv, dk] */
                 }
                 float w = sc[ki];
                 for (int i = 0; i < dk; i++) oh[i] += w * vh[i];
@@ -1725,7 +3063,9 @@ static void transformer_block(TGModel* m, float* x, int seq,
 
     /* out_proj (预解析指针) */
     if (m->use_q4_direct && bw->q4_out) {
-        matmul_q4(m->work_moe_out, m->work_attn, bw->q4_out, bw->q4_out_s, seq, d, d);
+        matmul_q4(m->work_moe_out, m->work_attn, bw->q4_out, bw->q4_out_s, bw->q4_out_sw, seq, d, d);
+    } else if (m->use_bf16_direct && bw->bf16_out) {
+        matmul_bf16(m->work_moe_out, m->work_attn, bw->bf16_out, seq, d, d);
     } else {
         matmul(m->work_moe_out, m->work_attn, bw->out_w, seq, d, d);
     }
@@ -1733,11 +3073,42 @@ static void transformer_block(TGModel* m, float* x, int seq,
     /* x = x + attn_out */
     for (int i = 0; i < seq * d; i++) x[i] += m->work_moe_out[i];
 
-    /* === MoE (预解析指针) === */
+    /* === FFN (稠密 SwiGLU 或 MoE, 由 n_experts 决定, Task 20c.3) === */
     rmsnorm(m->work_ln, x, bw->ln2_w, seq, d, 1e-6f);
 
-    /* router */
-    matmul(m->work_router, m->work_ln, bw->router_w, seq, d, ne);
+    if (ne == 0) {
+        /* 稠密 SwiGLU FFN (Task 20c.3): 与 MoE 专家 SwiGLU 数学等价, 无 router/top-k。
+         *   a = ln @ w1^T  [seq, d_ff]  (w1: [d_ff, d_model] gate → silu 分支)
+         *   b = ln @ w2^T  [seq, d_ff]  (w2: [d_ff, d_model] up → 直通分支)
+         *   a = silu(a) * b             (SwiGLU 激活)
+         *   out = a @ w3^T  [seq, d]    (w3: [d_model, d_ff] down → 输出投影)
+         * matmul 的 w 参数布局 [n_output, n_input] 与 ORV 导出的权重完全一致。 */
+        if (m->use_q4_direct && bw->q4_ffn_w1) {
+            matmul_q4(m->work_ffn_a, m->work_ln, bw->q4_ffn_w1, bw->q4_ffn_w1_s, bw->q4_ffn_w1_sw, seq, d, dff);
+            matmul_q4(m->work_ffn_b, m->work_ln, bw->q4_ffn_w2, bw->q4_ffn_w2_s, bw->q4_ffn_w2_sw, seq, d, dff);
+        } else {
+            matmul(m->work_ffn_a, m->work_ln, bw->ffn_w1, seq, d, dff);
+            matmul(m->work_ffn_b, m->work_ln, bw->ffn_w2, seq, d, dff);
+        }
+        for (int i = 0; i < seq * dff; i++) {
+            float v = m->work_ffn_a[i];
+            m->work_ffn_a[i] = (v / (1.0f + expf(-v))) * m->work_ffn_b[i];
+        }
+        if (m->use_q4_direct && bw->q4_ffn_w3) {
+            matmul_q4(m->work_moe_out, m->work_ffn_a, bw->q4_ffn_w3, bw->q4_ffn_w3_s, bw->q4_ffn_w3_sw, seq, dff, d);
+        } else {
+            matmul(m->work_moe_out, m->work_ffn_a, bw->ffn_w3, seq, dff, d);
+        }
+    } else {
+    /* === MoE (预解析指针) === */
+    /* router (Q4_0 direct 或 FP32) */
+    if (m->use_q4_direct && bw->q4_router) {
+        matmul_q4(m->work_router, m->work_ln, bw->q4_router, bw->q4_router_s, bw->q4_router_sw, seq, d, ne);
+    } else if (m->use_bf16_direct && bw->bf16_router) {
+        matmul_bf16(m->work_router, m->work_ln, bw->bf16_router, seq, d, ne);
+    } else {
+        matmul(m->work_router, m->work_ln, bw->router_w, seq, d, ne);
+    }
 
     /* top-k 选择 + 加权专家输出 */
     memset(m->work_moe_out, 0, (size_t)seq * d * sizeof(float));
@@ -1747,6 +3118,26 @@ static void transformer_block(TGModel* m, float* x, int seq,
     const float** expert_w2 = bw->expert_w2;
     const float** expert_w3 = bw->expert_w3;
     if (ne > 16) ne = 16;  /* 安全上限 */
+
+    /* Q4_0 专家预量化 buffer (同一输入被 w1/w2 多行复用, 量化一次) */
+    int8_t* xi_buf = NULL;
+    float* max_xs_buf = NULL;
+#if TG_HAS_AVX2
+    {
+        int maxk = dff > d ? dff : d;
+        xi_buf = (int8_t*)malloc((size_t)(((maxk + 31) / 32) * 32));
+        max_xs_buf = (float*)malloc((size_t)(((maxk + 31) / 32) * sizeof(float)));
+    }
+#endif
+
+    /* ★ QB 路由偏置：必须在 top-k 之前加到 logits 上（softmax 之前）。
+     * 有偏置才做，老模型 bw->qb_bias == NULL 时零开销。 */
+    if (bw->qb_bias) {
+        for (int t = 0; t < seq; t++) {
+            float* lg = m->work_router + (size_t)t * ne;
+            for (int e = 0; e < ne; e++) lg[e] += bw->qb_bias[e];
+        }
+    }
 
     for (int t = 0; t < seq; t++) {
         float* logits = m->work_router + (size_t)t * ne;
@@ -1788,25 +3179,79 @@ static void transformer_block(TGModel* m, float* x, int seq,
             /* 内联 swiglu 单 token, 不用全局 buffer 避免与循环冲突 */
             float* a = m->work_ffn_a;  /* 复用一行 */
             float* b = m->work_ffn_b;
-            /* a = xt @ w1.T  [1, d_ff] */
-            for (int nn = 0; nn < dff; nn++) {
-                const float* w1n = expert_w1[e] + (size_t)nn * d;
-                a[nn] = dot_4x(xt, w1n, d);
-            }
-            /* b = xt @ w2.T  [1, d_ff] */
-            for (int nn = 0; nn < dff; nn++) {
-                const float* w2n = expert_w2[e] + (size_t)nn * d;
-                b[nn] = dot_4x(xt, w2n, d);
-            }
-            /* a = silu(a) * b */
-            for (int i = 0; i < dff; i++) {
-                float xv = a[i];
-                a[i] = (xv / (1.0f + expf(-xv))) * b[i];
-            }
-            /* out = a @ w3.T  [1, d] */
-            for (int nn = 0; nn < d; nn++) {
-                const float* w3n = expert_w3[e] + (size_t)nn * dff;
-                out_ptr[nn] = dot_4x(a, w3n, dff);
+            if (bw->q4_expert_w1[e]) {
+                /* Q4_0 直接点积路径 (所有平台, 不再只限 AVX2):
+                 * use_q4_direct=1 时 expert_w1[e] 为 NULL, 若走 FP32 分支会
+                 * NULL+偏移越界崩溃 (ARM64 无 AVX2 必现)。 */
+                int blocks_d = (d + 31) / 32;
+                int blocks_f = (dff + 31) / 32;
+#if TG_HAS_AVX2
+                if (xi_buf && max_xs_buf) {
+                    /* AVX2 路径: xt/a 各量化一次, w1/w2/w3 多行复用 (省重复量化) */
+                    quantize_q4_input(xt, d, xi_buf, max_xs_buf);
+                    for (int nn = 0; nn < dff; nn++) {
+                        a[nn] = avx2_dot_q4_preq(xi_buf, max_xs_buf, d,
+                                                 bw->q4_expert_w1[e] + (size_t)nn * blocks_d * 18,
+                                                 bw->q4_expert_w1_s[e] + (size_t)nn * blocks_d,
+                                                 bw->q4_expert_w1_sw[e] + (size_t)nn * blocks_d);
+                        b[nn] = avx2_dot_q4_preq(xi_buf, max_xs_buf, d,
+                                                 bw->q4_expert_w2[e] + (size_t)nn * blocks_d * 18,
+                                                 bw->q4_expert_w2_s[e] + (size_t)nn * blocks_d,
+                                                 bw->q4_expert_w2_sw[e] + (size_t)nn * blocks_d);
+                    }
+                    for (int i = 0; i < dff; i++) {
+                        float xv = a[i];
+                        a[i] = (xv / (1.0f + expf(-xv))) * b[i];
+                    }
+                    quantize_q4_input(a, dff, xi_buf, max_xs_buf);
+                    for (int nn = 0; nn < d; nn++) {
+                        out_ptr[nn] = avx2_dot_q4_preq(xi_buf, max_xs_buf, dff,
+                                                       bw->q4_expert_w3[e] + (size_t)nn * blocks_f * 18,
+                                                       bw->q4_expert_w3_s[e] + (size_t)nn * blocks_f,
+                                                       bw->q4_expert_w3_sw[e] + (size_t)nn * blocks_f);
+                    }
+                } else
+#endif
+                {
+                    /* NEON/标量路径: tg_dot_q4 逐行 (输入按需量化, 通用回退) */
+                    for (int nn = 0; nn < dff; nn++) {
+                        a[nn] = tg_dot_q4(xt, bw->q4_expert_w1[e] + (size_t)nn * blocks_d * 18,
+                                          bw->q4_expert_w1_s[e] + (size_t)nn * blocks_d,
+                                          bw->q4_expert_w1_sw[e] + (size_t)nn * blocks_d, d);
+                        b[nn] = tg_dot_q4(xt, bw->q4_expert_w2[e] + (size_t)nn * blocks_d * 18,
+                                          bw->q4_expert_w2_s[e] + (size_t)nn * blocks_d,
+                                          bw->q4_expert_w2_sw[e] + (size_t)nn * blocks_d, d);
+                    }
+                    for (int i = 0; i < dff; i++) {
+                        float xv = a[i];
+                        a[i] = (xv / (1.0f + expf(-xv))) * b[i];
+                    }
+                    for (int nn = 0; nn < d; nn++) {
+                        out_ptr[nn] = tg_dot_q4(a, bw->q4_expert_w3[e] + (size_t)nn * blocks_f * 18,
+                                                bw->q4_expert_w3_s[e] + (size_t)nn * blocks_f,
+                                                bw->q4_expert_w3_sw[e] + (size_t)nn * blocks_f, dff);
+                    }
+                }
+            } else if (bw->bf16_expert_w1[e]) {
+                /* ★ BF16 直算路径（2026-10-10 加）
+                 * MoE 专家占 V2.7 权重 93.1%，每 token 读 1.31 GB ⇒ 这里省一半字节最大。
+                 * 与 FP32 路径逐位等价（bf16→fp32 只是左移 16 位）。 */
+                moe_expert_w12_bf16(xt, d, dff, bw->bf16_expert_w1[e],
+                                    bw->bf16_expert_w2[e], a, b);
+                for (int i = 0; i < dff; i++) {
+                    float xv = a[i];
+                    a[i] = (xv / (1.0f + expf(-xv))) * b[i];
+                }
+                moe_expert_w3_bf16(a, d, dff, bw->bf16_expert_w3[e], out_ptr);
+            } else
+            {
+                /* FP32 路径 (w1/w2 行并行 + w3 行并行) */
+                moe_expert_w12(xt, d, dff, expert_w1[e], expert_w2[e], a, b);
+                for (int i = 0; i < dff; i++) {
+                    float xv = a[i];
+                    a[i] = (xv / (1.0f + expf(-xv))) * b[i];
+                }
+                moe_expert_w3(a, d, dff, expert_w3[e], out_ptr);
             }
 
             for (int i = 0; i < d; i++) ot[i] += w * out_ptr[i];
@@ -1814,8 +3259,13 @@ static void transformer_block(TGModel* m, float* x, int seq,
             if (d > 256) free(out_ptr);
         }
     }
+#if TG_HAS_AVX2
+    free(xi_buf);
+    free(max_xs_buf);
+#endif
+    } /* end else (MoE FFN) */
 
-    /* x = x + moe_out */
+    /* x = x + ffn_out (稠密 SwiGLU 或 MoE 统一用 work_moe_out) */
     for (int i = 0; i < seq * d; i++) x[i] += m->work_moe_out[i];
 }
 
@@ -1836,25 +3286,52 @@ const float* tg_forward(TGModel* m, const int32_t* input_ids, int seq_len,
     int v = (int)m->header.vocab_size;
     int nl = (int)m->header.n_layers;
 
+    dbg("[fwd] seq=%d cache_pos=%d\n", seq_len, cache_pos);
+
     /* 1. Embedding lookup (直接从缓存读取 FP32) */
     const TGWeightEntry* emb = find_weight(m, "token_embedding.weight");
+    /* ★ 记录实际嵌入行数（tg_forward 用它做越界钳制） */
+    m->emb_rows = emb ? (int)emb->shape[0] : 0;
+    /* 不匹配时只警告一次（每 token 都刷会淹没日志） */
+    static int _warned_emb = 0;
+    if (!_warned_emb && m->emb_rows > 0 && m->emb_rows != m->vocab_size) {
+        _warned_emb = 1;
+        dbg_err("[fwd] WARN: header.vocab_size=%d 但 token_embedding 只有 %d 行; "
+                "词表 id 空间与嵌入表不匹配 —— 通常是转换/配错词表。\n"
+                "      已把 vocab 钳到嵌入行数，越界 id 落到 UNK。\n",
+                m->vocab_size, m->emb_rows);
+    }
+    /* ★ LM head 是权重共享（复用 embedding 矩阵），循环上界必须 <= 嵌入行数，
+     *   否则读 emb_w 越界 ⇒ access violation（实测崩过）。
+     *   合法文件里 m->emb_rows == v，此行无任何影响。 */
+    if (m->emb_rows > 0 && m->emb_rows < v) v = m->emb_rows;
     if (!emb) { set_err("找不到 token_embedding"); _forward_lock_release(); return NULL; }
     const float* emb_w = get_cached_weight(m, emb);
     for (int t = 0; t < seq_len; t++) {
         int id = input_ids[t];
         if (id < 0 || id >= v) id = m->unk_id;
+        { int32_t _sid = id; if (m->emb_rows > 0 && (_sid < 0 || _sid >= m->emb_rows)) _sid = m->unk_id; id = _sid; }
         memcpy(m->work_x + (size_t)t * d, emb_w + (size_t)id * d, (size_t)d * sizeof(float));
     }
 
+    tg_dump_f32("c_embed", m->work_x, (size_t)seq_len * d);
+
     /* 2. Transformer blocks */
     for (int i = 0; i < nl; i++) {
+        dbg("[fwd] block %d\n", i);
         transformer_block(m, m->work_x, seq_len, i, cache, cache_pos);
+        {   char _tag[64];
+            snprintf(_tag, sizeof(_tag), "c_block%d", i);
+            tg_dump_f32(_tag, m->work_x, (size_t)seq_len * d); }
     }
 
     /* 3. Final norm */
+    dbg("[fwd] final_norm\n");
     const TGWeightEntry* fn = find_weight(m, "final_norm.weight");
     if (!fn) { set_err("找不到 final_norm"); _forward_lock_release(); return NULL; }
     rmsnorm(m->work_x, m->work_x, get_cached_weight(m, fn), seq_len, d, 1e-6f);
+
+    tg_dump_f32("c_finalnorm", m->work_x, (size_t)seq_len * d);
 
     /* 4. LM Head (weight tying, 复用 embedding)
      * 优化: 只计算最后一个位置的 logits (用于预测下一个 token)
@@ -1862,9 +3339,10 @@ const float* tg_forward(TGModel* m, const int32_t* input_ids, int seq_len,
     {
         const float* last_x = m->work_x + (size_t)(seq_len - 1) * d;
 #if !defined(TG_SINGLE_THREAD)
-        if (g_nthreads > 1 && v >= g_nthreads * 8) {
+        tg_nthreads_ensure();
+    if (g_nthreads > 1 && v >= g_nthreads * 8) {
             /* 包装成 MatmulArgs 复用 _matmul_n_worker (seq==1 等价) */
-            MatmulArgs args = {m->work_logits, last_x, emb_w, NULL, NULL, 1, d, v};
+            MatmulArgs args = {m->work_logits, last_x, emb_w, NULL, NULL, NULL, NULL, 1, d, v};
             tg_parallel(v, _matmul_n_worker, &args);
         } else
 #endif
@@ -1915,6 +3393,66 @@ static int utf8_char_len(uint8_t b) {
 
 /* 对一个 token id 序列应用 BPE merges, 原地合并。
  * 返回合并后的序列长度。seq 容量必须 >= n。 */
+/* ★ vocab hash（2026-10-09 加，A）
+ *
+ * 目的：tg_encode 原来对每个单元做 O(vocab) 线性 strcmp（32779 次/字符），
+ *       改成 hash 查找 O(1)。cap 取 2 的幂，开放寻址线性探测。
+ *
+ * 正确性保证：查不到时返回 -1，调用方回落到线性扫描 ⇒ 绝不会因为 hash
+ *             碰撞/容量不足而编错 token。 */
+static uint32_t tg_fnv1a32(const char* s, int len) {
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < len; i++) {
+        h ^= (uint8_t)s[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
+/* 建表：加载 tokenizer 后调用一次。失败则 vocab_hash 保持 NULL（回落到线性扫描）。 */
+static void vocab_hash_build(TGModel* m) {
+    if (!m->vocab || m->vocab_size <= 0) return;
+    uint32_t cap = 1;
+    while (cap < (uint32_t)m->vocab_size * 2u) cap <<= 1;
+    if (cap < 16) cap = 16;
+    int32_t* tbl = (int32_t*)malloc((size_t)cap * sizeof(int32_t));
+    if (!tbl) return;
+    for (uint32_t i = 0; i < cap; i++) tbl[i] = -1;
+    for (int id = 0; id < m->vocab_size; id++) {
+        const char* tok = m->vocab[id];
+        if (!tok) continue;
+        int len = (int)strlen(tok);
+        if (len == 0) continue;
+        uint32_t h = tg_fnv1a32(tok, len) & (cap - 1u);
+        for (uint32_t probe = 0; probe < cap; probe++) {
+            uint32_t slot = (h + probe) & (cap - 1u);
+            if (tbl[slot] < 0) { tbl[slot] = id; break; }
+            /* 同 key 已存在：保留较小 id（与线性扫描"取第一个匹配"语义一致） */
+            if (strcmp(m->vocab[tbl[slot]], tok) == 0) break;
+        }
+    }
+    m->vocab_hash = tbl;
+    m->vocab_hash_cap = cap;
+    dbg("[load_tokenizer] vocab hash built: cap=%u vocab=%d\n", cap, m->vocab_size);
+}
+
+/* 查表：命中返回 id，未命中返回 -1（调用方回落线性扫描）。 */
+static inline int vocab_hash_lookup(const TGModel* m, const char* key, int len) {
+    if (!m->vocab_hash) return -1;
+    uint32_t cap = m->vocab_hash_cap;
+    uint32_t h = tg_fnv1a32(key, len) & (cap - 1u);
+    for (uint32_t probe = 0; probe < cap; probe++) {
+        uint32_t slot = (h + probe) & (cap - 1u);
+        int32_t id = m->vocab_hash[slot];
+        if (id < 0) return -1;                       /* 空槽 ⇒ 不存在 */
+        const char* tok = m->vocab[id];
+        if (tok && (int)strlen(tok) == len && memcmp(tok, key, (size_t)len) == 0) {
+            return (int)id;
+        }
+    }
+    return -1;
+}
+
 static int bpe_apply(const TGModel* m, int32_t* seq, int n) {
     if (n < 2 || m->n_merges == 0) return n;
 
@@ -1971,46 +3509,122 @@ int tg_encode(const TGModel* model, const char* text, int32_t* out_ids, int max_
         return n_out;
     }
 
-    /* 切分为 UTF-8 字符, 每个字符查 vocab 得到初始 token id */
-    int32_t* seq = (int32_t*)malloc((size_t)text_len * sizeof(int32_t) + 4);
+    /* ─── 编码（2026-10-09 重写，对齐 HF tokenizer）──────────────────
+     * HF 实测配置：
+     *   normalizer    : Replace ' ' -> '▁'        (不是丢弃空白!)
+     *   pre_tokenizer : Split 正则, Isolated
+     *   post_processor: null                       (不加 BOS/EOS)
+     *   added_tokens  : 9 个特殊标记, 必须整段匹配为单 token
+     *
+     * 本实现分两段：
+     *   ① Greedy longest match for special tokens：在当前位置尝试匹配特殊标记表里
+     *      最长的条目，命中则直接输出其 id 并跳过该段（不参与 BPE）。
+     *   ② 普通文本段：' ' -> space_token（若有），再按 UTF-8 字符切 + BPE。
+     */
+    int32_t* seq = (int32_t*)malloc((size_t)text_len * sizeof(int32_t) + 8);
     if (!seq) return -1;
     int seq_n = 0;
+    /* 段内累计的普通字符（遇到特殊标记时先 flush 这一段做 BPE） */
+    int32_t* seg = (int32_t*)malloc((size_t)text_len * sizeof(int32_t) + 8);
+    if (!seg) { free(seq); return -1; }
+    int seg_n = 0;
 
     const uint8_t* p = (const uint8_t*)text;
     const uint8_t* end = p + text_len;
     char char_buf[8];
 
+    #define TG_FLUSH_SEG() do {                                       \
+        if (seg_n > 0) {                                              \
+            int _m = bpe_apply(model, seg, seg_n);                    \
+            for (int _i = 0; _i < _m; _i++) {                         \
+                if (seq_n >= text_len + 8) break;                     \
+                seq[seq_n++] = seg[_i];                               \
+            }                                                         \
+            seg_n = 0;                                                \
+        }                                                             \
+    } while (0)
+
     while (p < end) {
+        /* ① 贪心最长匹配特殊标记 */
+        int matched = 0;
+        if (model->n_special > 0 && *p == (uint8_t)'<') {
+            int best = -1, best_len = 0;
+            for (int si = 0; si < model->n_special; si++) {
+                int sl = model->special_len[si];
+                if (sl <= best_len) continue;              /* 只要最长的 */
+                if (p + sl > end) continue;
+                if (memcmp(p, model->special_text[si], (size_t)sl) == 0) {
+                    best = si;
+                    best_len = sl;
+                }
+            }
+            if (best >= 0) {
+                TG_FLUSH_SEG();                            /* 先结算前面的普通段 */
+                if (seq_n < text_len + 8) seq[seq_n++] = model->special_id[best];
+                p += best_len;
+                matched = 1;
+            }
+        }
+        if (matched) continue;
+
         int cl = utf8_char_len(*p);
         if (p + cl > end) cl = (int)(end - p);
+        int src_len = cl;              /* ★ 源文本消费的字节数（与 cl 解耦！） */
 
-        /* 查找单字符 token */
-        memcpy(char_buf, p, cl);
-        char_buf[cl] = '\0';
-        int tid = -1;
-        for (int i = 0; i < model->vocab_size; i++) {
-            if (strcmp(model->vocab[i], char_buf) == 0) { tid = i; break; }
+        /* ② ' ' -> space_token（HF normalizer）；无 space_token 则保持原样（老模型）
+         * ⚠️ 修过的 bug：原实现把"是否发生替换"判断为 (cl == space_len)，
+         *    而中文 UTF-8 长度 3 恰好等于 '▁' 的字节长度 3 ⇒ 中文被误判
+         *    ⇒ 指针只前进 1 字节 ⇒ 拆成孤立续字节 ⇒ UNK。
+         *    ⇒ 这里用 src_len 独立记录，绝不从 cl 反推。 */
+        if (cl == 1 && *p == ' ' && model->space_len > 0) {
+            memcpy(char_buf, model->space_str, (size_t)model->space_len);
+            char_buf[model->space_len] = '\0';
+            cl = model->space_len;     /* 查表用 '▁'；src_len 仍是 1（只吃掉那个空格） */
+        } else {
+            memcpy(char_buf, p, (size_t)cl);
+            char_buf[cl] = '\0';
+        }
+
+        /* 查单字符/单元 token：先 hash（O(1)），未命中再线性扫描（兜底） */
+        int tid = vocab_hash_lookup(model, char_buf, cl);
+        if (tid < 0) {
+            for (int i = 0; i < model->vocab_size; i++) {
+                if (strcmp(model->vocab[i], char_buf) == 0) { tid = i; break; }
+            }
         }
         if (tid < 0) tid = model->unk_id;
-        seq[seq_n++] = tid;
+        if (seg_n < text_len + 8) seg[seg_n++] = tid;
 
-        p += cl;
+        p += src_len;              /* ★ 只按源文本步进 */
     }
-
-    /* 应用 BPE merges */
-    seq_n = bpe_apply(model, seq, seq_n);
+    TG_FLUSH_SEG();
+    #undef TG_FLUSH_SEG
+    free(seg);
+    int bpe_n = seq_n;
 
     /* 输出 */
-    for (int i = 0; i < seq_n; i++) {
+    for (int i = 0; i < bpe_n; i++) {
         if (n_out >= max_out) { free(seq); return -1; }
         out_ids[n_out++] = seq[i];
     }
     free(seq);
 
-    if (add_special && model->eos_id >= 0) {
-        if (n_out >= max_out) return -1;
-        out_ids[n_out++] = model->eos_id;
-    }
+    /* ★★ 必修 bug（2026-10-10）：这里原先在序列末尾追加 EOS。
+     *
+     * 症状：V2.7 对话降智 —— 首轮输出 "▁我▁▁▁▁|▁你好" 这类退化噪声，
+     *       而同一权重 + 同一词表在 llama.cpp 上完全正常。
+     * 原因：Python 侧 encode(add_bos=True) 把 1 传给 add_special，
+     *       而 add_special 同时控制【开头加 BOS】与【末尾加 EOS】，
+     *       ⇒ 每个 prompt 尾部都多一个 <EOS>(3)。
+     *       模型据此认为"对话已结束"，于是在结束标记之后继续续写 ⇒ 退化。
+     *       实测 prompt 变成 [2, 32770, 8, 911, 2002, 32771, 32773, 8, 3]。
+     * 依据：本函数 L3514-3516 已记录 HF 实测配置 ——
+     *       post_processor: null  (不加 BOS/EOS)
+     *       训练语料也是按"只有 BOS、无 EOS"编码的。
+     * 修复：add_special 只控制开头的 BOS；不再追加 EOS。
+     *       单轮 chat 的收尾由对话标记（<TGAI><回答>\n）承担，
+     *       而不是由 EOS 承担。
+     */
 
     return n_out;
 }
@@ -2035,4 +3649,20 @@ int tg_decode(const TGModel* model, const int32_t* ids, int n, char* out_str, in
     }
     out_str[pos] = '\0';
     return pos;
+}
+
+/* ★ 查询模型是否带特殊标记表（2026-10-09 加，P0-2）
+ *
+ * 用途：调用方据此判断该用哪种 prompt 格式。
+ *   n_special > 0 且含对话标记 ⇒ 新格式（<用户> / <TGAI> / <思考> / <回答>）
+ *   否则                        ⇒ 旧格式（用户: / TGAI?）
+ * 返回特殊标记个数；0 表示没有（老模型 / 老 .TG 文件）。 */
+TG_EXPORT int tg_has_special(const TGModel* m) {
+    return m ? m->n_special : 0;
+}
+
+/* 返回第 i 个特殊标记的 id；越界返回 -1 */
+TG_EXPORT int tg_special_id(const TGModel* m, int i) {
+    if (!m || i < 0 || i >= m->n_special) return -1;
+    return (int)m->special_id[i];
 }

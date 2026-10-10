@@ -1,0 +1,44 @@
+#version 450
+// TGAI GO 推理内核 ④ —— 数值稳定的 softmax（按行）
+//   1) 减最大值  2) exp  3) 除以和
+// 一个工作组处理一行，local_size = 256
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly  buffer X { float x[]; };
+layout(binding = 1) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform PC {
+    layout(offset = 0) uint n_rows;
+    layout(offset = 4) uint n_cols;
+    layout(offset = 8) uint pad0;
+    layout(offset = 12) uint pad1;
+} pc;
+shared float s_red[256];
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (row >= pc.n_rows) return;
+    uint base = row * pc.n_cols;
+    // ① 最大值
+    float mx = -3.4e38;
+    for (uint i = tid; i < pc.n_cols; i += 256u) mx = max(mx, x[base + i]);
+    s_red[tid] = mx; barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) s_red[tid] = max(s_red[tid], s_red[tid + s]);
+        barrier();
+    }
+    float m = s_red[0]; barrier();
+    // ② exp + 求和
+    float sum = 0.0;
+    for (uint i = tid; i < pc.n_cols; i += 256u) {
+        float e = exp(x[base + i] - m);
+        y[base + i] = e;
+        sum += e;
+    }
+    s_red[tid] = sum; barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) s_red[tid] += s_red[tid + s];
+        barrier();
+    }
+    float inv = 1.0 / s_red[0];
+    // ③ 归一化
+    for (uint i = tid; i < pc.n_cols; i += 256u) y[base + i] *= inv;
+}

@@ -1,0 +1,95 @@
+#version 450
+// ════════════════════════════════════════════════════════════════
+//  TGAI GO 推理内核 ② —— RoPE（旋转位置编码）+ KV Cache 写入
+//
+//  数学（每对 (2i, 2i+1)）：
+//    inv_freq_i = 1 / rope_theta^(2i/head_dim)
+//    theta = pos * inv_freq_i
+//    x' = x*cos(theta) - y*sin(theta)
+//    y' = x*sin(theta) + y*cos(theta)
+//
+//  TGAI V2.7：rope_theta = 10000.0，head_dim = 64，n_heads = 16
+//
+//  ★ 踩坑记录（重要）：
+//    第一版我【就地】改写 qkv buffer（读到 q0/q1 后写回同一位置）。
+//    问题：一个线程处理 pair i，另一个线程可能同时读同一对 ⇒ 竞态。
+//    正确做法：读 QKV(buffer 0) → 写 QOUT(buffer 4) / KVC(buffer 3)。
+//    代价是多一份 Q 的输出缓冲（n_tokens × q_dim × 4 字节，
+//    seq=1 时仅 4 KB，可忽略）。
+//
+//  绑定：
+//    binding 0 : QKV  输入    [n_tokens * (q_dim + 2*kv_dim)]
+//    binding 1 : COS  预计算  [max_seq * half_d]
+//    binding 2 : SIN  预计算  [max_seq * half_d]
+//    binding 3 : KVC  KV cache 输出（K 与 V）
+//    binding 4 : QOUT 旋转后的 Q 输出
+//  推送常量：
+//    0  uint n_tokens
+//    4  uint n_heads
+//    8  uint n_kv_heads
+//    12 uint head_dim
+//    16 uint start_pos
+//    20 uint max_seq
+// ════════════════════════════════════════════════════════════════
+layout(local_size_x = 256) in;
+
+layout(binding = 0) readonly  buffer QKV { float qkv[]; };
+layout(binding = 1) readonly  buffer CS  { float cs[];  };
+layout(binding = 2) readonly  buffer SN  { float sn[];  };
+layout(binding = 3) writeonly buffer KVC { float kvc[]; };
+layout(binding = 4) writeonly buffer QO  { float qo[];  };
+
+layout(push_constant) uniform PC {
+    layout(offset = 0)  uint n_tokens;
+    layout(offset = 4)  uint n_heads;
+    layout(offset = 8)  uint n_kv_heads;
+    layout(offset = 12) uint head_dim;
+    layout(offset = 16) uint start_pos;
+    layout(offset = 20) uint max_seq;
+} pc;
+
+void main() {
+    uint half_d = pc.head_dim >> 1u;
+    uint total = pc.n_tokens * pc.n_heads * half_d;
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= total) return;
+
+    uint pair = gid % half_d;
+    uint head = (gid / half_d) % pc.n_heads;
+    uint tok  = gid / (half_d * pc.n_heads);
+
+    uint q_dim  = pc.n_heads * pc.head_dim;
+    uint kv_dim = pc.n_kv_heads * pc.head_dim;
+    uint tok_stride = q_dim + 2u * kv_dim;
+
+    uint pos = pc.start_pos + tok;
+    float c = cs[pos * half_d + pair];
+    float s = sn[pos * half_d + pair];
+    uint i0 = pair * 2u;
+
+    /* ── Q：读 → 旋转 → 写 QOUT ── */
+    {
+        uint qbase = tok * tok_stride + head * pc.head_dim + i0;
+        float q0 = qkv[qbase];
+        float q1 = qkv[qbase + 1u];
+        uint ob = tok * q_dim + head * pc.head_dim + i0;
+        qo[ob]      = q0 * c - q1 * s;
+        qo[ob + 1u] = q0 * s + q1 * c;
+    }
+
+    /* ── K：读 → 旋转 → 写 KV cache；V：直接写 KV cache ── */
+    if (head < pc.n_kv_heads) {
+        uint kbase = tok * tok_stride + q_dim + head * pc.head_dim + i0;
+        float k0 = qkv[kbase];
+        float k1 = qkv[kbase + 1u];
+        uint kvrow = head * pc.head_dim + i0;
+        uint ko = 0u * pc.max_seq * kv_dim + pos * kv_dim + kvrow;
+        uint vo = 1u * pc.max_seq * kv_dim + pos * kv_dim + kvrow;
+        kvc[ko]      = k0 * c - k1 * s;
+        kvc[ko + 1u] = k0 * s + k1 * c;
+
+        uint vbase = tok * tok_stride + q_dim + kv_dim + head * pc.head_dim + i0;
+        kvc[vo]      = qkv[vbase];
+        kvc[vo + 1u] = qkv[vbase + 1u];
+    }
+}

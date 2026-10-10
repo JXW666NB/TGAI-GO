@@ -1,0 +1,108 @@
+#version 450
+// ════════════════════════════════════════════════════════════════
+//  TGAI GO 推理内核 ⑥ —— MoE 路由（top-k + softmax）
+//
+//  TGAI V2.7 的 MoE 前向（对齐官方 model.py）：
+//    router_logits_raw = router(x)                     [n_experts]
+//    # moe_balance='both' ⇒ 加 Quantile Balancing 偏置
+//    router_logits = raw + qb_bias                     ← ★ TGAI 专属
+//    topk_vals, topk_ids = topk(router_logits, n_activated)   (2 of 8)
+//    router_probs = softmax(topk_vals)                 ← 只在 top-k 上做
+//
+//  ★ 三个 TGAI 专属点（通用引擎没有）：
+//    ① QB 偏置：moe_balance='both' 时 router_logits 要加偏置再做 top-k
+//       偏置由训练时维护（bias = 0.9*bias + 0.1*(-q_0.75(raw))）
+//       数值范围实测 -44..+86，量级与 router logits 相当
+//    ② top-k 之后才 softmax（不是先 softmax 再 top-k）
+//    ③ top-k 用【加偏置后】的 logits 选，但概率用【加偏置后】的值算
+//
+//  实现：一个工作组处理一个 token
+//        local_size = 256，n_experts ≤ 256
+//        每线程负责一个 expert：算 logit → 加偏置 → 归约找 top-2
+//
+//  绑定：
+//    binding 0 : X        输入激活 [d_model]
+//    binding 1 : ROUTER   router 权重（FP32）[n_experts * d_model]
+//    binding 2 : QBBIAS   QB 偏置 [n_experts]（可为空 buffer = 不加）
+//    binding 3 : TOPIDS   输出 top-k 的 expert id [k]
+//    binding 4 : TOPPROB  输出 top-k 的概率 [k]
+//  推送常量：
+//    0  uint n_experts
+//    4  uint d_model
+//    8  uint top_k
+//    12 uint use_qb       1 = 加 QB 偏置
+// ════════════════════════════════════════════════════════════════
+layout(local_size_x = 256) in;
+
+layout(binding = 0) readonly buffer XB  { float x[];      };
+layout(binding = 1) readonly buffer RB  { float router[]; };
+layout(binding = 2) readonly buffer QB  { float qb[];     };
+layout(binding = 3) writeonly buffer TI { uint  topids[]; };
+layout(binding = 4) writeonly buffer TP { float topprob[];};
+
+layout(push_constant) uniform PC {
+    layout(offset = 0)  uint n_experts;
+    layout(offset = 4)  uint d_model;
+    layout(offset = 8)  uint top_k;
+    layout(offset = 12) uint use_qb;
+} pc;
+
+#define MAXE 256
+shared float s_logit[MAXE];
+
+void main() {
+    uint e = gl_LocalInvocationID.x;
+    if (e >= pc.n_experts) return;
+
+    /* ── 算 router logit：点积 ── */
+    const uint base = e * pc.d_model;
+    float acc = 0.0;
+    for (uint i = 0u; i < pc.d_model; i++) {
+        acc += router[base + i] * x[i];
+    }
+    /* ── 加 QB 偏置（TGAI 专属：moe_balance='both'）── */
+    if (pc.use_qb != 0u) acc += qb[e];
+
+    s_logit[e] = acc;
+    barrier();
+
+    /* ── top-k 选择（小 k，直接串行挑最大即可）── */
+    if (e == 0u) {
+        /* 只让线程 0 做，避免复杂归约；k 很小（通常 2）*/
+        uint k = pc.top_k;
+        if (k > pc.n_experts) k = pc.n_experts;
+
+        /* 记录已选的，避免重复选同一个 */
+        bool taken[MAXE];
+        for (uint i = 0u; i < pc.n_experts; i++) taken[i] = false;
+
+        uint ids[MAXE];
+        float vals[MAXE];
+
+        for (uint t = 0u; t < k; t++) {
+            float best = -3.4e38;
+            uint bi = 0u;
+            for (uint i = 0u; i < pc.n_experts; i++) {
+                if (taken[i]) continue;
+                if (s_logit[i] > best) { best = s_logit[i]; bi = i; }
+            }
+            taken[bi] = true;
+            ids[t] = bi;
+            vals[t] = best;
+        }
+
+        /* ── 只在 top-k 上做 softmax（TGAI 的做法）── */
+        float mx = vals[0];
+        for (uint t = 1u; t < k; t++) mx = max(mx, vals[t]);
+        float sum = 0.0;
+        for (uint t = 0u; t < k; t++) {
+            vals[t] = exp(vals[t] - mx);
+            sum += vals[t];
+        }
+        float inv = (sum > 0.0) ? (1.0 / sum) : 0.0;
+        for (uint t = 0u; t < k; t++) {
+            topids[t]  = ids[t];
+            topprob[t] = vals[t] * inv;
+        }
+    }
+}

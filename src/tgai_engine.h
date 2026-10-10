@@ -176,7 +176,7 @@ TG_EXPORT const char* tg_last_error(void);
 
 /**
  * 设置推理线程数 (1 = 单线程, 0 = 自动检测 CPU 核心数)
- * 调用 tg_set_nthreads(0) 自动设置为 CPU 核心数 (最多 TG_MAX_THREADS=8)
+ * 调用 tg_set_nthreads(0) 自动设置为 CPU 核心数 (最多 TG_MAX_THREADS=16)
  * 多线程加速 matmul 和 attention, 在 4-8 核设备上可获 2-4x 加速
  */
 TG_EXPORT void tg_set_nthreads(int n);
@@ -185,6 +185,13 @@ TG_EXPORT void tg_set_nthreads(int n);
  * 获取当前线程数设置
  */
 TG_EXPORT int tg_get_nthreads(void);
+
+/**
+ * 终止线程池并等待线程退出。
+ * 必须在进程退出 / DLL 卸载前调用 (ctypes/Flutter 等场景),
+ * 否则 worker 线程会访问已卸载的 DLL 内存导致崩溃。调用后可重建。
+ */
+TG_EXPORT void tg_engine_shutdown(void);
 
 /**
  * NTK-aware 上下文扩展
@@ -198,12 +205,90 @@ TG_EXPORT int tg_get_nthreads(void);
  */
 TG_EXPORT void tg_set_extend(TGModel* model, int extend_ctx);
 
+/**
+ * 查询当前 Q4_0 直接点积模式是否生效
+ * (由 tg_load 时读取环境变量 TGAI_Q4_DIRECT 决定: 1/0/auto)
+ *
+ * 返回 1 时, 权重缓存不再保留 Q4_0 权重的 FP32 副本
+ * (matmul 直接使用 4-bit 原始数据), 可大幅节省内存。
+ *
+ * 调用方 (如 API 服务器) 据此决定是否调用 tg_preload_all
+ * 全量预解码 — Q4 direct 模式下应跳过, 否则省内存效果失效。
+ */
+TG_EXPORT int tg_q4_direct_enabled(const TGModel* model);
+
+/* ★ BF16 直算开关（2026-10-10 加）
+ *
+ * 开启后 BF16 权重保持 2 字节，矩阵乘时在寄存器内解包（bf16→fp32 就是左移 16 位）。
+ * 实测收益：内存省 50%、速度 1.5~1.8x（本机带宽受限）、数值逐位相同。
+ * 对 TGAI 的 MoE 架构尤其关键：专家 w1/w2/w3 占 V2.7 权重的 93.1%。
+ * 由 tg_load 读环境变量 TGAI_BF16_DIRECT 决定（默认 1，设 0 关闭）。 */
+TG_EXPORT void tg_enable_bf16_direct(TGModel* model, int enable);
+TG_EXPORT int  tg_bf16_direct_enabled(const TGModel* model);
+
 /* ─── NPU 加速接口 (可选, 定义在 tgai_npu.c) ────── */
+
+/* NPU 后端类型 */
+typedef enum {
+    TG_NPU_NONE    = 0,
+    TG_NPU_NNAPI   = 1,
+    TG_NPU_COREML  = 4,
+    TG_NPU_OPENCL  = 5,
+} TGNpuBackend;
+
+/* NPU 运行时模式 */
+typedef enum {
+    TG_NPU_MODE_OFF   = 0,
+    TG_NPU_MODE_AUTO  = 1,
+    TG_NPU_MODE_FORCE = 2,
+} TGNpuMode;
+
+/**
+ * 检测最佳 NPU 后端
+ * 返回可用的最优后端, 无可用则返回 TG_NPU_NONE
+ */
+TG_EXPORT TGNpuBackend tg_npu_detect(void);
+
+/**
+ * 返回 NPU 检测结果 JSON（供 JNI 调用）
+ * 格式: {"available":true,"vendor":"qualcomm","backend":"NNAPI"}
+ * 注意：vendor 字段为通用标识 "android_nnapi"，精确厂商由 Kotlin getDeviceInfo() 判断
+ */
+TG_EXPORT const char* tg_npu_detect_json(void);
+
+/**
+ * 设置 NPU 模式（运行时切换）
+ * mode: 0=off, 1=auto, 2=force
+ * 返回: 1=已启用, 0=未启用（回退 CPU）
+ */
+TG_EXPORT int tg_npu_set_mode(int mode);
+
+/**
+ * 初始化 NPU 后端
+ * 返回 1 成功, 0 失败 (回退 CPU)
+ */
+TG_EXPORT int tg_npu_init(TGNpuBackend backend);
+
 /**
  * NPU 加速矩阵乘法 (如果可用)
  * 返回 1=已加速, 0=回退 CPU
  */
-int tg_npu_matmul(float* out, const float* x, const float* w, int seq, int k, int n);
+TG_EXPORT int tg_npu_matmul(float* out, const float* x, const float* w, int seq, int k, int n);
+
+/**
+ * 获取当前 NPU 后端名称
+ */
+TG_EXPORT const char* tg_npu_current_name(void);
+
+/**
+ * 获取 NPU 后端显示名称（中文友好）
+ */
+TG_EXPORT const char* tg_npu_backend_name(TGNpuBackend b);
+
+/**
+ * 释放所有 NPU 资源（程序退出时调用）
+ */
+TG_EXPORT void tg_npu_shutdown(void);
 
 
 #ifdef __cplusplus

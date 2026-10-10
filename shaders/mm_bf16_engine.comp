@@ -1,0 +1,110 @@
+#version 450
+// ════════════════════════════════════════════════════════════════
+//  ★ BF16 矩阵乘 —— split-K 版（引擎约定版）
+//
+//  ★★ 布局约定（必须与引擎的 _matmul_impl_bf16 一致）：
+//     引擎：
+//       const float* xt = x + t * k;          // x 是 [seq][k]
+//       float* ot = out + t * n;              // out 是 [seq][n]
+//       ot[nn] = bf16_dot(xt, wbf + nn*k, k); // W 是 [n][k]
+//
+//     本内核：
+//       x[(row_k) * seq + tok]      ← [k][seq]
+//       y[(row_n) * seq + tok]      ← [n][seq]
+//
+//     ⚠️ 这两个布局【互为转置】！
+//     第一版我按 [k][seq] 写，桥接层按引擎约定传 [seq][k] ⇒ 输出全错
+//     （实测：生成出"听据此展，有病"这种乱码）
+//
+//     ⇒ 本版改为【直接在算子内部按引擎布局索引】：
+//        x[tok * k + i]        （tok 是 token 序号，i 是输入维）
+//        y[tok * n + row]      （row 是输出维）
+//       ⇒ 桥接层无需转置，语义一目了然。
+//
+//  ★ 性能取舍：
+//     转置访问会让相邻线程读的地址跨度变大（不合并），
+//     但 k=1024、n=4096 时每个线程是顺序读一整行，仍能打满带宽。
+//     若将来要优化，可在权重侧做预转置（一次性）。
+//
+//  split-K 思路（专为 LLM 解码 seq 小设计）：
+//    把 K(=k) 切成 split 段，每段独立算部分和
+//    ⇒ 并行度 × split
+//
+//  线程组织：
+//    out_idx = gl_GlobalInvocationID.x   （0 .. seq*n-1）
+//    seg     = gl_GlobalInvocationID.y   （0 .. split-1）
+//    ⇒ gx = ceil(seq*n / 256), gy = split
+//
+//  ★ 踩坑记录（三个 GLSL 语法坑）：
+//    1) atomicCompSwap 在 GLSL 450 core 里没有 uint 重载（ES 3.1 才有）
+//       ⇒ 改用「分段输出 + CPU 规约」，确定、无竞态
+//    2) GLSL 450 不支持 `uint words[4] = uint[4](...)` 数组构造
+//    3) GLSL 不支持把 buffer 数组当 `const uint*` 传参
+// ════════════════════════════════════════════════════════════════
+layout(local_size_x = 256) in;
+
+layout(binding = 0) readonly  buffer W { uint  w[]; };   // [n][k] 打包（2 个 BF16/uint32）
+layout(binding = 1) readonly  buffer X { float x[]; };   // [seq][k]
+layout(binding = 2) writeonly buffer Y { float yp[]; };  // [split][seq][n] 部分和
+
+layout(push_constant) uniform PC {
+    layout(offset = 0)  uint n;        // 输出维（权重行数）
+    layout(offset = 4)  uint k;        // 输入维（权重列数）
+    layout(offset = 8)  uint seq;      // token 数
+    layout(offset = 12) uint split;
+} pc;
+
+float b2f(uint packed, uint hi) {
+    uint raw = (hi == 0u) ? (packed & 0xFFFFu) : (packed >> 16);
+    return uintBitsToFloat(raw << 16);
+}
+
+void main() {
+    uint total = pc.seq * pc.n;                 /* 输出元素总数 = seq * n */
+    uint idx = gl_GlobalInvocationID.x;         /* 展平的输出下标 */
+    uint seg = gl_GlobalInvocationID.y;
+
+    if (idx >= total || seg >= pc.split || pc.split == 0u) return;
+
+    /* ★ 引擎布局：out 是 [seq][n] ⇒ idx = tok * n + row */
+    uint tok = idx / pc.n;
+    uint row = idx % pc.n;
+
+    uint nw = (pc.k + 1u) / 2u;                 /* 每行几个 uint32 */
+    /* 每段长度：向上取整并【对齐到 8】（保证 BF16 成对 + 循环规整）*/
+    uint per = (pc.k + pc.split - 1u) / pc.split;
+    per = (per + 7u) & ~7u;
+    uint k0 = seg * per;
+    uint k1 = min(k0 + per, pc.k);
+    if (k0 >= pc.k) { yp[seg * total + idx] = 0.0; return; }
+
+    const uint wb = row * nw;                   /* 本行权重在 w[] 里的起点 */
+    /* ★ GLSL 不支持 const float* 指针 ⇒ 用整数基址索引 */
+    uint xb = tok * pc.k;                       /* 本 token 的激活行起点 */
+
+    float acc = 0.0;
+    uint k = k0;
+    /* 主循环：每次 4 个 uint32 = 8 个 BF16（内联，不用指针参数）*/
+    for (; k + 8u <= k1; k += 8u) {
+        uint bi = wb + (k >> 1u);
+        uint p0 = w[bi + 0u];
+        uint p1 = w[bi + 1u];
+        uint p2 = w[bi + 2u];
+        uint p3 = w[bi + 3u];
+        uint kk = k;
+        acc += b2f(p0, 0u) * x[xb + kk + 0u];
+        acc += b2f(p0, 1u) * x[xb + kk + 1u];
+        acc += b2f(p1, 0u) * x[xb + kk + 2u];
+        acc += b2f(p1, 1u) * x[xb + kk + 3u];
+        acc += b2f(p2, 0u) * x[xb + kk + 4u];
+        acc += b2f(p2, 1u) * x[xb + kk + 5u];
+        acc += b2f(p3, 0u) * x[xb + kk + 6u];
+        acc += b2f(p3, 1u) * x[xb + kk + 7u];
+    }
+    /* 尾部标量 */
+    for (; k < k1; k++) {
+        acc += b2f(w[wb + (k >> 1u)], k & 1u) * x[xb + k];
+    }
+
+    yp[seg * total + idx] = acc;
+}

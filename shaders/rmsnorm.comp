@@ -1,0 +1,64 @@
+#version 450
+// ════════════════════════════════════════════════════════════════
+//  TGAI GO 推理内核 ① —— RMSNorm
+//
+//  数学： y[i] = x[i] / sqrt(mean(x^2) + eps) * weight[i]
+//        其中 mean(x^2) 在【最后一维】(d_model) 上求
+//
+//  TGAI V2.7 参数：eps = 1e-6，d_model = 1024
+//
+//  实现：
+//    一个工作组处理一行（一个 token 的 d_model 个元素）
+//    local_size = 256，每线程处理 d_model/256 = 4 个元素
+//    工作组内归约求平方和（共享内存树形归约）
+//
+//  绑定：
+//    binding 0 : X  输入 (FP32)        [n_rows * d]
+//    binding 1 : W  权重 (FP32)        [d]
+//    binding 2 : Y  输出 (FP32)        [n_rows * d]
+//  推送常量：
+//    offset 0 : uint n_rows
+//    offset 4 : uint d
+//    offset 8 : float eps
+// ════════════════════════════════════════════════════════════════
+layout(local_size_x = 256) in;
+
+layout(binding = 0) readonly  buffer XB { float x[]; };
+layout(binding = 1) readonly  buffer WB { float w[]; };
+layout(binding = 2) writeonly buffer YB { float y[]; };
+
+layout(push_constant) uniform PC {
+    layout(offset = 0)  uint  n_rows;
+    layout(offset = 4)  uint  d;
+    layout(offset = 8)  float eps;
+    layout(offset = 12) uint  _pad;
+} pc;
+
+shared float s_part[256];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (row >= pc.n_rows) return;
+
+    uint base = row * pc.d;
+    float acc = 0.0;
+    for (uint i = tid; i < pc.d; i += 256u) {
+        float v = x[base + i];
+        acc += v * v;
+    }
+    s_part[tid] = acc;
+    barrier();
+
+    /* 树形归约 */
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) s_part[tid] += s_part[tid + s];
+        barrier();
+    }
+    float mean_sq = s_part[0] / float(pc.d);
+    float rstd = inversesqrt(mean_sq + pc.eps);
+
+    for (uint i = tid; i < pc.d; i += 256u) {
+        y[base + i] = x[base + i] * rstd * w[i];
+    }
+}

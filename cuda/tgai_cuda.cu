@@ -312,8 +312,15 @@ static int copy_weight_to_gpu(TGModel *m, const char *name, float **d_ptr) {
 static int _load_cuda_impl(TGModel *m, CudaModel *cm) {
     const TGHeader *hdr = tg_config(m);
     if (!hdr) return -1;
-    if (hdr->version != 1 && hdr->version != 2) {
-        fprintf(stderr, "[CUDA] unsupported format version %u (expected 1 or 2)\n", hdr->version);
+    /* v3 兼容 (Task 27b): 接受 v1/v2/v3
+     * - v1: PyTorch 导出的原始格式
+     * - v2: 中间版本 (未实际使用, 保留兼容)
+     * - v3: ORV 产出 + 多模态 (modality_flags + extension_off)
+     *   v3 多模态文件: tg_load 在 TG_ENABLE_MM 模式下已接受并加载文本部分,
+     *   子模型由 tg_mm_load 解析 (见 build_cuda.sh -DTG_ENABLE_MM)
+     *   v3 纯文本 (flags=TEXT, ext_off=0): 与 v1 二进制等价 */
+    if (hdr->version != 1 && hdr->version != 2 && hdr->version != 3) {
+        fprintf(stderr, "[CUDA] unsupported format version %u (expected 1/2/3)\n", hdr->version);
         return -1;
     }
     cm->n_layers    = (int)hdr->n_layers;
@@ -860,3 +867,81 @@ const float *tg_cuda_forward(void* handle, const int32_t *input_ids, int seq_len
     cudaMemcpy(cm->h_logits, cm->d_logits, (size_t)v * sizeof(float), cudaMemcpyDeviceToHost);
     return cm->h_logits;
 }
+
+/* ═══════════════════════════════════════════════════════════════
+ *  多模态双线推理入口 (TG_ENABLE_MM 启用时)
+ *
+ *  设计 (LLM 走 GPU, 子模型走 CPU — 业界标准做法):
+ *    1. tg_mm_load (CPU) 加载整个 .TG v3 文件 (LLM + 子模型)
+ *    2. tg_cuda_load 把 LLM 权重上 GPU (cuBLAS kernel 加速)
+ *    3. 子模型 (DiT/VAE/AudioCodec) 保留在 CPU (复用 src/mm/*.c, 已 19/19 PASS)
+ *
+ *  双线推理路径:
+ *    - GPU: tg_cuda_forward(cm->cuda_handle, ...)  → LLM 推理 (高频)
+ *    - CPU: tg_mm_text_to_image(cm->mm, ...)        → 文生图 (低频)
+ *    - CPU: tg_mm_tokens_to_audio(cm->mm, ...)      → 音频 (低频)
+ *
+ *  GPU 不可用时: cuda_handle=NULL, 用 tg_mm_get_text_model(cm->mm)
+ *    取 TGModel* 走 tg_forward (CPU 回退, 与纯 CPU 版完全一致)
+ * ═══════════════════════════════════════════════════════════════ */
+#ifdef TG_ENABLE_MM
+TGCudaMM* tg_cuda_mm_load(const char* path, int use_mmap, TGError* out_err) {
+    if (!path) {
+        if (out_err) *out_err = TG_ERR_INVALID;
+        return NULL;
+    }
+    /* 1. CPU 加载整个 v3 文件 (LLM + 子模型) — tg_mm_load 内部调用 tg_load */
+    TGError err = TG_OK;
+    TGMultiModal* mm = tg_mm_load(path, use_mmap, &err);
+    if (!mm) {
+        fprintf(stderr, "[CUDA-MM] tg_mm_load 失败: err=%d\n", (int)err);
+        if (out_err) *out_err = err;
+        return NULL;
+    }
+    TGCudaMM* cm = (TGCudaMM*)calloc(1, sizeof(TGCudaMM));
+    if (!cm) {
+        tg_mm_free(mm);
+        if (out_err) *out_err = TG_ERR_OOM;
+        return NULL;
+    }
+    cm->mm = mm;
+
+    /* 2. 取 LLM text_model, 尝试上 GPU (失败则回退 CPU, text_model 仍在 mm) */
+    TGModel* m = tg_mm_get_text_model(mm);
+    if (m && tg_cuda_available()) {
+        cm->cuda_handle = tg_cuda_load(m);
+        if (cm->cuda_handle) {
+            printf("[CUDA-MM] LLM 已上 GPU, 子模型留 CPU (双线推理就绪)\n");
+        } else {
+            /* GPU 加载失败: 不算致命, 回退 CPU (text_model 仍在 mm, 可走 tg_forward) */
+            fprintf(stderr, "[CUDA-MM] GPU 加载失败, 回退 CPU (tg_forward)\n");
+            cm->cuda_handle = NULL;
+        }
+    } else if (!m) {
+        fprintf(stderr, "[CUDA-MM] 无文本模型 (纯多模态文件?), 仅子模型可用\n");
+    } else {
+        printf("[CUDA-MM] 无 GPU, 全 CPU 模式 (LLM + 子模型都在 CPU)\n");
+    }
+
+    if (out_err) *out_err = TG_OK;
+    return cm;
+}
+
+void tg_cuda_mm_free(TGCudaMM* cm) {
+    if (!cm) return;
+    /* 先释放 GPU (LLM), 再释放 mm (CPU 子模型 + text_model)
+     * 注意: text_model 被 cuda_handle 引用 (上 GPU 时拷贝权重),
+     * tg_cuda_free 只释放 GPU 端拷贝, 不影响 CPU 端 text_model,
+     * 所以释放顺序无关紧要, 但遵循 "先 GPU 后 CPU" 的惯例 */
+    if (cm->cuda_handle) {
+        tg_cuda_free(cm->cuda_handle);
+        cm->cuda_handle = NULL;
+    }
+    if (cm->mm) {
+        tg_mm_free(cm->mm);
+        cm->mm = NULL;
+    }
+    free(cm);
+    printf("[CUDA-MM] 已释放\n");
+}
+#endif /* TG_ENABLE_MM */

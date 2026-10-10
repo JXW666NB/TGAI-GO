@@ -1,0 +1,93 @@
+#version 450
+// ════════════════════════════════════════════════════════════════
+//  ★ BF16 矩阵乘 —— split-K 版（专为 LLM 解码 seq 小 的场景）
+//
+//  为什么不用「行分块 + RPT」（实测踩过）：
+//    LLM 生成时 seq=1 ⇒ 矩阵乘 [n_out x n_in] × [n_in x 1]
+//    行分块按 16x16 组织线程 ⇒ 列方向 15/16 线程闲置
+//    且每线程串行 n_in/2 = 512 次 ⇒ 并行度不足，打不满带宽
+//
+//  ★ split-K 思路：
+//    把 K(=n_in) 切成 split 段，每段独立算部分和
+//    ⇒ 并行度 × split，每线程串行次数 ÷ split
+//
+//  线程组织：
+//    out_idx = gl_GlobalInvocationID.x   （0 .. n_out*seq-1）
+//    seg     = gl_GlobalInvocationID.y   （0 .. split-1）
+//    ⇒ gx = ceil(n_out*seq / 256), gy = split
+//
+//  ★ 踩坑记录（三个 GLSL 语法坑，都是实测撞出来的）：
+//    1) atomicCompSwap 在 GLSL 450 core 里没有 uint 重载
+//       （那是 GLSL ES 3.1 特性）
+//       ⇒ 改用「分段输出 + CPU 规约」，完全确定、无竞态
+//          代价：多一份 split× 临时显存（seq=1、split=8 时仅 128 KB）
+//    2) GLSL 450 不支持 `uint words[4] = uint[4](a,b,c,d);` 数组构造
+//    3) GLSL 不支持把 buffer 里的 `uint w[]` 当 `const uint*` 传参
+//       ⇒ 把取值逻辑内联进循环，不抽函数
+// ════════════════════════════════════════════════════════════════
+layout(local_size_x = 256) in;
+
+layout(binding = 0) readonly  buffer W { uint  w[]; };
+layout(binding = 1) readonly  buffer X { float x[]; };
+layout(binding = 2) writeonly buffer Y { float yp[]; };   // 分段部分和
+
+layout(push_constant) uniform PC {
+    layout(offset = 0)  uint n_out;
+    layout(offset = 4)  uint n_in;
+    layout(offset = 8)  uint seq;
+    layout(offset = 12) uint split;
+} pc;
+
+float b2f(uint packed, uint hi) {
+    uint raw = (hi == 0u) ? (packed & 0xFFFFu) : (packed >> 16);
+    return uintBitsToFloat(raw << 16);
+}
+
+void main() {
+    uint out_idx = gl_GlobalInvocationID.x;
+    uint seg     = gl_GlobalInvocationID.y;
+
+    uint total = pc.n_out * pc.seq;
+    if (out_idx >= total || seg >= pc.split || pc.split == 0u) return;
+
+    uint col = out_idx % pc.seq;
+    uint row = out_idx / pc.seq;
+
+    uint nw = (pc.n_in + 1u) / 2u;
+    /* 每段长度：向上取整并【对齐到 8】*/
+    uint per = (pc.n_in + pc.split - 1u) / pc.split;
+    per = (per + 7u) & ~7u;
+    uint k0 = seg * per;
+    uint k1 = min(k0 + per, pc.n_in);
+    uint wb = row * nw;                       // 本行权重在 w[] 里的起点
+    uint stride = pc.seq;
+
+    if (k0 >= pc.n_in) { yp[seg * total + out_idx] = 0.0; return; }
+
+    float acc = 0.0;
+
+    /* ── 主循环：每次 4 个 uint32 = 8 个 BF16（内联，不用指针参数）── */
+    uint k = k0;
+    for (; k + 8u <= k1; k += 8u) {
+        uint bi = wb + (k >> 1u);
+        uint p0 = w[bi + 0u];
+        uint p1 = w[bi + 1u];
+        uint p2 = w[bi + 2u];
+        uint p3 = w[bi + 3u];
+        uint kk = k;
+        acc += b2f(p0, 0u) * x[kk * stride + col];
+        acc += b2f(p0, 1u) * x[(kk + 1u) * stride + col];
+        acc += b2f(p1, 0u) * x[(kk + 2u) * stride + col];
+        acc += b2f(p1, 1u) * x[(kk + 3u) * stride + col];
+        acc += b2f(p2, 0u) * x[(kk + 4u) * stride + col];
+        acc += b2f(p2, 1u) * x[(kk + 5u) * stride + col];
+        acc += b2f(p3, 0u) * x[(kk + 6u) * stride + col];
+        acc += b2f(p3, 1u) * x[(kk + 7u) * stride + col];
+    }
+    /* ── 尾部标量 ── */
+    for (; k < k1; k++) {
+        acc += b2f(w[wb + (k >> 1u)], k & 1u) * x[k * stride + col];
+    }
+
+    yp[seg * total + out_idx] = acc;
+}

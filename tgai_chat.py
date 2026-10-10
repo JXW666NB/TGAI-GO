@@ -66,7 +66,9 @@ SOFT_STOP_AFTER = _env_f('TGAI_SOFT_STOP_AFTER', 256)
 # ★ EOS 概率上限（用户要求：渐升但封顶 99%，永不强制到 100%）
 #   实现方式：按目标概率反解所需 logit，而不是直接给 logit 加常数
 #   （加常数时概率只会渐进趋近 100%，没有真上限）。
-SOFT_STOP_MAX_P = _env_f('TGAI_SOFT_STOP_MAX_P', 0.99)
+# ★ 最大 logit 加常数（用户可设）。logit +1≈概率×2.7、+3≈×20、+5≈×148。
+#   logit 加常数 ⇒ 概率渐进趋近 100% 但永不到达，天然满足"不强制"。
+SOFT_STOP_MAX_LOGIT = _env_f('TGAI_SOFT_STOP_MAX_LOGIT', 3.0)
 
 # ══════════════════════════════════════════════════════════════
 #  ★ 代码块内的防复读参数（2026-10-10 加）
@@ -88,14 +90,11 @@ CODE_FREQ_PENALTY = _env_f('TGAI_CODE_FREQ_PENALTY', 0.1)
 # ★ 取值教训：曾用 0.12 —— _code_len=100 时偏置达 +12.0 logit（概率差 16 万倍），
 #   模型立刻狂吐 <回答> 标记污染代码（实测出现 `A list of <回答>` 刷屏）。
 #   0.02 在 _code_len=100 时只 +2.0，属"温和推动"量级。
-# ★ 围栏闭合的【概率】控制（用户设计：概率随长度上升到 99% 封顶）
-#   CODE_CLOSE_MAX_P : 目标概率上限（0.95 = 95%，永不强制到 100%）
-#   CODE_CLOSE_GAIN  : 每多写 1 个 token 给闭合概率加的绝对量
-#                      （0.002 ⇒ 写 100 token 时从 ~0 升到 0.20）
-#   CODE_CLOSE_SMOOTH: 目标 logit 的平滑系数（1.0=完全按目标概率；<1 更温和）
-CODE_CLOSE_MAX_P = _env_f('TGAI_CODE_CLOSE_MAX_P', 0.99)
-CODE_CLOSE_GAIN = _env_f('TGAI_CODE_CLOSE_GAIN', 0.001)
-CODE_CLOSE_SMOOTH = _env_f('TGAI_CODE_CLOSE_SMOOTH', 0.6)
+# ★ 围栏闭合控制（用户设计：线性斜坡 + 可设最大 logit）
+#   bias = min(CODE_CLOSE_MAX_LOGIT, 代码长度 * CODE_CLOSE_SLOPE)
+CODE_CLOSE_MAX_LOGIT = _env_f('TGAI_CODE_CLOSE_MAX_LOGIT', 3.0)
+# 每多写 1 个 token 给闭合反引号加的 logit（线性斜坡斜率）
+CODE_CLOSE_SLOPE = _env_f('TGAI_CODE_CLOSE_SLOPE', 0.03)
 
 DLL_CANDIDATES = [
     os.path.join(SCRIPT_DIR, 'cpu', 'build', 'libtgai_engine.dll'),
@@ -641,10 +640,19 @@ def sample_numpy(logits, temp, top_k, top_p, vocab, p=None, recent=None,
     #        soft_stop_after     已生成多少 token 后开始施加（两者取先到）
     #        eos_ids            本轮所有停止符 id（含轮次标记）
     #
-    #  ★ 2026-10-10 改：从"logit 线性斜坡"改为【按目标概率反解 logit】。
-    #    原因（用户要求"渐升但封顶 95%"）：
-    #      直接给 logit 加常数时，EOS 概率会【渐进趋近 100%】——虽然永远到不了，
-    #      但没有真正的上限。按概率反解才能真正把概率压到 SOFT_STOP_MAX_P。
+    #  ★ 2026-10-10 定版（用户设计）：线性斜坡 + 用户可设【最大 logit 加常数】
+    #
+    #    公式：  k     = max(已生成 - start_after, start_at_remain - 剩余)
+    #            bias  = min(SOFT_STOP_MAX_LOGIT, k * SOFT_STOP_SLOPE)
+    #            arr[eos] += bias        （对所有停止符）
+    #
+    #    为什么回到 logit 而不是"按目标概率反解"（上一版的尝试）：
+    #      · logit 加常数时，EOS 概率【渐进趋近 100% 但永不到达】——
+    #        这本身就满足"不强制"的要求，且实现简单、行为可预期；
+    #      · 按概率反解要额外做 exp/求和，还依赖当时所有 token 的分布，
+    #        参数含义不直观（用户无法预估"设 0.99 会怎样"）。
+    #      · 用户明确要"logit 线性斜坡 + 可设最大加常数"⇒ 采用此方案。
+    #    调参直觉：logit +1 ≈ 概率提升 e^1≈2.7 倍；+3 ≈ 20 倍；+5 ≈ 148 倍。
     _spt = float(p.get('soft_stop_per_tok', SOFT_STOP_PER_TOK) or 0.0)
     if _spt > 0.0 and eos_ids:
         _n_remain = max_tok - step
@@ -652,26 +660,10 @@ def sample_numpy(logits, temp, top_k, top_p, vocab, p=None, recent=None,
         _at_rem = float(p.get('soft_stop_at_remain', SOFT_STOP_AT_REMAIN) or 0) - _n_remain
         _k = _after if _after > _at_rem else _at_rem
         if _k > 0.0:
-            _mx = arr.max()
-            if np.isfinite(_mx):
-                _ex = np.exp(arr - _mx)
-                _tot = float(_ex.sum())
-                # 各 EOS 当前概率之和；目标：线性升到 SOFT_STOP_MAX_P 封顶
-                _p_cur = sum(float(_ex[_e]) / _tot for _e in eos_ids
-                             if 0 <= _e < arr.size) if _tot > 0 else 0.0
-                _p_tgt = min(SOFT_STOP_MAX_P, _p_cur + _k * _spt * 0.01)
-                if _p_tgt > _p_cur and _p_tgt < 1.0:
-                    _ei = [e for e in eos_ids if 0 <= e < arr.size]
-                    if _ei:
-                        _rest = _tot - sum(float(_ex[e]) for e in _ei)
-                        if _rest > 0:
-                            _ex_need = _rest * _p_tgt / (1.0 - _p_tgt)
-                            _ex_have = sum(float(_ex[e]) for e in _ei)
-                            if _ex_have > 0:
-                                _d = float(np.log(_ex_need)) - float(np.log(_ex_have))
-                                for _e in _ei:
-                                    if np.isfinite(arr[_e]):
-                                        arr[_e] += _d
+            _bias = min(SOFT_STOP_MAX_LOGIT, _k * _spt)
+            for _e in eos_ids:
+                if 0 <= _e < arr.size and np.isfinite(arr[_e]):
+                    arr[_e] += _bias
 
     # ③ 温度
     arr = arr / max(float(temp), 0.01)
@@ -1184,34 +1176,23 @@ def generate(engine, input_ids, params, eos_id, eos_set=None, kv=None):
                 #    拿它当停止符会截断正常回答；实测用它当偏置目标时，
                 #    模型会开始往代码里吐 `<回答>` 文本（`A list of <回答>` 刷屏）。
                 #
-                #  为什么用"按概率反解 logit"而不是直接加常数偏置：
-                #    直接加 logit 常数时，"加多少"与"实际概率"是非线性关系，
-                #    长度一长就压不住（或反过来压爆）。按目标概率反解才能精确
-                #    控制到 95% 这个上限。
+                #  ★ 2026-10-10 定版（用户设计）：与框外 Soft-Stop 用【同一套逻辑】
+                #      bias = min(CODE_CLOSE_MAX_LOGIT, _code_len * CODE_CLOSE_SLOPE)
+                #      arr[反引号] += bias
+                #    即：线性斜坡 + 用户可设的最大 logit 加常数。
+                #    logit 加常数 ⇒ 闭合概率渐进趋近 100% 但永不到达，
+                #    天然满足"不强制"；且参数含义直观（+3 ≈ 概率 20 倍）。
                 if closing_tid >= 0 and _code_len > 0 and _at_line_start:
                     # ★ 只在【行首】施加（2026-10-10 修，踩坑后加）
-                    #   踩坑：不分位置地把反引号概率抬到 95%，代码被污染成
+                    #   踩坑：不分位置地抬高反引号概率，代码被污染成
                     #         `u'])  /  generate_`print()  /  `bubble_sort(...)`
                     #         —— 反引号在代码里天然高频（字典 {'a'}、字符串模板），
-                    #         单独抬它的概率等于到处乱吐。
-                    #   正解：闭合围栏一定出现在【行首】，而代码行首几乎不会是
-                    #         反引号 ⇒ 只在行首施加偏置，既能把围栏逼出来，
-                    #         又不会污染代码内部。
-                    _mx = arr.max()
-                    if np.isfinite(_mx):
-                        _ex = np.exp(arr - _mx)
-                        _tot = _ex.sum()
-                        _pc = float(_ex[closing_tid]) / _tot if _tot > 0 else 0.0
-                        # 目标概率：随长度线性上升到 CODE_CLOSE_MAX_P，封顶
-                        _pt = min(CODE_CLOSE_MAX_P,
-                                  _pc + _code_len * CODE_CLOSE_GAIN)
-                        if _pt > _pc:
-                            # 解所需 logit：需要 (sum_ex - ex_c) * _pt/(1-_pt) 作为新的 ex_c
-                            _rest = _tot - float(_ex[closing_tid])
-                            if _rest > 0 and _pt < 1.0:
-                                _ex_need = _rest * _pt / (1.0 - _pt)
-                                _bias = float(np.log(_ex_need)) - float(np.log(float(_ex[closing_tid])))
-                                arr[closing_tid] += _bias * CODE_CLOSE_SMOOTH
+                    #         单独抬它等于到处乱吐。
+                    #   正解：闭合围栏必在【行首】，而代码行首几乎不会是反引号
+                    #         ⇒ 只在行首施加偏置，既能把围栏逼出来，又不污染代码内部。
+                    if np.isfinite(arr[closing_tid]):
+                        arr[closing_tid] += min(CODE_CLOSE_MAX_LOGIT,
+                                                _code_len * CODE_CLOSE_SLOPE)
 
             tid = sample_numpy(arr, temp, top_k, top_p, vocab,
                                p=params, recent=_recent,

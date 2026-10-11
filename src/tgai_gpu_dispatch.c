@@ -8,7 +8,18 @@
  *      int  tg_gpu_matmul(float* out, const float* x, const float* w,
  *                         int seq, int k, int n);
  *      int  tg_gpu_backend_init(void);
- *      void tg_gpu_backend_shutdown(void);
+ *      /* ── 对外：查询后端状态（2026-10-11 加，给 Python 侧显示用）────────
+ *  返回一段人类可读的说明，包含：
+ *    走的哪个后端 / 设备名 / 是否独显 / 显存与模型大小 / 为什么没走 GPU
+ *  ★ 项目原则：不许静默回落 —— 用户必须能知道"到底走没走 GPU、为什么"。
+ *  ★ 在 init 之前调用也安全（返回"未初始化"），不会崩。
+ */
+const char* tg_gpu_backend_info(void) {
+    if (!g_inited) return g_reason[0] ? g_reason : "未初始化";
+    return g_reason;
+}
+
+void tg_gpu_backend_shutdown(void);
  *
  *  ══════════════════════════════════════════════════════════════
  *  一、数值契约（★ 这是本文件最容易写错的地方，先钉死）
@@ -122,6 +133,29 @@
 #define GD_POOL_SLOTS        8        /* 激活/部分和缓冲池 */
 
 /* ══════════════════════════════════════════════════════════════
+ *  独立显卡判定（2026-10-11 加，用户要求）
+ *
+ *  用户原话：
+ *    "由于本机的核显，和CPU抢内存通道因此慢是肯定的
+ *     但是检测到独立显卡就接线（但是门槛是显存要装得下所加载的模型）"
+ *
+ *  设计：
+ *    · 核显（device_type=1 / is_uma=1）与 CPU 共享内存控制器，
+ *      一起跑只会互相抢带宽 ⇒ 走原来的 FLOP 门槛（默认基本不用 GPU）
+ *    · 独立显卡有【独立显存 + 独立内存控制器】⇒ 不抢系统内存通道。
+ *      此时唯一的硬门槛是"显存装不装得下模型"：
+ *        装得下 → 权重常驻显存，后续每 token 只传激活 ⇒ 全量走 GPU
+ *        装不下 → 每 token 要重传权重（1.7 GB 级），必然更慢 ⇒ 回落 CPU
+ *
+ *  模型大小从哪来：
+ *    dispatch 层拿不到 TGModel 内部（它是不透明结构，且本文件不链接引擎）。
+ *    由调用方（Python 的 tgai_go，它知道 .TG 文件大小）通过环境变量传入：
+ *        TG_GPU_MODEL_MB   模型文件大小（MB）
+ *    未提供时退化：仅按独显 + 显存总量判断（乐观），但会记录原因。
+ * ══════════════════════════════════════════════════════════════ */
+#define GD_DEF_VRAM_HEADROOM 1.25    /* 显存需 ≥ 模型 × 1.25（KV/激活/驱动余量）*/
+
+/* ══════════════════════════════════════════════════════════════
  *  模块状态
  * ══════════════════════════════════════════════════════════════ */
 typedef struct {
@@ -154,6 +188,12 @@ typedef struct {
 
     char    device[256];
     char    spv_dir[512];
+
+    /* ── 独显接线判定结果（一次性，init 时定）── */
+    int     is_discrete;      /* 1 = 选定的是独立显卡 */
+    int     model_fits;       /* 1 = 显存装得下模型（或未知）*/
+    uint64_t vram_bytes;      /* 选定设备的显存总量 */
+    uint64_t model_bytes;     /* 模型文件大小（0 = 未知）*/
 
     uint64_t st_calls;        /* 进入 tg_gpu_matmul 的总次数 */
     uint64_t st_gpu_ok;       /* 真正由 GPU 完成的次数 */
@@ -507,6 +547,46 @@ static int gd_init(void) {
     } else {
         _snprintf_s(g.device, sizeof(g.device), _TRUNCATE, "unknown");
     }
+    /* ── ⑤b 独显判定 + 显存门槛（2026-10-11 加）──────────────────
+     *  用户要求："检测到独立显卡就接线，但门槛是显存要装得下所加载的模型"
+     *
+     *  ★ 为什么核显不能这么干：
+     *    核显与 CPU 共享内存控制器（UMA），两边一起跑只是互相抢带宽。
+     *    实测本机 AMD 核显：多线程 CPU 107 GFLOP/s vs 核显 48 GFLOP/s，
+     *    交叉点 250~270 MFLOP ⇒ 小算子核显必输。
+     *  ★ 独显为什么可以：
+     *    有独立显存与独立内存控制器，不占系统内存通道。
+     *    只要权重能常驻显存，每 token 就只传激活（KB 级）而不用重传
+     *    1.7 GB 权重 ⇒ 换成"显存带宽"这条更快的路。
+     */
+    g.vram_bytes = di ? (uint64_t)di->heap_bytes : 0;
+    g.is_discrete = (di && di->device_type == 2) ? 1 : 0;
+    g.model_bytes = (uint64_t)gd_env_ll("TG_GPU_MODEL_MB", 0) * 1024ull * 1024ull;
+
+    /* ── 测试后门（无独显的机器上验证独显分支的代码路径）──
+     *  TG_GPU_FORCE_DISCRETE=1  假装是独显（仅用于测试判定逻辑，
+     *   不会改变真实硬件探测结果以外的任何行为）
+     *  TG_GPU_FORCE_VRAM_MB=N   假装显存 N MB（默认用真实 heap_bytes）
+     *  ★ 明确命名 FORCE，避免运维误用；生产环境不要设。 */
+    if (gd_env_ll("TG_GPU_FORCE_DISCRETE", 0)) {
+        g.is_discrete = 1;
+        long long fv = gd_env_ll("TG_GPU_FORCE_VRAM_MB", 0);
+        if (fv > 0) g.vram_bytes = (uint64_t)fv * 1024ull * 1024ull;
+    }
+
+    if (g.is_discrete && g.vram_bytes > 0) {
+        if (g.model_bytes > 0) {
+            double need = (double)g.model_bytes *
+                          gd_env_dbl("TG_GPU_VRAM_HEADROOM", GD_DEF_VRAM_HEADROOM);
+            g.model_fits = ((double)g.vram_bytes >= need) ? 1 : 0;
+        } else {
+            /* 调用方没给模型大小 ⇒ 乐观放行，但在 reason 里讲清楚 */
+            g.model_fits = 1;
+        }
+    } else {
+        g.model_fits = 0;      /* 核显 / 未知设备 ⇒ 不启用"独显模式" */
+    }
+
     long long mb = gd_env_ll("TG_GPU_WCACHE_MB", -1);
     if (mb < 0) {
         uint64_t heap = di ? di->heap_bytes : 0;
@@ -518,9 +598,28 @@ static int gd_init(void) {
     }
 
     _snprintf_s(g_backend, sizeof(g_backend), _TRUNCATE, "vulkan");
-    _snprintf_s(g_reason, sizeof(g_reason), _TRUNCATE,
-                "就绪：%s（SPIR-V: %s，权重缓存预算 %.0f MB）",
-                g.device, g.spv_dir, (double)g.wcache_budget / (1024.0 * 1024.0));
+    if (g.is_discrete && g.model_fits) {
+        _snprintf_s(g_reason, sizeof(g_reason), _TRUNCATE,
+                    "就绪：独立显卡 %s（显存 %.0f MB%s，权重缓存预算 %.0f MB）"
+                    " ⇒ 全量走 GPU",
+                    g.device, (double)g.vram_bytes / (1024.0 * 1024.0),
+                    g.model_bytes ? "" : "／模型大小未知，按乐观处理",
+                    (double)g.wcache_budget / (1024.0 * 1024.0));
+    } else if (g.is_discrete && !g.model_fits) {
+        _snprintf_s(g_reason, sizeof(g_reason), _TRUNCATE,
+                    "独立显卡 %s 显存 %.0f MB 装不下模型 %.0f MB（需 %.2fx 余量）"
+                    " ⇒ 回落 CPU 门槛判定",
+                    g.device, (double)g.vram_bytes / (1024.0 * 1024.0),
+                    (double)g.model_bytes / (1024.0 * 1024.0),
+                    gd_env_dbl("TG_GPU_VRAM_HEADROOM", GD_DEF_VRAM_HEADROOM));
+    } else {
+        _snprintf_s(g_reason, sizeof(g_reason), _TRUNCATE,
+                    "就绪但非独显：%s（%s，显存/共享内存 %.0f MB，"
+                    "权重缓存预算 %.0f MB）⇒ 按 FLOP 门槛决定是否上 GPU",
+                    g.device, di && di->is_uma ? "核显 UMA，与 CPU 共享内存通道" : "非独显",
+                    (double)g.vram_bytes / (1024.0 * 1024.0),
+                    (double)g.wcache_budget / (1024.0 * 1024.0));
+    }
     g_inited = 1;
     g_fatal = 0;
     return 1;
@@ -534,6 +633,17 @@ static int gd_worth_gpu(int seq, int k, int n) {
     /* 内核总输出元素数上限：gx ≤ 65535 workgroup、每 workgroup 256 线程
      * （见 tg_vk_kernel_mm_bf16 里的 total 检查）*/
     if ((uint64_t)n * (uint64_t)seq > 65535ull * 256ull) return 0;
+
+    /* ── ★ 独显模式：模型已能常驻显存 ⇒ 跳过所有"性价比"门槛 ──
+     *  理由（用户要求："检测到独立显卡就接线，门槛是显存装得下模型"）：
+     *    下面的 FLOP 门槛是为【核显】定的 —— 核显与 CPU 共享内存控制器，
+     *    小算子上必然打不过多线程 CPU（实测交叉点 250~270 MFLOP）。
+     *    独立显卡有独立显存与独立内存通道，权重一次上传后每 token 只传
+     *    激活（KB 级）⇒ 即使算子很小，用 GPU 也不会拖慢 CPU
+     *    （CPU 此时几乎空闲，正好把活全交给 GPU）。
+     *  只保留上面的【内核结构限制】（workgroup 数量上限等），那是硬约束。
+     */
+    if (g.is_discrete && g.model_fits) return 1;
 
     double flops = 2.0 * (double)n * (double)k * (double)seq;
     double min_flops = gd_env_dbl("TG_GPU_MIN_FLOPS", GD_DEF_MIN_FLOPS);

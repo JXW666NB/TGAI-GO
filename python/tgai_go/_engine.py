@@ -215,6 +215,51 @@ class TGEngine:
         if not self.kvcache: raise RuntimeError("KV cache failed")
         self.kvcache_pos = 0
 
+        # ── GPU 后端初始化（2026-10-11 加，用户要求）────────────────
+        #   用户原话："检测到独立显卡就接线（门槛是显存要装得下所加载的模型）"
+        #
+        #   做三件事：
+        #     ① 把模型文件大小告诉原生层（它拿不到 TGModel 内部，
+        #        而"装得下"的判定正需要这个数）
+        #     ② 调 tg_gpu_backend_init() 触发探测
+        #     ③ 把原生层给出的原因打印出来 —— 让用户知道到底走没走 GPU、
+        #        没走的话为什么（这个项目的原则：不许静默回落）
+        #
+        #   ★ 原生层未接 GPU 时这两个符号不存在（AttributeError）⇒ 静默跳过，
+        #     保持"pip 包纯 CPU 也能用"的兼容性。
+        #   ★ 任何异常都不影响加载 —— GPU 永远是可选加速，不是必需。
+        self.gpu_info = None
+        try:
+            _mb = int(os.path.getsize(tg_path) // (1024 * 1024))
+            os.environ['TG_GPU_MODEL_MB'] = str(_mb)
+            self.lib.tg_gpu_backend_init.restype = ctypes.c_int
+            _ok = int(self.lib.tg_gpu_backend_init())
+            # 取后端名与原因（原生层已有 tg_gpu_backend_name/reason；
+            # 缺失时说明是旧 DLL，静默降级）
+            _name = _why = b''
+            try:
+                self.lib.tg_gpu_backend_name.restype = ctypes.c_char_p
+                self.lib.tg_gpu_backend_reason.restype = ctypes.c_char_p
+                _name = self.lib.tg_gpu_backend_name() or b''
+                _why = self.lib.tg_gpu_backend_reason() or b''
+            except AttributeError:
+                pass
+            self.gpu_info = {
+                'ready': bool(_ok),
+                'backend': _name.decode('utf-8', 'replace'),
+                'model_mb': _mb,
+                'reason': _why.decode('utf-8', 'replace'),
+            }
+            if _ok:
+                log.info("GPU backend: %s", self.gpu_info['reason'] or 'ready')
+            else:
+                log.info("GPU backend 未启用: %s",
+                         self.gpu_info['reason'] or '原生层返回 0')
+        except AttributeError:
+            pass                      # 引擎没接 GPU 钩子（旧 DLL）——正常
+        except Exception as _e:                                     # noqa: BLE001
+            log.info("GPU backend 初始化跳过: %s", _e)
+
         # ── 加载 sidecar 分词器 (大词表模型专用) ──
         # 只查模型专属 sidecar: <model.TG>.tokenizer.json (GGUF 转换时导出)
         # 不查目录级 tokenizer.json — TGAI checkpoints 目录有旧版自定义格式,

@@ -2469,6 +2469,18 @@ TG_EXPORT int tg_gpu_matmul(float* out, const float* x, const float* w, int seq,
 #if !defined(TG_LINK_GPU_SEPARATE)
 TG_EXPORT int tg_gpu_backend_init(void) { return 0; }
 TG_EXPORT void tg_gpu_backend_shutdown(void) { }
+/* 状态查询空桩 —— 让"未接 GPU"也能被查询，调用方不必区分 |
+   ★ 必须提供，否则 Python 侧 os.path.getsize 之后的调用会 AttributeError */
+TG_EXPORT int         tg_gpu_backend_ready(void)  { return 0; }
+TG_EXPORT const char* tg_gpu_backend_name(void)   { return "cpu"; }
+TG_EXPORT const char* tg_gpu_backend_reason(void) {
+    return "未接 GPU 后端（本次构建未定义 TG_LINK_GPU_SEPARATE）";
+}
+TG_EXPORT const char* tg_gpu_backend_device(void) { return ""; }
+TG_EXPORT const char* tg_gpu_backend_info(void) {
+    return "未接 GPU 后端（本次构建未定义 TG_LINK_GPU_SEPARATE）";
+}
+TG_EXPORT void        tg_gpu_cache_clear(void) { }
 #endif
 
 /* 内部实现: matmul 统一入口 */

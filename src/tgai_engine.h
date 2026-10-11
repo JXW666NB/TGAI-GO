@@ -131,6 +131,15 @@ TG_EXPORT int  tg_gpu_matmul(float* out, const float* x, const float* w,
                              int seq, int k, int n);
 TG_EXPORT int  tg_gpu_backend_init(void);
 TG_EXPORT void tg_gpu_backend_shutdown(void);
+/* 查询后端状态（2026-10-11）——
+   项目原则"不许静默回落"：用户必须能知道走没走 GPU、为什么。
+   未接 GPU 的构建里这些是空桩，分别返回 0 / "none" / 说明。 */
+TG_EXPORT int         tg_gpu_backend_ready(void);   /* 1=已就绪 */
+TG_EXPORT const char* tg_gpu_backend_name(void);    /* "vulkan" / "cpu" / "none" */
+TG_EXPORT const char* tg_gpu_backend_reason(void);  /* 人类可读说明 */
+TG_EXPORT const char* tg_gpu_backend_device(void);  /* 设备名 */
+TG_EXPORT const char* tg_gpu_backend_info(void);    /* 同 reason（兼容别名） */
+TG_EXPORT void        tg_gpu_cache_clear(void);     /* 清权重缓存（换模型时）*/
 
 /**
  * 计算预加载后 FP32 缓存总大小 (字节)

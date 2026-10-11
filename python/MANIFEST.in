@@ -1,6 +1,7 @@
 include README.md
 include LICENSE
 include pyproject.toml
-recursive-include examples *.py
+include 使用手册.md
+recursive-include examples *.py *.md
 recursive-include tgai_go/_native *.md
 global-exclude *.pyc __pycache__/*

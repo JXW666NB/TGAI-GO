@@ -147,8 +147,103 @@ PARAM_SPEC = [
     ('dry_base',          float, 1.75, (1.0, 4.0),  'DRY 惩罚增长底数'),
     ('dry_allowed_length', int,  3,    (1, 32),     'DRY 允许的重复长度'),
     ('dry_penalty_last_n', int,  256,  (0, 4096),   'DRY 回看窗口'),
+
+    # ── 收尾偏置（Soft-Stop）────────────────────────────────────
+    #  作用：生成越接近上限，越倾向自然收尾（logit 加常数 ⇒ 概率渐近 100% 但永不到达）
+    #  这三个是【实时生效】的（sample_numpy 直接读 params）
+    ('soft_stop_per_tok',    float, 0.08, (0.0, 1.0),  '收尾偏置：每 token 递增的 logit（0=关）'),
+    ('soft_stop_at_remain',  int,   64,   (0, 2048),   '收尾偏置：剩余多少 token 开始施加'),
+    ('soft_stop_after',      int,   256,  (0, 4096),   '收尾偏置：已生成多少后开始施加'),
+
+    # ── 思考档收尾（2026-10-11 加）──────────────────────────────
+    #  动机：思考档的出口是 <回答>，它不在 eos_set 里 ⇒ 没有收尾推力，
+    #        模型可能无限念下去（实测问"1+1"念了 11 遍模板）
+    ('think_close_slope',     float, 0.02, (0.0, 1.0),  '思考档：<回答> 偏置递增率（0=关）'),
+    ('think_close_max_logit', float, 2.5,  (0.0, 20.0), '思考档：<回答> 偏置上限'),
+    ('think_soft_limit',      int,   220,  (0, 4096),   '思考档：最长 token 数（超过后偏置拉满）'),
+
+    # ── 代码围栏（``` 内）──────────────────────────────────────
+    #  动机：代码天然多重复，且不该被"英文洪水检测"腰斩；
+    #        进入围栏后换一套更适配代码的参数
+    ('code_repeat_penalty',   float, 1.10, (1.0, 2.0),  '代码块内：重复惩罚'),
+    ('code_dry_multiplier',   float, 2.5,  (0.0, 20.0), '代码块内：DRY 强度'),
+    ('code_freq_penalty',     float, 0.1,  (0.0, 2.0),  '代码块内：频率惩罚'),
+    ('code_close_slope',      float, 0.03, (0.0, 1.0),  '代码块：收尾 ``` 偏置递增率'),
+    ('code_close_max_logit',  float, 3.0,  (0.0, 20.0), '代码块：收尾 ``` 偏置上限'),
 ]
 SPEC_BY_NAME = {s[0]: s for s in PARAM_SPEC}
+
+# ══════════════════════════════════════════════════════════════
+#  参数短名（2026-10-11 加，用户需求："太长了，最好一个名只有 3~5 个字"）
+#
+#  选型：方案 A —— 拼音首字母缩写
+#    think_close_slope      → tslp   思考斜率
+#    code_dry_multiplier    → cdy    代码 DRY
+#    soft_stop_per_tok      → srate  收尾速率
+#
+#  规则：
+#    · /set 与 /get 同时接受【短名】与【全名】（短名优先）
+#    · /params 表格里短名在前、全名在后，方便对照
+#    · 短名全部 ≤5 字符，好打
+# ══════════════════════════════════════════════════════════════
+PARAM_ALIAS = {
+    # 采样
+    'temperature': 'temp',
+    'top_k': 'topk',
+    'top_p': 'topp',
+    'min_p': 'minp',
+    'max_tokens': 'maxt',
+    'min_tokens': 'mint',
+    'seed': 'seed',
+    'repeat_penalty': 'rpen',
+    'repeat_last_n': 'rwin',
+    'frequency_penalty': 'fpen',
+    'presence_penalty': 'ppen',
+    'dry_multiplier': 'dry',
+    'dry_base': 'dryb',
+    'dry_allowed_length': 'dryl',
+    'dry_penalty_last_n': 'dryw',
+    # 收尾偏置（soft stop）
+    'soft_stop_per_tok': 'srate',      # 收尾·速率
+    'soft_stop_at_remain': 'srem',     # 收尾·剩余阈值
+    'soft_stop_after': 'saft',         # 收尾·起始
+    # 思考档
+    'think_close_slope': 'tslp',       # 思考·斜率
+    'think_close_max_logit': 'tmax',   # 思考·上限
+    'think_soft_limit': 'tlim',        # 思考·长度上限
+    # 代码块
+    'code_repeat_penalty': 'crp',      # 代码·重复惩罚
+    'code_dry_multiplier': 'cdry',     # 代码·DRY
+    'code_freq_penalty': 'cfp',        # 代码·频率惩罚
+    'code_close_slope': 'cslp',        # 代码·斜率
+    'code_close_max_logit': 'cmax',    # 代码·上限
+}
+ALIAS_BY_SHORT = {v: k for k, v in PARAM_ALIAS.items()}
+
+
+def resolve_param(name):
+    """把用户输入的名字解析成规范全名；无法识别返回 None
+
+    接受三种写法（大小写不敏感）：
+      · 短名        tslp
+      · 全名        think_close_slope
+      · 全名带前缀  TGAI_THINK_CLOSE_SLOPE   ← 环境变量名也认，省得用户换算
+    """
+    if not name:
+        return None
+    k = name.strip().lower().replace('-', '_')
+    if k in SPEC_BY_NAME:
+        return k
+    if k in ALIAS_BY_SHORT:
+        return ALIAS_BY_SHORT[k]
+    # 环境变量名：TGAI_XXX_YYY → xxx_yyy
+    if k.startswith('tgai_'):
+        k2 = k[5:]
+        if k2 in SPEC_BY_NAME:
+            return k2
+        if k2 in ALIAS_BY_SHORT:
+            return ALIAS_BY_SHORT[k2]
+    return None
 
 # ══════════════════════════════════════════════════════════════
 #  预设（实测取向；TGAI 专属：因为三机制补齐后不需要激进惩罚）
@@ -332,18 +427,31 @@ def show_help():
 """)
 
 def show_params(params, changed):
+    """打印参数表
+
+    ★ 2026-10-11 改：首列改为【短名】（用户要求"一个名只有 3~5 个字"），
+      全名放右侧暗色列便于对照：
+          srate   soft_stop_per_tok   0.08   0.0~1.0   收尾偏置：每 token 递增
+    """
     print(f"\n{C.BLD}═══ 当前参数 ═══{C.RST}")
-    print(f"  {C.DIM}{'参数':<22}{'值':<12}{'范围':<18}说明{C.RST}")
-    print(f"  {C.DIM}{'-'*76}{C.RST}")
+    print(f"  {C.DIM}{'短名':<8}{'全名':<22}{'值':<10}{'范围':<12}说明{C.RST}")
+    print(f"  {C.DIM}{'-'*94}{C.RST}")
     for name, typ, dflt, rng, help_ in PARAM_SPEC:
         v = params.get(name, dflt)
         star = f"{C.YLW}*{C.RST}" if name in changed else ' '
         lo, hi = rng
         rs = f"{lo}~{hi}" if not (lo == -1 and hi > 1000) else "-1 或 正整数"
         col = C.YLW if name in changed else ''
-        print(f"  {star}{col}{name:<21}{C.RST}{str(v):<12}{rs:<18}{C.DIM}{help_}{C.RST}")
+        short = PARAM_ALIAS.get(name, name)
+        print(f"  {star}{col}{short:<8}{C.RST}{C.DIM}{name:<22}{C.RST}"
+              f"{str(v):<10}{rs:<12}{C.DIM}{help_}{C.RST}")
     if changed:
-        print(f"\n  {C.YLW}* = 已改动: {', '.join(sorted(changed))}{C.RST}")
+        _cs = ', '.join(sorted(PARAM_ALIAS.get(x, x) for x in changed
+                               if not x.startswith('__')))
+        if _cs:
+            print(f"\n  {C.YLW}* = 已改动: {_cs}{C.RST}")
+    print(f"\n  {C.DIM}用法：/set <短名> <值>   例: /set tslp 0.05   "
+          f"（全名与 TGAI_ 环境变量名也认）{C.RST}")
     print()
 
 
@@ -667,10 +775,12 @@ def handle_command(line, ctx):
             show_params(P, changed)
     elif cmd == 'set':
         if len(args) < 2:
-            print(f"{C.RED}用法: /set <名> <值>{C.RST}")
-        elif args[0] not in SPEC_BY_NAME:
-            print(f"{C.RED}未知参数: {args[0]}（/params 看全部）{C.RST}")
+            print(f"{C.RED}用法: /set <短名|全名> <值>   例: /set tslp 0.05{C.RST}")
+        elif resolve_param(args[0]) is None:
+            print("%s未知参数: %s（/params 看全部；短名见表格首列）%s"
+                  % (C.RED, args[0], C.RST))
         else:
+            args[0] = resolve_param(args[0])       # ★ 解析短名/全名/环境变量名
             name, typ, _d, rng, _h = SPEC_BY_NAME[args[0]]
             try:
                 v = typ(args[1])
@@ -680,17 +790,23 @@ def handle_command(line, ctx):
             if not (lo <= v <= hi):
                 print(f"{C.YLW}⚠️ {v} 超出建议范围 {lo}~{hi}，仍已设置{C.RST}")
             P[name] = v; changed.add(name)
-            print(f"{C.GRN}{name} = {v}{C.RST}")
+            print('%s%s%s = %s%s%s'
+                  % (C.GRN, PARAM_ALIAS.get(name, name), C.RST, C.GRN, v, C.RST))
             # 特殊提醒（实测得来的边界）
             if name == 'frequency_penalty' and v > 0.4:
                 print(f"{C.YLW}  ⚠️ 实测 frequency_penalty > 0.4 会产生符号噪声乱码{C.RST}")
             if name == 'repeat_penalty' and v <= 1.0:
                 print(f"{C.YLW}  ⚠️ repeat_penalty <= 1.0 时模型可能立刻吐结束符{C.RST}")
     elif cmd == 'get':
-        if args and args[0] in P:
-            print(f"  {args[0]} = {P[args[0]]}")
+        if not args:
+            print('%s用法: /get <短名|全名>%s' % (C.RED, C.RST))
         else:
-            print(f"{C.RED}未知参数{C.RST}")
+            _g = resolve_param(args[0])
+            if _g is None:
+                print('%s未知参数: %s%s' % (C.RED, args[0], C.RST))
+            else:
+                print('%s%s%s = %s%s%s' % (C.CYN, PARAM_ALIAS.get(_g, _g),
+                      C.RST, C.GRN, P.get(_g), C.RST))
     elif cmd == 'threads':
         # ★ 线程数：本机实测 4→7 tok/s、8→11 tok/s、16→10.7 tok/s（超线程略降）
         #   默认取物理核数；用户可自行调（不同 CPU 最优值不同）。

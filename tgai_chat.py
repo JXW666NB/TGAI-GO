@@ -1205,9 +1205,15 @@ def generate(engine, input_ids, params, eos_id, eos_set=None, kv=None):
             #   对 <回答> 施加随已思考 token 数递增的 logit 偏置（封顶、不强制）。
             if _think_active and think_answer_id >= 0:
                 _tk = min(step, THINK_SOFT_LIMIT)
-                if _tk > 0 and 0 <= think_answer_id < vocab:
-                    arr[think_answer_id] += min(
-                        THINK_CLOSE_MAX_LOGIT, _tk * THINK_CLOSE_SLOPE)
+                _tmax = float(params.get('think_close_max_logit',
+                                         THINK_CLOSE_MAX_LOGIT) or 0.0)
+                _tslp = float(params.get('think_close_slope',
+                                         THINK_CLOSE_SLOPE) or 0.0)
+                _tlim = int(params.get('think_soft_limit', THINK_SOFT_LIMIT) or 0)
+                if _tlim > 0:
+                    _tk = min(step, _tlim)
+                    if _tk > 0 and _tmax > 0.0 and 0 <= think_answer_id < vocab:
+                        arr[think_answer_id] += min(_tmax, _tk * _tslp)
 
             # ★★★ 代码块保护（2026-10-10 加）—— 用户设计
             #
@@ -1260,8 +1266,12 @@ def generate(engine, input_ids, params, eos_id, eos_set=None, kv=None):
                     #   正解：闭合围栏必在【行首】，而代码行首几乎不会是反引号
                     #         ⇒ 只在行首施加偏置，既能把围栏逼出来，又不污染代码内部。
                     if np.isfinite(arr[closing_tid]):
-                        arr[closing_tid] += min(CODE_CLOSE_MAX_LOGIT,
-                                                _code_len * CODE_CLOSE_SLOPE)
+                        _cmax = float(params.get('code_close_max_logit',
+                                                 CODE_CLOSE_MAX_LOGIT) or 0.0)
+                        _cslp = float(params.get('code_close_slope',
+                                                 CODE_CLOSE_SLOPE) or 0.0)
+                        if _cmax > 0.0:
+                            arr[closing_tid] += min(_cmax, _code_len * _cslp)
 
             tid = sample_numpy(arr, temp, top_k, top_p, vocab,
                                p=params, recent=_recent,
@@ -1348,7 +1358,8 @@ def generate(engine, input_ids, params, eos_id, eos_set=None, kv=None):
                 if _in_code and not _code_overrides:
                     _saved_params = {k: params.get(k) for k in
                                      ('repeat_penalty', 'dry_multiplier', 'frequency_penalty')}
-                    params['repeat_penalty'] = CODE_REPEAT_PENALTY
+                    params['repeat_penalty'] = float(params.get(
+                        '_code_rp_saved', CODE_REPEAT_PENALTY) or CODE_REPEAT_PENALTY)
                     params['dry_multiplier'] = CODE_DRY_MULTIPLIER
                     params['frequency_penalty'] = CODE_FREQ_PENALTY
                     _code_overrides = True

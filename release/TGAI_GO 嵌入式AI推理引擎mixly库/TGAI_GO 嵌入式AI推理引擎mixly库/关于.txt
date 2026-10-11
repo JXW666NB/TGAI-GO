@@ -1,0 +1,8 @@
+感谢爱迪生/QQ号328828999对本项目的整理和研究！
+此外本项目属于TGAI 系列
+可以加入QQ群1082708943来了解
+本系列项目github开源地址
+1. https://github.com/JXW666NB/TG-HELPER（AI智能体）
+2. https://github.com/JXW666NB/TGAI_CHAT（手机离线推理）
+3. https://github.com/JXW666NB/TGAI-GUI-NLP（AI训练框架）
+4. https://github.com/JXW666NB/TGAI-GO（本项目！AI推理引擎！）

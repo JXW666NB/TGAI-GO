@@ -31,16 +31,8 @@ COMMANDS = {
 }
 
 
-def find_model():
-    """自动找模型
-
-    ★ 规则（2026-10-10 改进）：
-       1) 收集 models\\ 与 D:\\tgai_gguf_work 下所有 .tg
-       2) 【优先选 >= 1 GB 的】—— 小文件通常是测试用的小模型/夹具，
-          自动选中它们会让用户"以为引擎有问题"（实测踩过：挑到 3 MB 的
-          _mini_stream.TG，输出速度 345 tok/s 但对话质量离谱）
-       3) 若无大文件，才退回选最大的那个
-    """
+def find_models():
+    """列出可用模型：models\\ 与 D:\\tgai_gguf_work 下的 .tg（按大小降序）"""
     cands = []
     for d in (os.path.join(SCRIPT_DIR, 'models'), r'D:\tgai_gguf_work'):
         if not os.path.isdir(d):
@@ -48,19 +40,58 @@ def find_model():
         for f in os.listdir(d):
             if f.lower().endswith('.tg'):
                 cands.append(os.path.join(d, f))
+    cands.sort(key=lambda p: -os.path.getsize(p))
+    return cands
+
+
+def auto_model(cands):
+    """自动选择规则（2026-10-10 定，保持原语义）：
+    优先 >= 1 GB 的最大者 —— 小文件通常是测试夹具，选中会让人
+    误以为"引擎有问题"（实测踩过：挑到 3 MB 的夹具）。"""
     if not cands:
         return None
-    cands.sort(key=lambda p: -os.path.getsize(p))
     GB = 1024 ** 3
     big = [p for p in cands if os.path.getsize(p) >= GB]
     return (big or cands)[0]
+
+
+def find_model():
+    """自动找模型（保持原语义：优先 >=1GB 的最大者）"""
+    return auto_model(find_models())
+
+
+def resolve_model(value, cands):
+    """把 -m 的值解析成模型路径（2026-10-11 加）
+
+    支持三种写法（工程面板的便利性；完整路径永远可用）：
+      ① 完整/相对路径：文件存在 ⇒ 原样使用
+      ② 序号：tgai.bat models 里的编号（从 1 开始）
+      ③ 名称片段：大小写不敏感的子串匹配（多个命中取最大者）
+    返回 (path, note)；解析失败时 path=None，note=错误信息。
+    """
+    if os.path.isfile(value):
+        return value, ''
+    if value.isdigit():
+        i = int(value)
+        if 1 <= i <= len(cands):
+            return cands[i - 1], '按序号 %d 选择' % i
+        return None, '序号超范围（共 %d 个，用 tgai.bat models 查看）' % len(cands)
+    hits = [p for p in cands if value.lower() in os.path.basename(p).lower()]
+    if len(hits) == 1:
+        return hits[0], '按名称匹配'
+    if len(hits) > 1:
+        return hits[0], '名称匹配到 %d 个，取最大者' % len(hits)
+    return None, '没有匹配 "%s" 的模型（用 tgai.bat models 查看）' % value
 def print_help():
     print("""
   TGAI GO - 统一入口
   ==========================================================
    tgai.bat                          对话（自动找模型）
-   tgai.bat chat  -m model.TG        对话
-   tgai.bat server -m model.TG       OpenAI 兼容服务器
+   tgai.bat models                   列出可用模型（序号 + 大小）
+   tgai.bat chat -m <序号|名称|路径>   指定模型进入对话
+   tgai.bat chat --server 8080       对话 + 同进程开 OpenAI 兼容服务
+   tgai.bat server -m <...>          只开 OpenAI 兼容服务器（独立进程）
+   tgai.bat server --port 11435      自定义端口（默认 8080；--host 同）
    tgai.bat convert <args>           转换 .pt/.gguf -> .TG
    tgai.bat bench                    基准测试
    tgai.bat rebuild                  重新编译引擎
@@ -72,7 +103,7 @@ def print_help():
    --dll cpu\\build\\libtgai_engine_gpubridge.dll  GPU 桥
 
   对话中的命令:
-   /help  /params  /set name value  /preset name  /stats  /clear  /exit
+   /help  /params  /model <路径>  /server [端口]  /env  /stats  /clear  /exit
 
   速度对比:
    python tools\\compare_backends.py --repeat 3
@@ -95,6 +126,22 @@ def main():
         print_help()
         return 0
 
+    if cmd in ('models', 'list', 'ls'):
+        cands = find_models()
+        if not cands:
+            print('  [ERROR] 找不到任何 .tg 模型')
+            print('          搜索目录: models\\ 与 D:\\tgai_gguf_work')
+            return 1
+        auto = auto_model(cands)
+        print('  TGAI GO 可用模型（%d 个）:' % len(cands))
+        for i, p in enumerate(cands, 1):
+            mark = '★' if p == auto else ' '
+            print('   %s %2d) %7.2f GB  %s'
+                  % (mark, i, os.path.getsize(p) / 1024.0 ** 3, p))
+        print('  ★ = 不指定 -m 时自动选择的模型')
+        print('  用法: tgai.bat chat -m <序号|名称片段|完整路径>')
+        return 0
+
     if cmd == 'bench':
         return subprocess.call([os.path.join(SCRIPT_DIR, 'bench.bat')],
                                cwd=SCRIPT_DIR, shell=True)
@@ -113,7 +160,7 @@ def main():
     script, _ = ent
     rest = argv[1:]
 
-    # 对话/服务器：没有 -m 就自动找
+    # 对话/服务器：没有 -m 就自动找；-m 支持 序号/名称片段/完整路径
     if cmd in ('chat', 'tui', 'server'):
         has_m = any(a in ('-m', '--model') for a in rest)
         if not has_m:
@@ -124,6 +171,18 @@ def main():
                 return 1
             print('  [info] 自动选择模型: %s' % m)
             rest = ['-m', m] + rest
+        else:
+            cands = find_models()
+            for _i, _a in enumerate(rest):
+                if _a in ('-m', '--model') and _i + 1 < len(rest):
+                    _path, _note = resolve_model(rest[_i + 1], cands)
+                    if not _path:
+                        print('  [ERROR] %s' % _note)
+                        return 1
+                    if _path != rest[_i + 1]:
+                        print('  [info] %s: %s' % (_note, _path))
+                        rest[_i + 1] = _path
+                    break
 
     target = os.path.join(SCRIPT_DIR, script)
     if not os.path.exists(target):

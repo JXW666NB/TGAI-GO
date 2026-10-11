@@ -76,11 +76,13 @@ def ui_ask(ctx=None, poll=0.05):
         s = input(prompt)
     except (EOFError, KeyboardInterrupt):
         raise
-    # ★ 回车后把 "You › xxx" 这一行擦掉再回到行首（2026-10-11 加）
-    #   动机：不清的话，光标停在已提交的行上，屏幕上还是 "You › 你好"，
-    #   观感像"没提交成功"。擦掉后紧接着会打印用户消息行，位置自然衔接。
+    # ★★ 不要擦掉提示行（2026-10-11 修，我上一版擦错了）
+    #    input() 的回显里【包含用户敲的字】： "You › 你好"
+    #    我上一版为了"看起来已提交"而用 ANSI 上移+清行把整行擦掉，
+    #    结果把用户的消息一起擦没了 —— 用户反馈"把我的消息吞了"。
+    #    正解：保留这一行（它就是输入回显），只在下面补个空行分隔。
     if sys.stdout.isatty():
-        _sys.stdout.write('\033[A\r\033[K')
+        _sys.stdout.write('\n')
         _sys.stdout.flush()
     else:
         print()          # 管道：终端不回显输入、也不替你换行 ⇒ 手动补换行
@@ -861,6 +863,11 @@ def main():
             _eof = 0
             if not ui:
                 continue
+            # ★★ 回显用户消息（2026-10-11 修：同事重构时把 ui_user 删掉了，
+            #    导致用户消息在屏幕上一闪而过/完全看不见 —— 用户反馈"把我的消息吞了"。
+            #    input() 的原生回显只到"回车"为止，之后生成过程会滚动覆盖，
+            #    所以必须在聊天流里正式打印一条，才能留下可回看的记录。
+            print('%s%sYou ›%s %s' % (U.USER, U.BLD, U.RST, ui))
             if ui.startswith('/'):
                 if not handle_command(ui, ctx):
                     break

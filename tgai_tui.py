@@ -202,6 +202,44 @@ ENV_SPEC = [
 ]
 
 
+# ══════════════════════════════════════════════════════════════
+#  生成期间按键中断（2026-10-11 加）
+#
+#  动机：用户报告"卡的时候按不了回车" —— generate() 是阻塞循环，
+#        一旦某轮生成很长（实测 1443 token / 186 秒）或卡住，
+#        用户除了 Ctrl+C 杀进程没有别的办法，体验很差。
+#  做法：每 N 个 token 用非阻塞方式探一次键盘；按 Esc 或 q 即请求中断。
+#        · Windows 用 msvcrt.kbhit()/getwch()
+#        · POSIX 用 select + termios（取不到就退化为不支持）
+#  注意：只是在【token 边界】检查，不会影响正在进行的 C 前向调用。
+# ══════════════════════════════════════════════════════════════
+def _kbhit_esc():
+    """非阻塞探键盘：按了 Esc 或 q 返回 True"""
+    try:
+        if sys.platform == 'win32':
+            import msvcrt
+            while msvcrt.kbhit():
+                ch = msvcrt.getwch()
+                if ch in ('\x1b', 'q', 'Q'):
+                    return True
+            return False
+        import select
+        import termios
+        import tty
+        fd = sys.stdin.fileno()
+        if not select.select([sys.stdin], [], [], 0)[0]:
+            return False
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            ch = sys.stdin.read(1)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        return ch in ('\x1b', 'q', 'Q')
+    except Exception:
+        return False
+
+
 def default_params():
     return {n: d for n, _t, d, _r, _h in PARAM_SPEC}
 
@@ -804,6 +842,11 @@ def main():
                         stream.feed(tok)    # 实时：字符立刻出现，落定套 MD 样式
                         out += tok
                         cnt += 1
+                        # ★ 生成期间按 Esc/q 可中断（每 8 个 token 探一次键盘）
+                        if (cnt & 7) == 0 and _kbhit_esc():
+                            print('\n%s  [已中断] 按 Esc/q 停止生成%s'
+                                  % (U.WARN, U.RST))
+                            break
                 finally:
                     ctx['lock'].release()
                 stream.flush()
@@ -812,7 +855,17 @@ def main():
                 ctx['last_stat'] = {'n': cnt, 'sec': el, 'tps': tps}
                 txt = out.strip()          # 显示用（去首尾空白）
                 hist_txt = kv_safe_text(out)   # ★ 写回历史用（保留前导 \n，见 kv_safe_text 注释）
-                ui_ai_meta(cnt, el, tps, '' if txt else '空回复')
+                # 显示停止原因 + 本轮 prefill 量（排查"只出 1 token"用）
+                try:
+                    from tgai_chat import LAST_STOP as _LS
+                    _note = (_LS.get('reason') or '')[:34]
+                    if _LS.get('n_prefill'):
+                        _note += ' · prefill %d' % _LS['n_prefill']
+                except Exception:
+                    _note = ''
+                if not txt:
+                    _note = ('空回复 · ' + _note) if _note else '空回复'
+                ui_ai_meta(cnt, el, tps, _note)
                 if txt:
                     chat.add(ui, hist_txt)
                 # ★ 生成结束、实时区已落定 ⇒ 排空接口事件（安全时机）

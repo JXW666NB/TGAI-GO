@@ -491,6 +491,15 @@ def _build_turn_eog(engine):
     return ids
 
 
+# ★ 最后一次生成是怎么停的（2026-10-11 加）
+#   动机：用户报告"某轮只出了 1 个 token"，但界面上看不出原因 —— 是模型自己
+#   出了 EOS？撞了 max_tokens？复读检测掐的？围栏逻辑掐的？内容拦截掐的？
+#   generate() 内部本来算出了 _stop_reason，但只在 TGAI_STOP_TRACE=1 时打到
+#   stderr。这里把它公开成模块级变量，供 TUI / server 显示在界面上，
+#   用户下次看到异常就能直接说清是哪条规则触发的。
+LAST_STOP = {'reason': None, 'step': 0, 'fence': 0}
+
+
 def kv_safe_text(out):
     """把模型输出转成"可以拼回历史"的文本（★ 只去尾部空白，保留前导换行）
 
@@ -1362,6 +1371,14 @@ def generate(engine, input_ids, params, eos_id, eos_set=None, kv=None):
                 break
         else:
             _stop_reason = 'hit max_tokens(%d)' % max_tok
+        # 公开最后一次停止原因（见模块顶部 LAST_STOP 注释）
+        LAST_STOP['reason'] = _stop_reason
+        LAST_STOP['step'] = step + 1
+        LAST_STOP['fence'] = 1 if (_fence_open & 1) else 0
+        # 本轮实际 prefill 了多少 token（= prompt 长度 - 命中缓存的长度）
+        LAST_STOP['n_prompt'] = len(input_ids)
+        LAST_STOP['n_reused'] = reused
+        LAST_STOP['n_prefill'] = max(0, len(input_ids) - reused)
         if _trace:
             print('\n%s[stop] %s  (生成 %d tok, 围栏状态 %s)%s'
                   % (C.YLW, _stop_reason or '未记录', step + 1,

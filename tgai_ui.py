@@ -641,35 +641,54 @@ class Screen:
 #
 #  问题：Markdown 是块结构，逐 token 打印会让 **粗体** 中间出现断点、
 #        代码围栏半截就铺底色 —— 观感比纯文本更差。
-#  方案：按【完整行】为最小单位推进 —— 每收到一整行就渲染一次该行；
-#        围栏内的行原样按代码样式输出（不再重排）。
-#        这样既保留了"逐行出现"的流式感，又不会把标记拆坏。
+#  方案 = "实时吐字 + 行完成时回退重绘"：
+#        · 未完成的行：以 [实时区] 的形式【逐字】即时画出（纯文本）
+#        · 收到 \n：回到实时区行首擦掉，改画成【渲染后的 Markdown】再换行
+#        · 围栏代码块内的行同样实时吐字，落定时换成代码样式
+#      ⇒ 有打字机的实时感，最终又落到正确的 Markdown 排版。
+#
+#  ★ 2026-10-11 重写实时区（用户反馈："看起来根本不是流式"）：
+#    旧实现用 wrap() 每个 token 重算分段，且主循环条件写成
+#      `while _live_n < len(segs)` ⇒ 行内没有"新增折行"时循环体不执行，
+#      "最后一行还在长 ⇒ 只追加增量"的分支永远走不到。
+#    隔离探针实测：一行文字只有【首字符】和【折行后的尾巴】会即时出现，
+#      中间字符全要等 \n 落定重绘后才显示 ⇒ 观感就是整行整行蹦出来。
+#    另有一处：折行边界会随文本增长而移动，旧实现会把已画出的"上一段"
+#      留在原地（少字）；新实现逐字追加，天然无此问题。
 # ══════════════════════════════════════════════════════════════
 class MdStream:
     """流式 Markdown 输出器
 
-    ★ 核心权衡（用户要求"我流式输出呢"）：
-      纯逐 token 打印会把 **粗体** 拆断、代码围栏半截就铺底色；
-      而只在整行完成时才打印，又失去了流式感（长行要等很久）。
-      折中方案 = "实时吐字 + 行完成时回退重绘"：
-        · 未完成的行：以 [实时区] 的形式立即画出（每来一个 token 就重画该行）
-        · 收到 \\n：用 \\r + ESC[K 回到行首擦掉，改画成【渲染后的 Markdown】再换行
-      ⇒ 有打字机的实时感，最终又落到正确的 Markdown 排版。
-
     · 连续空行会被压缩（模型常吐 \\n\\n，不压缩会在流式时刷出一堆空行）
-    · 代码围栏内的行不做重绘（本来就该原样输出）
+    · 实时区用【有状态游标】逐字追加（O(增量)，不做整行重排）：
+        _live_pos  已画出的字符数（buf 增量游标）
+        _live_n    实时区已占用的控制台行数（落定时按它回退擦除）
+        _live_cols 当前行已占用的显示列数（用于折行判定）
+    · cont_prefix：非首行前缀（2026-10-11 加）
+        None ⇒ 与首行等宽的空白（窗框内镶边，旧行为）
+        显式给出（如 ''）⇒ 前缀只落首行、续行顶格（朴素聊天风格）
     """
 
-    def __init__(self, width=76, prefix='', indent='', live=True):
+    def __init__(self, width=76, prefix='', indent='', live=True,
+                 cont_prefix=None):
         self.width = width
         self.prefix = prefix
         self.indent = indent
         self.live = live
         self.buf = ''
         self.infence = False
-        self._live_n = 0        # 实时区已占用的行数
-        self._live_done = ''    # 已画出的内容（用于增量比对）
         self._padv = dw(prefix) if prefix else 0
+        # ★ cont_prefix（2026-10-11 加）：非首行前缀
+        #   None ⇒ 与首行等宽的空白（窗框内镶边，即旧行为）
+        #   显式给出 ⇒ "前缀只落首行"模式；'' 即朴素聊天风格（续行顶格）
+        self.cont_prefix = (' ' * self._padv) if cont_prefix is None \
+            else cont_prefix
+        self._first_only = cont_prefix is not None
+        self._emitted = False   # 是否已输出过正式内容（决定首行前缀归属）
+        self._live_n = 0        # 实时区已占用的【控制台行数】
+        self._live_cols = 0     # 实时区当前行已占用的【显示列数】
+        self._live_pos = 0      # self.buf 中已画出的字符数（增量游标）
+        self._live_limit = max(16, self.width - self._padv)   # 当前行可用列数
         self._last_blank = False
 
     # ── 实时区 ──
@@ -677,7 +696,7 @@ class MdStream:
         """回退到实时区起始处（用于落定时擦掉重绘）
 
         ★ 必须先 flush：_draw_live 是增量 append 且不带换行，
-          若输出缓冲里还有未刷出的字符就发 \\033[A / \\033[K，
+          若输出缓冲里还有未刷出的字符就发 \033[A / \033[K，
           终端会先处理控制序列、再打印缓冲内容 ⇒ 擦错行。
         """
         _sys.stdout.flush()
@@ -685,58 +704,88 @@ class MdStream:
             self.sys_write('\r\033[K')
             for _ in range(self._live_n - 1):
                 self.sys_write('\033[A\r\033[K')
-            self._live_n = 0
-        self._live_done = ''
+        self._live_n = 0
+        self._live_cols = 0
+        self._live_pos = 0
 
     def sys_write(self, s):
         _sys.stdout.write(s)
         _sys.stdout.flush()
 
-    def _draw_live(self):
-        """把当前未完成的行以纯文本形式实时画出（增量追加，不整行重画）
+    def _pfx_live(self, first):
+        """实时区中某行的前缀（first=True 表示"实时区首行"）
 
-        ★ 性能关键（2026-10-10 修）：
-          原实现每收到一个 token 就清掉重画【整行】—— 行长 90 列时
-          每个 token 要重画 90 列，长回答下重绘量爆炸（实测一次回答
-          产生几十 MB 控制序列，管道里直接把日志刷爆）。
-          改为：只把 buf 里【尚未画出的那部分】追加输出；
-                只有发生折行（宽度越界）时才换到新行继续追加。
-          这样每个 token 只画它自己那几个字符 ⇒ O(1) 而非 O(行长)。
-
-        ★ 折行宽度要用 avail = width - dw(prefix)：
-          踩坑：曾直接用 self.width 折行，但画出来的是 prefix + 文本，
-          可用列数少了 prefix 的宽度 ⇒ 文本提前折行，出现莫名断行。
+        ★ 与 _take_pfx 的区别：实时区只是临时画面（落定会被擦掉重绘），
+          这里【不推进】_emitted —— 正式输出的首行前缀由 _take_pfx 决定，
+          否则"擦掉重绘"时首行前缀会丢。
         """
-        if not self.live or self.infence or not self.buf:
+        if not self._first_only:              # 帧内模式：首行 prefix、续行镶边
+            return self.prefix if first else self.cont_prefix
+        if first and not self._emitted:       # 朴素模式：只有全流首行配 prefix
+            return self.prefix
+        return self.cont_prefix
+
+    def _take_pfx(self):
+        """正式输出（_emit）取本行前缀，并把"已输出过内容"置位"""
+        p = self.prefix if (not self._first_only or not self._emitted) \
+            else self.cont_prefix
+        self._emitted = True
+        return p
+
+    def _draw_live(self):
+        """把当前未完成的行以纯文本形式【逐字】实时画出（只追加增量）
+
+        ★ 2026-10-11 重写（用户反馈"看起来根本不是流式"，探针定位）：
+          旧实现用 wrap(self.buf) 每次重算分段，主循环条件
+            `while self._live_n < len(segs)`
+          ⇒ 行内没有【新增折行】时循环体一次都不执行，
+            "最后一行还在长 ⇒ 只追加增量"的分支永远走不到：
+            一行文字只有首字符与折行后的尾巴会即时显示，其余全要等
+            \n 落定时整行重绘 ⇒ 观感就是整行整行地蹦出来。
+          新实现 = 有状态游标自增：
+            · _live_pos 之后是"尚未画出"的新字符，逐个追加输出；
+            · 显示列宽累计超过 avail 就换行（补上与前缀等宽的缩进）；
+            · 每个 token 只画自己那几个字符 ⇒ O(增量)，无整行重排，
+              也不会出现"折行边界移动 ⇒ 已画内容缺字"的旧问题。
+          可用列数用 avail = width - dw(prefix)（画出来的是 prefix + 文本）。
+        """
+        if not self.live or not self.buf:
             return
-        avail = max(16, self.width - self._padv)
-        segs = wrap(self.buf, avail) or ['']
-        while self._live_n < len(segs):
-            i = self._live_n
-            if i > 0:
-                self.sys_write('\n')
-            body = segs[i]
-            # 最后一行是"正在长"的那行：只追加新增部分
-            if i == len(segs) - 1:
-                prev = self._live_done
-                if body.startswith(prev):
-                    body = body[len(prev):]
-                else:
-                    body = body            # 内容变了（极少数）⇒ 整行补画
-                self._live_done = segs[i]
-            self.sys_write((self.prefix if i == 0 else ' ' * self._padv) + body)
-            self._live_n += 1
+        pending = self.buf[self._live_pos:]
+        if not pending:
+            return
+        for ch in pending:
+            cw = _dw(ch)
+            if self._live_n == 0:
+                _pfx = self._pfx_live(True)      # 实时区首行：前缀先落
+                self.sys_write(_pfx)
+                self._live_limit = max(16, self.width - dw(_pfx))
+                self._live_n = 1
+                self._live_cols = 0
+            elif self._live_cols + cw > self._live_limit:
+                _pfx = self._pfx_live(False)     # 折行：换行 + 该行前缀
+                self.sys_write('\n' + _pfx)
+                self._live_limit = max(16, self.width - dw(_pfx))
+                self._live_n += 1
+                self._live_cols = 0
+            self.sys_write(ch)
+            self._live_cols += cw
+        self._live_pos = len(self.buf)
 
     # ── 对外接口 ──
     def feed(self, chunk):
-        """喂入一段文本；立即实时显示，遇到换行则落定该行"""
+        """喂入一段文本；立即实时显示，遇到换行则落定该行
+
+        ★ 收尾无条件 _draw_live：chunk 含 \n 时，\n 之后的新字符也要立刻
+          显示（旧实现 `if '\n' not in chunk` 会漏掉，迟一拍才吐出）；
+          buf 为空时 _draw_live 自然返回，无副作用。
+        """
         for ch in chunk:
             if ch == '\n':
                 self._finalize_line()
             else:
                 self.buf += ch
-        if '\n' not in chunk:
-            self._draw_live()
+        self._draw_live()
 
     def _finalize_line(self):
         """当前缓冲区构成一整行 ⇒ 擦掉实时区，按 Markdown 正式输出"""
@@ -750,14 +799,28 @@ class MdStream:
         self._emit(s)
 
     def flush(self):
-        """收尾：把最后一行（无 \\n 结尾）落定"""
+        """收尾：把最后一行（无 \n 结尾）落定"""
         self._clear_live()
         if self.buf:
             line, self.buf = self.buf, ''
             self._emit(line.rstrip())
 
     def _emit(self, s):
-        """输出一整行（s 不含 \\n）"""
+        """输出一整行（s 不含 \n）
+
+        ★ 2026-10-11 改（配合朴素前缀风格）：
+            · 前缀统一走 _take_pfx()：
+                帧内模式 ⇒ 每行都用 self.prefix（左边框）
+                朴素模式 ⇒ 只有全流首行用 self.prefix，其余用 cont_prefix
+            · 空行恢复为【真空行】（保留段落间隙）：
+                旧实现对空行返回空列表 ⇒ 段落被粘在一起；用户定版截图里
+                段落之间是有空行的（模型吐 \n\n）⇒ 这里对齐；
+                但【全流开头的空行】丢弃，避免回复前面多一条空行。
+        """
+        if s == '':
+            if self._emitted:
+                print('')
+            return
         if _FENCE_RE.match(s):
             self.infence = not self.infence
             lang = s.lstrip()[3:].strip() if self.infence else ''
@@ -765,19 +828,19 @@ class MdStream:
             if self.infence:
                 lab = (' %s%s %s' % (BRAND, lang, RST)) if lang else ''
                 n = max(0, avail - 2 - dw(lab))
-                print('%s%s╭─%s%s%s' % (self.prefix, LINE, lab, H * n, RST),
+                print('%s%s╭─%s%s%s' % (self._take_pfx(), LINE, lab, H * n, RST),
                       flush=True)
             else:
-                print('%s%s╰%s%s' % (self.prefix, LINE,
+                print('%s%s╰%s%s' % (self._take_pfx(), LINE,
                                      H * max(0, avail - 1), RST), flush=True)
             return
         if self.infence:
             avail = max(16, self.width - dw(self.indent))
             for seg in (wrap(s, avail - 4) or ['']):
                 pad = max(0, avail - 4 - dw(seg))
-                print('%s%s│%s %s%s%s ' % (self.prefix, LINE, RST,
+                print('%s%s│%s %s%s%s ' % (self._take_pfx(), LINE, RST,
                                            _c(252) + _c(238),
                                            seg + ' ' * pad, RST), flush=True)
             return
         for l in md_render(s, self.width, self.indent):
-            print('%s%s' % (self.prefix, l), flush=True)
+            print('%s%s' % (self._take_pfx(), l), flush=True)

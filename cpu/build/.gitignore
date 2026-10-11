@@ -1,0 +1,12 @@
+﻿# cpu\build\ 的产物不入库（DLL/OBJ/LIB 都是可重建的）
+*.dll
+*.so
+*.obj
+*.lib
+*.exp
+*.def
+*.exe
+*.bak*
+
+# CUDA 运行时（547 MB，NVIDIA 官方库，只在跑 GPU 后端时才需要）
+cuda/

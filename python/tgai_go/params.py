@@ -146,6 +146,12 @@ class Params(dict):
            Params.from_meta(engine)        默认值 + .TG 内嵌默认
         """
         super().__init__()
+        # ★★ 先用参数表的默认值填满（2026-10-11 修）
+        #   原来构造出的是空 dict，于是 p.get('tslp') 返回 None、
+        #   传给 generate() 等于"没设"（靠 generate 内部回落），
+        #   但用户查值时看到 None 会以为参数不存在。
+        #   现在默认值全部就位 ⇒ get() 永远返回有意义的值。
+        dict.update(self, DEFAULTS)
         if args:
             for a in args:
                 if isinstance(a, dict):

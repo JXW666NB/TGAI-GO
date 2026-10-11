@@ -42,13 +42,17 @@ from ._session import (ChatSession, generate,       # noqa: E402
 from ._meta import parse_tg_chat_meta             # noqa: E402
 from .params import Params, describe as describe_params   # noqa: E402
 from . import gpu                                   # noqa: E402
+from .chat import Chat, PRESETS                     # noqa: E402
+from . import server                                # noqa: E402
+from . import launcher                              # noqa: E402
 from ._sampling import sample_numpy, apply_penalties   # noqa: E402
 
 __all__ = [
     'TGEngine', 'ChatSession', 'generate', 'load', 'Model',
     'parse_tg_chat_meta', 'sample_numpy', 'apply_penalties',
     'native_dir', 'native_available', 'chat_meta_of', '__version__',
-    'kv_safe_text', 'Params', 'describe_params', 'gpu',
+    'kv_safe_text', 'Params', 'describe_params', 'gpu', 'launcher',
+    'Chat', 'PRESETS', 'server',
 ]
 
 

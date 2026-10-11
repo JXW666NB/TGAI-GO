@@ -46,160 +46,45 @@ import tgai_ui as U                                          # noqa: E402
 
 
 def ui_ask(ctx=None, poll=0.05):
-    """读取一行输入（提示符 You ›），等待期间顺带显示接口事件
+    """读取一行输入（提示符 You ›）
 
-    ★★ 2026-10-11 重写（用户报告"按回车没反应、要等好久才换行"）
-      原实现用 msvcrt.kbhit() 轮询，但有两个把界面卡死的缺陷：
+    ★★ 2026-10-11 定版：改回 input()（中文输入法唯一可靠的方式）
 
-      ① 功能键污染 + 忙等：
-         方向键/Home/End/F1.. 会让 msvcrt.getwch() 【先】返回 '\x00' 或 '\xe0'，
-         真正的扫描码在下一次调用才给出。原实现把这个前缀当普通字符
-         buf.append(ch) 存进输入缓冲；而紧接着 kbhit() 仍为真（扫描码还没读走），
-         于是 "else: sleep(poll)" 被【跳过】⇒ while 循环全速空转，
-         每一轮还都调一次 _drain_api_echo ⇒ CPU 打满、回车处理不过来。
-      ② 没有方向键/Home 支持，且中文输入法上屏时配合 ① 更卡。
+      为什么放弃 msvcrt.kbhit() 轮询（走过的弯路，两次踩坑）：
 
-      本版：
-        · 识别 \x00/\xe0 前缀，读出并【丢弃】紧随的扫描码，绝不入 buf
-        · 无论是否按键，循环末尾都 sleep（有按键时更短，保证打字跟手）
-        · _drain_api_echo 限速每 ~0.2s 一次，不再每轮都调
-        · 支持 ←/→/Home/End/Delete、Ctrl+U(清行)/Ctrl+A/E(行首行尾)
+      坑①「忙等卡死」：轮询循环里只有"没按键"分支才 sleep。而功能键在
+          msvcrt 里是【前缀(\x00/\xe0) + 扫描码】两个字符，前缀被当成普通
+          字符存进缓冲后，紧随的 kbhit() 仍为真 ⇒ sleep 被跳过 ⇒ 全速空转，
+          每轮还调一次 _drain_api_echo ⇒ CPU 打满，回车要排很久才处理。
+
+      坑②「中文输入法不兼容」（决定性线索：用户反馈"输入中文才有这个问题"）：
+          · IME 需要主线程跑 Windows 消息循环才能弹出/更新候选词窗口，
+            而我们的 while 循环把消息循环饿死；
+          · IME 提交的是多字节 UTF-8，getwch() 逐字节读，拼不出完整汉字；
+          · 打字过程中 IME 合成状态被反复打断。
+          ⇒ 表现为"按回车没反应 / 要等好久"。
+
+      input() 把控制台输入模式完全交还给系统：IME 候选词、方向键、退格、
+      行内编辑、多行粘贴全部由 Windows 正确处理。代价是等待输入期间无法
+      再"顺便"刷接口事件 —— 这是可接受的取舍，输入可靠性优先。
+      接口事件改为在读输入【之前】和生成【之后】这两个安全时机排空。
+
+      非 TTY（管道/重定向）同样走 input()，行为一致。
     """
     prompt = '%s%sYou ›%s ' % (U.USER, U.BLD, U.RST)
-    if not (sys.stdin.isatty() and sys.stdout.isatty()):
-        s = input(prompt).strip()
-        if not sys.stdout.isatty():
-            print()      # 管道：终端不回显输入、也不替你换行 ⇒ 手动补换行
-        return s
-
-    import time as _t
-    import msvcrt
-
-    def _wd(ch):
-        """单字符显示宽度（中文/全角 2 列）"""
-        o = ord(ch)
-        if o < 0x1100:
-            return 1
-        if (0x1100 <= o <= 0x115F or 0x2E80 <= o <= 0xA4CF
-                or 0xAC00 <= o <= 0xD7A3 or 0xF900 <= o <= 0xFAFF
-                or 0xFE30 <= o <= 0xFE6F or 0xFF00 <= o <= 0xFF60
-                or 0xFFE0 <= o <= 0xFFE6):
-            return 2
-        return 1
-
-    sys.stdout.write(prompt)
-    sys.stdout.flush()
-    buf = []                 # 已输入字符
-    cur = 0                  # 光标位置（buf 下标）
-    last_drain = 0.0
-
-    def redraw():
-        """整行重绘（输入行通常很短，代价可忽略；这样光标移动才准）"""
-        tail = ''.join(buf[cur:])
-        tw = sum(_wd(c) for c in tail)
-        sys.stdout.write('\r\033[K' + prompt + ''.join(buf))
-        if tw:
-            sys.stdout.write('\033[%dD' % tw)
-        sys.stdout.flush()
-
-    while True:
-        # ── 限速 drain 接口事件（原来每轮都调，是卡顿的一半原因）──
-        now = _t.time()
-        if ctx and ctx.get('api_queue') and now - last_drain >= 0.2:
-            last_drain = now
-            try:
-                _drain_api_echo(ctx)
-            except Exception:                                   # noqa: BLE001
-                pass
-
-        got = False
-        if msvcrt.kbhit():
-            got = True
-            ch = msvcrt.getwch()
-
-            # ★★ 关键修复：功能键是"前缀 + 扫描码"两个字符
-            #   msvcrt.getwch() 对方向键/Home/End/F1.. 先返回 '\x00' 或 '\xe0'，
-            #   真正的扫描码要再调一次才给出。
-            #   原实现把这个前缀当普通字符存进 buf ⇒ 缓冲区被污染；
-            #   且紧随其后 kbhit() 仍为真 ⇒ sleep 被跳过 ⇒ while 全速空转
-            #   （同时每轮都调 _drain_api_echo）⇒ CPU 打满、回车处理不过来。
-            #   现在：读出扫描码，能识别的映射成光标操作，其余一律丢弃。
-            if ch in ('\x00', '\xe0'):
-                code = msvcrt.getwch() if msvcrt.kbhit() else ''
-                if code == 'K':                  # ← 左
-                    if cur > 0:
-                        cur -= 1
-                        redraw()
-                elif code == 'M':                # → 右
-                    if cur < len(buf):
-                        cur += 1
-                        redraw()
-                elif code == 'G':                # Home
-                    cur = 0
-                    redraw()
-                elif code == 'O':                # End
-                    cur = len(buf)
-                    redraw()
-                elif code == 'S':                # Delete
-                    if cur < len(buf):
-                        buf.pop(cur)
-                        redraw()
-                # 其他功能键（F1..F12、PgUp/PgDn 等）静默忽略
-                continue
-
-            if ch in ('\r', '\n'):           # 回车
-                sys.stdout.write('\n')
-                sys.stdout.flush()
-                return ''.join(buf).strip()
-
-            if ch == '\x03':                  # Ctrl+C
-                raise KeyboardInterrupt
-
-            if ch == '\x1a':                  # Ctrl+Z（Windows 下当 EOF）
-                raise EOFError
-
-            if ch == '\x15':                  # Ctrl+U 清行
-                buf.clear()
-                cur = 0
-                redraw()
-                continue
-
-            if ch == '\x01':                  # Ctrl+A 行首
-                cur = 0
-                redraw()
-                continue
-
-            if ch == '\x05':                  # Ctrl+E 行尾
-                cur = len(buf)
-                redraw()
-                continue
-
-            if ch == '\x08':                  # 退格
-                if cur > 0:
-                    buf.pop(cur - 1)
-                    cur -= 1
-                    redraw()
-                continue
-
-            if ch == '\x7f':                  # Delete
-                if cur < len(buf):
-                    buf.pop(cur)
-                    redraw()
-                continue
-
-            if ch and ch >= ' ':               # 可打印字符（含中文）
-                buf.insert(cur, ch)
-                cur += 1
-                sys.stdout.write(ch)           # 直接输出，避免整行重绘闪烁
-                # 若后面还有字符（光标在中间），需要把尾部补出来
-                if cur < len(buf):
-                    redraw()
-                sys.stdout.flush()
-                continue
-
-        # ★ 关键修复：无论是否按键都要 sleep
-        #   有按键时用极短 sleep（保证连续输入跟手），空闲时用 poll
-        _t.sleep(0.001 if got else poll)
+    try:
+        s = input(prompt)
+    except (EOFError, KeyboardInterrupt):
+        raise
+    # ★ 回车后把 "You › xxx" 这一行擦掉再回到行首（2026-10-11 加）
+    #   动机：不清的话，光标停在已提交的行上，屏幕上还是 "You › 你好"，
+    #   观感像"没提交成功"。擦掉后紧接着会打印用户消息行，位置自然衔接。
+    if sys.stdout.isatty():
+        _sys.stdout.write('\033[A\r\033[K')
+        _sys.stdout.flush()
+    else:
+        print()          # 管道：终端不回显输入、也不替你换行 ⇒ 手动补换行
+    return s.strip()
 
 
 def ui_ai_start():

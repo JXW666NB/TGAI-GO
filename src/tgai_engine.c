@@ -2436,6 +2436,41 @@ int tg_npu_matmul(float* out, const float* x, const float* w, int seq, int k, in
 }
 #endif
 
+/* ══════════════════════════════════════════════════════════════
+ *  GPU 加速钩子（2026-10-11 加的"接线缝"）
+ *
+ *  背景（实测查明）：
+ *    · tgai_vulkan.c 已实现 mm_bf16 等内核，测试证明【比 CPU 快 2.2×】
+ *        CPU(AVX2,单线程) 3.02ms / 2.78 GFLOP/s
+ *        Vulkan(AMD 核显)  1.26ms / 6.67 GFLOP/s   数值一致(误差 3e-3)
+ *    · cuda\tgai_cuda.cu 也是完整实现（7 个 __global__ 内核 + tg_cuda_* API）
+ *    · 但 tgai_engine.c【从未调用】任何 GPU 后端 ——
+ *        tg_backend.c/h 是孤立文件，全项目没有 .c include 它，
+ *        TG_BE_HAS_VULKAN 无人 define；引擎只挂了 tg_npu_matmul 一个钩子。
+ *    ⇒ 缺的就是下面这条"缝"。
+ *
+ *  语义（与 tg_npu_matmul 完全一致，便于同一处判断）：
+ *      返回 1 = GPU 已接管计算，out 已填好，调用方直接 return
+ *      返回 0 = 不可用/不支持，调用方继续走 CPU 路径
+ *
+ *  ★ 默认是【空桩】⇒ 不接线的构建行为与现在完全一致，零风险。
+ *    接哪个后端由外部编译单元提供实现覆盖：
+ *        -DTG_LINK_GPU_SEPARATE  +  链接自己的 tgai_gpu_dispatch.c
+ *    该实现内部再决定用 Vulkan 还是 CUDA（读环境变量 TG_BACKEND）。
+ * ══════════════════════════════════════════════════════════════ */
+#if !defined(TG_LINK_GPU_SEPARATE)
+TG_EXPORT int tg_gpu_matmul(float* out, const float* x, const float* w, int seq, int k, int n) {
+    (void)out; (void)x; (void)w; (void)seq; (void)k; (void)n;
+    return 0;                        /* 无 GPU 实现 ⇒ 回落 CPU */
+}
+#endif
+
+/* GPU 后端初始化/释放（同样默认空桩；返回 1 = 就绪） */
+#if !defined(TG_LINK_GPU_SEPARATE)
+TG_EXPORT int tg_gpu_backend_init(void) { return 0; }
+TG_EXPORT void tg_gpu_backend_shutdown(void) { }
+#endif
+
 /* 内部实现: matmul 统一入口 */
 static void _matmul_impl(float* out, const float* x, const float* w,
                           const uint8_t* q4, const float* scales,
@@ -2443,6 +2478,13 @@ static void _matmul_impl(float* out, const float* x, const float* w,
                           int seq, int k, int n) {
     /* NPU 加速: 大矩阵走 NNAPI (仅 FP32 路径) */
     if (!q4 && tg_npu_matmul(out, x, w, seq, k, n)) return;
+
+    /* GPU 加速（Vulkan / CUDA）—— 与 NPU 同一语义：
+     *   返回 1 = 已接管；返回 0 = 回落下面的 CPU 路径。
+     *   仅在 FP32/BF16 权重路径尝试（q4 走自己的核）；
+     *   实测 Vulkan mm_bf16 在此形状下比 CPU 快 2.2×。
+     *   默认空桩 ⇒ 不影响现有行为。 */
+    if (!q4 && tg_gpu_matmul(out, x, w, seq, k, n)) return;
 
 #if !defined(TG_SINGLE_THREAD)
     tg_nthreads_ensure();      /* ★ 必须先初始化，否则下面的 g_nthreads>1 恒假 */

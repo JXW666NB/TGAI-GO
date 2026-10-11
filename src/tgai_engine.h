@@ -116,6 +116,22 @@ TG_EXPORT const float* tg_forward(
  */
 TG_EXPORT int tg_preload_all(TGModel* model);
 
+/* ── GPU 加速钩子（2026-10-11 加）────────────────────────────
+ * 语义与 tg_npu_matmul 一致：返回 1 = 已接管计算（out 已填好），
+ *                           返回 0 = 不可用/不支持，调用方走 CPU 路径。
+ *
+ * 默认是空桩（返回 0）⇒ 不接 GPU 的构建行为与以前完全一致。
+ * 要用真实现：编译时加 -DTG_LINK_GPU_SEPARATE，并提供自己的
+ * tgai_gpu_dispatch.c（内部可调 Vulkan 的 mm_bf16 或 CUDA 内核），
+ * 再链接进引擎 DLL。
+ *
+ * 这些用 TG_EXPORT 导出，是为了让【DLL 使用方】（如 Python 的
+ * tgai_go）也能查询/初始化 GPU 后端，而不只是引擎内部调用。 */
+TG_EXPORT int  tg_gpu_matmul(float* out, const float* x, const float* w,
+                             int seq, int k, int n);
+TG_EXPORT int  tg_gpu_backend_init(void);
+TG_EXPORT void tg_gpu_backend_shutdown(void);
+
 /**
  * 计算预加载后 FP32 缓存总大小 (字节)
  * 调用方据此判断是否有足够内存。

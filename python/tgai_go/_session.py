@@ -45,6 +45,13 @@ def generate(engine, input_ids, params, eos_id, eos_set=None, kv=None):
     """Autoregressive generation with all anti-degradation from GUI"""
     lib = engine.lib; model = engine.model; vocab = engine.vocab_size
     max_seq = engine.max_seq; FloatArr = ctypes.POINTER(ctypes.c_float)
+    # ★ 每轮生成前重置 SentencePiece detokenize 状态（2026-10-11 加）
+    #   动机：detok 是【有状态】的（_detok_first 控制"是否吞掉前导空格"）。
+    #   若不重置，上一轮的"已产出可见内容"状态会带到下一轮，
+    #   导致新一轮开头的空格被错误保留（或首批空格被吞）。
+    #   llama.cpp 的 llama_detokenize 也是按序列调用的，语义这里对齐。
+    if hasattr(engine, 'detok_reset'):
+        engine.detok_reset()
     temp = params.get('temperature', 0.3); top_k = params.get('top_k', 60)
     top_p = params.get('top_p', 0.9); max_tok = params.get('max_tokens', 2048)
     min_tok = params.get('min_tokens', 1)

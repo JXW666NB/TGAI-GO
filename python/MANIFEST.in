@@ -1,0 +1,6 @@
+include README.md
+include LICENSE
+include pyproject.toml
+recursive-include examples *.py
+recursive-include tgai_go/_native *.md
+global-exclude *.pyc __pycache__/*

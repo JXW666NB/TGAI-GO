@@ -261,12 +261,64 @@ class TGEngine:
         n = self.lib.tg_encode(self.model, text.encode('utf-8'), buf, 2048, 1 if add_bos else 0)
         return [buf[i] for i in range(n)]
 
-    def decode(self, tid):
+    # ── SentencePiece detokenize 状态（2026-10-11 加）──────────────
+    #   ★ 为什么需要：HF normalizer 把 ' ' 换成 '▁'(U+2581) 再做 BPE，
+    #     词表里存的就是带 ▁ 的形式。旧版 decode 直接返回词表条目，
+    #     界面上会出现 "由▁JXW▁一个人" 这类裸符号（用户在 pip 包实测到）。
+    #     llama.cpp 的 llama_detokenize 会把 ▁ 还原成空格、并吞掉序列
+    #     首个前导空格；本实现与之对齐。
+    _SP_MARK = '\u2581'
+
+    def detok_reset(self):
+        """开始一次新的生成/解码序列时调用，重置 detokenize 状态"""
+        self._detok_first = True
+        self._detok_pend = False
+        self._detok_prev = None
+
+    def decode(self, tid, detok=None):
+        """token id → 文本
+
+        detok=True  : 启用 SentencePiece detokenize（▁→空格，吞掉首个前导空格）
+        detok=False : 返回原始词表条目（保留 ▁，调试用）
+        detok=None  : 沿用上次 detok_reset() 设定的模式（默认启用）
+
+        ★ 状态语义（与 llama.cpp 一致）：
+            _detok_first : 还没产出过任何【可见字符】⇒ 前导空格要吞掉
+            _detok_pend  : 刚吃到一个裸 ▁ ⇒ 下一个 token 前面要补空格
+        """
         if self.sidecar:
             return self.sidecar.decode([tid])
+        if not hasattr(self, '_detok_first'):
+            self.detok_reset()
         buf = ctypes.create_string_buffer(256)
         self.lib.tg_token_to_str(self.model, tid, buf, 256)
-        return buf.value.decode('utf-8', errors='replace')
+        s = buf.value.decode('utf-8', errors='replace')
+        if detok is False:
+            return s
+        if detok is True:
+            self._detok_first = True
+            self._detok_pend = False
+        self._detok_prev = s
+
+        # ① token 本身就是裸 ▁（词表 id=9）：只登记待定空格，本次不输出
+        if s == self._SP_MARK:
+            self._detok_pend = True
+            return ''
+        # ② token 以 ▁ 开头（如 '▁的'）：剥掉 ▁，按位置决定补不补空格
+        if s.startswith(self._SP_MARK):
+            out = s[len(self._SP_MARK):]
+            if not self._detok_first:
+                out = ' ' + out
+        # ③ 普通 token：若前面有待定 ▁ 则补空格
+        elif self._detok_pend:
+            out = s if self._detok_first else (' ' + s)
+        else:
+            out = s
+
+        self._detok_pend = False
+        if out:
+            self._detok_first = False     # 产出过可见内容，后续不再吞前导空格
+        return out
 
     def kv_handle(self):
         """★ KV_CACHE_REUSE：返回可复用的 KV cache 句柄（跨轮保留）"""

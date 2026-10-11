@@ -82,6 +82,19 @@ SOFT_STOP_MAX_LOGIT = _env_f('TGAI_SOFT_STOP_MAX_LOGIT', 3.0)
 #        （历史教训：照抄调参台激进值曾把 '1+1=2' 压成 '1+1=3'）。
 #  只在 ``` 围栏代码块内生效，出块立即恢复原值。
 # ══════════════════════════════════════════════════════════════
+# ★ 思考档收尾偏置（2026-10-11 加）
+#   动机：思考档的出口是 <回答>，而它【不在 eos_set 里】（刻意排除 ——
+#        <回答> 会出现在回答内部，当停止串会截断回答）。
+#        ⇒ Soft-Stop 对它没有任何压力 ⇒ 模型在思考段可以无限念下去
+#        （用户实测：问 "1+1是多少"，思考段把 "1+1等于多少呢？" 念了 11 遍，
+#          永远到不了 <回答>，看不到答案）。
+#   做法：对 <回答> 施加随"已思考 token 数"递增的 logit 偏置，封顶不强制。
+#        与代码围栏催闭合（CODE_CLOSE_*）完全同一套设计。
+THINK_CLOSE_SLOPE = _env_f('TGAI_THINK_CLOSE_SLOPE', 0.02)
+THINK_CLOSE_MAX_LOGIT = _env_f('TGAI_THINK_CLOSE_MAX_LOGIT', 2.5)
+# 思考段最长 token 数：超过后偏置拉满（兜底，避免极端情况写几千 token 思考）
+THINK_SOFT_LIMIT = int(_env_f('TGAI_THINK_SOFT_LIMIT', 220))
+
 CODE_REPEAT_PENALTY = _env_f('TGAI_CODE_REPEAT_PENALTY', 1.10)
 CODE_DRY_MULTIPLIER = _env_f('TGAI_CODE_DRY_MULTIPLIER', 2.5)
 CODE_FREQ_PENALTY = _env_f('TGAI_CODE_FREQ_PENALTY', 0.1)
@@ -1139,6 +1152,18 @@ def generate(engine, input_ids, params, eos_id, eos_set=None, kv=None):
         #   _ticks     : 连续反引号计数（本模型词表把 ``` 拆成 '``'+'`' 两个 token，
         #                所以不能用 ts == '```' 判断）
         #   代码块内会禁用"英文洪水检测/复读检测/Soft-Stop"，否则写代码会被腰斩。
+        # ★ 思考档状态（2026-10-11）：由调用方通过 params['_think_mode'] 告知
+        #   _think_active：当前是否处于思考段（出了 <回答> 就置 False）
+        #   think_answer_id：<回答> 的 token id
+        _think_active = bool(params.get('_think_mode'))
+        think_answer_id = -1
+        try:
+            _ai = engine.encode('<回答>', add_bos=False)
+            if len(_ai) == 1:
+                think_answer_id = int(_ai[0])
+        except Exception:                                           # noqa: BLE001
+            think_answer_id = -1
+
         _fence_open = 0
         _ticks = 0
         _in_code = False
@@ -1174,6 +1199,15 @@ def generate(engine, input_ids, params, eos_id, eos_set=None, kv=None):
             if step < min_tok:
                 for e in eos_set:
                     if 0 <= e < vocab: arr[e] = -np.inf
+
+            # ★★ 思考档收尾偏置（2026-10-11 加，见模块顶部 THINK_CLOSE_* 注释）
+            #   仅当 mode='think' 且尚未出现 <回答> 时生效：
+            #   对 <回答> 施加随已思考 token 数递增的 logit 偏置（封顶、不强制）。
+            if _think_active and think_answer_id >= 0:
+                _tk = min(step, THINK_SOFT_LIMIT)
+                if _tk > 0 and 0 <= think_answer_id < vocab:
+                    arr[think_answer_id] += min(
+                        THINK_CLOSE_MAX_LOGIT, _tk * THINK_CLOSE_SLOPE)
 
             # ★★★ 代码块保护（2026-10-10 加）—— 用户设计
             #
@@ -1237,6 +1271,10 @@ def generate(engine, input_ids, params, eos_id, eos_set=None, kv=None):
                                #   代码块内传空 eos_ids 使其自动失效，避免催停半截代码
                                max_tok=max_tok, step=step,
                                eos_ids=(set() if _in_code else eos_set))
+
+            # ★ 思考段结束（生成出 <回答>）⇒ 关掉收尾偏置
+            if _think_active and tid == think_answer_id:
+                _think_active = False
 
             # EOS check (after min_tokens) — 支持多 EOS token
             if tid in eos_set and step >= min_tok:

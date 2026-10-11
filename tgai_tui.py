@@ -916,9 +916,16 @@ def main():
             #    think 档 → ThinkStream（思考段暗色斜体，遇 <回答> 切正文）
             #    direct 档 → MdStream（普通 Markdown）
             #    ctx['think_hidden'] 由 /think hide|show 控制
-            stream = ui_ai_start(
-                think=(getattr(chat, 'think_mode', 'direct') == 'think'),
-                hidden=bool(ctx.get('think_hidden', False)))
+            _is_think = (getattr(chat, 'think_mode', 'direct') == 'think')
+            stream = ui_ai_start(think=_is_think,
+                                 hidden=bool(ctx.get('think_hidden', False)))
+            # ★ 告诉 generate 当前是思考档 ⇒ 它会对 <回答> 施加收尾偏置，
+            #   否则思考段没有"该收尾了"的推力，可能无限念下去
+            #   （实测：问 "1+1是多少"，思考段把 "1+1等于多少呢？" 念了 11 遍）
+            if _is_think:
+                params['_think_mode'] = True
+            else:
+                params.pop('_think_mode', None)
             try:
                 # ★ 与接口请求串行：引擎非线程安全（C 侧全局 scratch + 线程池）
                 ctx['lock'].acquire()

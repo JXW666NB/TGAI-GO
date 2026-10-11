@@ -411,15 +411,22 @@ class ThinkStream:
         phase='answer'  正文段：委托 MdStream 做 Markdown 渲染
       <思考> / <回答> 标记一律吃掉。
 
-    ★ 流式实现（2026-10-11 修，用户反馈"思考内容不是流式输出"）：
-      第一版只在攒够一整行（遇到 \n）时才 _emit_think ⇒ 思考段是
-      "一行一行蹦"，不像正文那样逐字吐。
-      现在与 MdStream 用同一套做法：
-        · 未完成的行进 [实时区]：立即画出，每来一个 token 就【追加】新字符
-        · 收到 \n：擦掉实时区（\r\033[K + 上移），正式打印该行
-        · 遇到 <回答>：擦掉实时区，切到正文 MdStream
-      增量追加（不是整行重画）—— 这是之前 MdStream 踩过的性能坑：
-      整行重画在长行下会产生 O(行长) 的输出量，把日志刷爆。
+    ★★ 实时区记账（2026-10-11 第二版，修"一句一句出来"）
+      第一版我偷懒写成：
+          segs = wrap(self.buf, avail)
+          while self._live_n < len(segs): ...     # 只有行数增加才画
+      ⇒ 行数没变时什么都不做，同一行内新增的字符【从未被画出来】，
+        只有折行（约 40 字）时才刷新一次 ⇒ 看起来"一句一句蹦"。
+
+      现在改为【自写行包装 + 精确记账】，三个计数：
+          cols    当前行已画的显示列数
+          drawn   已画出的字符数（buf 的下标）
+          nlines  实时区已占的终端行数
+      每来一个 token 只把 buf[drawn:] 追加输出；"下一个字符要不要换行"
+      由 cols + _dw(ch) > avail 直接判断（O(1)，不用重新 wrap 整行）。
+      ⇒ 单个 token 的输出量 = 它自己的字符数 = O(1)，
+        不会像"整行重画"那样产生 O(行长) 的输出量
+        （那是 MdStream 早期把管道日志刷到几十 MB 的坑）。
     """
 
     def __init__(self, width=76, prefix='', cont_prefix='',
@@ -434,47 +441,52 @@ class ThinkStream:
         self.think_len = 0
         self.done = False
         self.md = None
-        self._live_n = 0        # 实时区已占行数
-        self._live_done = ''    # 实时区当前行已画出的内容
+        # 实时区记账
+        self.cols = 0
+        self.drawn = 0
+        self.nlines = 0
 
     # ── 实时区 ──
-    def _live_avail(self):
+    def _avail(self):
         return max(16, self.width - dw(self.cont_prefix) - 2)
+
+    def _head(self, first):
+        bar = '%s▏%s %s%s' % (THINK_BAR, RST, ITAL, THINK)
+        return (self.cont_prefix if first else ' ' * dw(self.cont_prefix)) + bar
 
     def _clear_live(self):
         _sys.stdout.flush()
-        if self._live_n > 0:
+        if self.nlines > 0:
             _sys.stdout.write('\r\033[K')
-            for _ in range(self._live_n - 1):
+            for _ in range(self.nlines - 1):
                 _sys.stdout.write('\033[A\r\033[K')
-            self._live_n = 0
-        self._live_done = ''
+        self.nlines = 0
+        self.cols = 0
+        self.drawn = 0
         _sys.stdout.flush()
 
     def _draw_live(self):
-        """把未完成的行实时画出（增量追加）"""
+        """把 buf[drawn:] 追加到实时区（增量，O(新增字符数)）"""
         if self.hidden or self.done:
             return
-        avail = self._live_avail()
-        segs = wrap(self.buf, avail) or ['']
-        while self._live_n < len(segs):
-            i = self._live_n
-            if i > 0:
-                _sys.stdout.write('\n')
-            body = segs[i]
-            if i == len(segs) - 1:
-                # 最后一行"正在长"：只追加新增部分
-                prev = self._live_done
-                if body.startswith(prev):
-                    body = body[len(prev):]
-                self._live_done = segs[i]
-            head = ('%s%s▏%s %s%s' % (self.cont_prefix, THINK_BAR, RST,
-                                      ITAL, THINK)) if i == 0 \
-                else ('%s%s▏%s %s%s' % (' ' * dw(self.cont_prefix), THINK_BAR,
-                                        RST, ITAL, THINK))
-            _sys.stdout.write(head + body if i == len(segs) - 1 else head + body)
-            self._live_n += 1
-        _sys.stdout.flush()
+        avail = self._avail()
+        first = (self.nlines == 0)
+        out = []
+        if first:
+            out.append(self._head(True))
+            self.nlines = 1
+        for ch in self.buf[self.drawn:]:
+            w = _dw(ch)
+            if self.cols + w > avail:
+                out.append('\n' + self._head(False))
+                self.nlines += 1
+                self.cols = 0
+            out.append(ch)
+            self.cols += w
+        self.drawn = len(self.buf)
+        if out:
+            _sys.stdout.write(''.join(out))
+            _sys.stdout.flush()
 
     # ── 标记处理 ──
     def _clean(self, s):
@@ -487,14 +499,24 @@ class ThinkStream:
 
     # ── 落定一行 ──
     def _emit_think(self, line):
+        """正式打印一行思考内容（暗色斜体 + 左竖线）"""
         self.think_len += dw(line)
         if self.hidden or not line.strip():
             return
-        avail = self._live_avail()
-        for seg in (wrap(line, avail) or ['']):
-            _sys.stdout.write('%s%s▏%s %s%s%s%s\n'
-                              % (self.cont_prefix, THINK_BAR, RST,
-                                 ITAL, THINK, seg, RST))
+        avail = self._avail()
+        first = True
+        col = 0
+        seg = []
+        for ch in line:
+            w = _dw(ch)
+            if col + w > avail:
+                _sys.stdout.write('%s%s%s\n' % (self._head(first), ''.join(seg), RST))
+                first = False
+                seg = []
+                col = 0
+            seg.append(ch)
+            col += w
+        _sys.stdout.write('%s%s%s\n' % (self._head(first), ''.join(seg), RST))
         _sys.stdout.flush()
 
     def _switch(self):

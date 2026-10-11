@@ -42,8 +42,25 @@ typedef struct {
 } TGVkDeviceInfo;
 
 /* ─────────── 生命期 ─────────── */
-int  tg_vk_probe(void);                          /* 返回可用设备数（0=不可用）*/
-int  tg_vk_device_info(int index, TGVkDeviceInfo* out);
+/* ── 为什么这两个要导出（2026-10-11 加）────────────────────────
+ *  Python 侧必须【在加载引擎之前】判断设备是不是独立显卡：
+ *  否则核显机器会白加载 GPU 版 DLL（多付 Vulkan 实例创建开销）。
+ *  Windows 的 Win32_VideoController 只能拿到厂商名（"AMD Radeon"），
+ *  分不出核显/独显；只有 Vulkan 的 deviceType 是权威的：
+ *      1 = INTEGRATED_GPU（核显）  2 = DISCRETE_GPU（独显）
+ *  ⇒ 导出 tg_vk_probe / tg_vk_device_info 供外部查询。
+ *
+ *  仅当以 -DTGAI_VK_BUILD_DLL 编译（引擎 DLL 的构建脚本）时启用导出，
+ *  这样 tests\*.exe 之类的普通构建不受影响。
+ * ──────────────────────────────────────────────────────────── */
+#ifdef TGAI_VK_BUILD_DLL
+#  define TGAI_VK_EXPORT __declspec(dllexport)
+#else
+#  define TGAI_VK_EXPORT
+#endif
+
+TGAI_VK_EXPORT int  tg_vk_probe(void);              /* 返回可用设备数（0=不可用）*/
+TGAI_VK_EXPORT int  tg_vk_device_info(int index, TGVkDeviceInfo* out);
 const char* tg_vk_vendor_name(uint32_t vendor_id);
 int  tg_vk_init(int device_index);               /* -1 = 自动选（优先独显）*/
 void tg_vk_shutdown(void);

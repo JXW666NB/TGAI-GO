@@ -88,7 +88,7 @@ if not exist "%G%\cpu\build" mkdir "%G%\cpu\build"
 echo [1/2] compiling engine + Vulkan dispatch (takes ~15-30s) ...
 cl /nologo /LD /O2 /Oy /fp:fast /openmp /utf-8 /std:c11 /W3 ^
    /D_CRT_SECURE_NO_WARNINGS /arch:AVX2 ^
-   /DTG_LINK_GPU_SEPARATE /DTG_GPU_VULKAN ^
+   /DTG_LINK_GPU_SEPARATE /DTG_GPU_VULKAN /DTGAI_VK_BUILD_DLL ^
    /I"%G%\src" /I"%G%\third_party" ^
    "%G%\src\tgai_engine.c" ^
    "%G%\src\tgai_gpu_dispatch.c" ^

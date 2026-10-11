@@ -45,6 +45,114 @@ class C:
     RST = ''; BLD = ''; DIM = ''; CYN = ''; GRN = ''; YLW = ''; RED = ''; BLU = ''
 
 
+# ══════════════════════════════════════════════════════════════
+#  GPU 版引擎 DLL 的自动选择（2026-10-11 加）
+#
+#  背景：包内现在有两个引擎 DLL
+#      libtgai_engine.dll     CPU 版（永远可用，兜底）
+#      libtgai_engine_vk.dll  接了 Vulkan GPU 分派的版本
+#
+#  用户要求：「检测到独立显卡就接线（门槛是显存要装得下所加载的模型）」
+#  ⇒ 只有在【检测到独立显卡】时才优先选 GPU 版；
+#    核显（与 CPU 抢内存通道，实测跑不过多线程 CPU）继续用 CPU 版。
+#
+#  ★ 为什么要在这里判断，而不是在原生层判断：
+#    原生层确实也会判断（TG_GPU_FORCE_DISCRETE / is_discrete / heap_bytes），
+#    但它需要先被【加载】才能判断。若在核显机器上加载 Vulkan 版，
+#    会白白付出 Vulkan 实例创建的开销（实测约 +0.5s 启动）。
+#    这里先粗筛一次，让核显机器根本不加载 GPU 版。
+#
+#  ★ 检测失败一律回落 CPU —— GPU 是可选的加速，不是必需。
+# ══════════════════════════════════════════════════════════════
+class _VkDeviceInfo(ctypes.Structure):
+    """对应 C 侧 TGVkDeviceInfo 的内存布局（见 src/tgai_vulkan.h）
+
+    ★ 必须在 Python 侧重建一份：原生头文件依赖 vulkan_core.h，
+      不适合让 ctypes 去 include。字段顺序/类型已逐一对齐。
+    """
+    _fields_ = [("device_name", ctypes.c_char * 256),
+                ("vendor_id", ctypes.c_uint32),
+                ("device_id", ctypes.c_uint32),
+                ("api_version", ctypes.c_uint32),
+                ("driver_version", ctypes.c_uint32),
+                ("device_type", ctypes.c_uint32),   # 1=核显 2=独显 3=虚拟 4=CPU
+                ("heap_bytes", ctypes.c_uint64),
+                ("is_uma", ctypes.c_int)]
+
+
+def vulkan_devices():
+    """列出 Vulkan 能看到的 GPU：device_type / 显存 / 是否 UMA
+
+    返回 [dict]，取不到时返回 []（永不抛异常）。
+
+    ★ 为什么必须用 Vulkan 而不能用 Windows 的显卡枚举：
+      Win32_VideoController 只给厂商名（"AMD Radeon (TM) Graphics"），
+      分不出核显还是独显 —— 实测本机就是【核显】，但按厂商名会被误判为独显。
+      Vulkan 的 deviceType 才是权威的（1=INTEGRATED / 2=DISCRETE）。
+    """
+    vk = os.path.join(_NATIVE_DIR, 'libtgai_engine_vk.dll')
+    if not os.path.exists(vk):
+        vk = os.path.join(_NATIVE_DIR, 'libtgai_engine_vk.so')
+        if not os.path.exists(vk):
+            return []                       # 包里没有 GPU 版
+    try:
+        lib = ctypes.CDLL(vk)
+        lib.tg_vk_probe.restype = ctypes.c_int
+        lib.tg_vk_device_info.restype = ctypes.c_int
+        lib.tg_vk_device_info.argtypes = [ctypes.c_int,
+                                          ctypes.POINTER(_VkDeviceInfo)]
+        n = int(lib.tg_vk_probe())
+        out = []
+        for i in range(max(0, min(n, 16))):
+            d = _VkDeviceInfo()
+            if lib.tg_vk_device_info(i, ctypes.byref(d)):
+                out.append({
+                    'name': d.device_name.decode('utf-8', 'replace'),
+                    'vendor_id': d.vendor_id,
+                    'device_type': d.device_type,
+                    'heap_bytes': int(d.heap_bytes),
+                    'is_uma': bool(d.is_uma),
+                    'discrete': d.device_type == 2,
+                })
+        return out
+    except Exception:                                          # noqa: BLE001
+        return []
+
+
+def _has_discrete_gpu():
+    """是否存在【独立显卡】（Vulkan deviceType==2 为权威判据）
+
+    ★ 用 Vulkan 而非 WMI：WMI 只给厂商名，会把 AMD 核显误判为独显
+      （实测踩过：本机 "AMD Radeon (TM) Graphics" 其实是核显，
+       按厂商名判断会错误地加载 GPU 版 DLL）。
+    ★ 取不到设备信息（没有 GPU 版 DLL / 无 Vulkan 运行时）⇒ 返回 False，
+      保守地继续用 CPU 版。GPU 是可选加速，不是必需。
+    """
+    return any(d.get('discrete') for d in vulkan_devices())
+
+
+def _pick_gpu_dll():
+    """返回 GPU 版 DLL 路径；不适用则返回 None
+
+    优先级（都要求文件存在）：
+        1. 环境变量 TGAI_ENGINE=gpu  → 强制用 GPU 版
+        2. 环境变量 TGAI_ENGINE=cpu  → 强制用 CPU 版
+        3. 默认：检测到独立显卡就用 GPU 版，否则 CPU 版
+    """
+    vk = os.path.join(_NATIVE_DIR, 'libtgai_engine_vk.dll')
+    if not os.path.exists(vk):
+        vk2 = os.path.join(_NATIVE_DIR, 'libtgai_engine_vk.so')
+        vk = vk2 if os.path.exists(vk2) else None
+    if not vk:
+        return None                       # 包里没有 GPU 版（旧包）
+    want = (os.environ.get('TGAI_ENGINE') or '').strip().lower()
+    if want in ('cpu', 'nogpu'):
+        return None
+    if want in ('gpu', 'vk', 'vulkan'):
+        return vk
+    return vk if _has_discrete_gpu() else None
+
+
 class TGEngine:
     def __init__(self, dll_path=None):
         self.lib = None; self.model = None; self.cfg = {}; self.dll_path = dll_path
@@ -71,8 +179,15 @@ class TGEngine:
                 if d:
                     cands += [os.path.join(d, 'libtgai_engine.dll'),
                               os.path.join(d, 'libtgai_engine.so')]
-            # 脚本自身所在目录（发行版可把 dll 与 .py 放一起）
             # ★ 包内 _native/ 优先（pip 安装后的位置）
+            #   若检测到独立显卡且有 GPU 版 DLL，把它排到最前 ——
+            #   GPU 版内部有完整的 CPU 回落，加载失败会自动退回 CPU 路径；
+            #   而 CPU 版没有 GPU 代码，放前面就永远用不上 GPU。
+            _gpu_dll = _pick_gpu_dll()
+            if _gpu_dll:
+                log.info("检测到独立显卡，优先使用 GPU 版引擎: %s",
+                         os.path.basename(_gpu_dll))
+                cands += [_gpu_dll]
             cands += [os.path.join(_NATIVE_DIR, 'libtgai_engine.dll'),
                       os.path.join(_NATIVE_DIR, 'libtgai_engine.so'),
                       os.path.join(_NATIVE_DIR, 'libtgai_engine_gpubridge.dll')]

@@ -128,14 +128,14 @@ static int ensure_instance(void) {
     return 1;
 }
 
-int tg_vk_probe(void) {
+TGAI_VK_EXPORT int tg_vk_probe(void) {
     if (!ensure_instance()) return 0;
     uint32_t n = 0;
     if (vkEnumeratePhysicalDevices(g_inst, &n, NULL) != VK_SUCCESS) return 0;
     return (int)n;
 }
 
-int tg_vk_device_info(int index, TGVkDeviceInfo* out) {
+TGAI_VK_EXPORT int tg_vk_device_info(int index, TGVkDeviceInfo* out) {
     if (!out) return 0;
     memset(out, 0, sizeof(*out));
     if (!ensure_instance()) return 0;

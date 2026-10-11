@@ -138,7 +138,6 @@ TG_EXPORT int         tg_gpu_backend_ready(void);   /* 1=已就绪 */
 TG_EXPORT const char* tg_gpu_backend_name(void);    /* "vulkan" / "cpu" / "none" */
 TG_EXPORT const char* tg_gpu_backend_reason(void);  /* 人类可读说明 */
 TG_EXPORT const char* tg_gpu_backend_device(void);  /* 设备名 */
-TG_EXPORT const char* tg_gpu_backend_info(void);    /* 同 reason（兼容别名） */
 TG_EXPORT void        tg_gpu_cache_clear(void);     /* 清权重缓存（换模型时）*/
 
 /**

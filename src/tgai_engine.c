@@ -2477,9 +2477,6 @@ TG_EXPORT const char* tg_gpu_backend_reason(void) {
     return "未接 GPU 后端（本次构建未定义 TG_LINK_GPU_SEPARATE）";
 }
 TG_EXPORT const char* tg_gpu_backend_device(void) { return ""; }
-TG_EXPORT const char* tg_gpu_backend_info(void) {
-    return "未接 GPU 后端（本次构建未定义 TG_LINK_GPU_SEPARATE）";
-}
 TG_EXPORT void        tg_gpu_cache_clear(void) { }
 #endif
 

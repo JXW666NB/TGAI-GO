@@ -8,18 +8,7 @@
  *      int  tg_gpu_matmul(float* out, const float* x, const float* w,
  *                         int seq, int k, int n);
  *      int  tg_gpu_backend_init(void);
- *      /* ── 对外：查询后端状态（2026-10-11 加，给 Python 侧显示用）────────
- *  返回一段人类可读的说明，包含：
- *    走的哪个后端 / 设备名 / 是否独显 / 显存与模型大小 / 为什么没走 GPU
- *  ★ 项目原则：不许静默回落 —— 用户必须能知道"到底走没走 GPU、为什么"。
- *  ★ 在 init 之前调用也安全（返回"未初始化"），不会崩。
- */
-const char* tg_gpu_backend_info(void) {
-    if (!g_inited) return g_reason[0] ? g_reason : "未初始化";
-    return g_reason;
-}
-
-void tg_gpu_backend_shutdown(void);
+ *      void tg_gpu_backend_shutdown(void);
  *
  *  ══════════════════════════════════════════════════════════════
  *  一、数值契约（★ 这是本文件最容易写错的地方，先钉死）

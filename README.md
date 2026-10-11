@@ -473,7 +473,25 @@ ESP32-C3/C6  —— 无 PSRAM
 （README 旧版曾在 library.properties 里列 esp8266，是错的，已修正）
 ```
 
-### 快速开始
+### 模型从哪来
+
+本仓库是**推理引擎**，不含模型权重。TGAI 系列模型在魔搭社区：
+
+```bash
+pip install modelscope
+modelscope download --model JXW7777/TGAI_NB TGAI_NB_V2.7.tg --local_dir .
+```
+
+| 模型 | 格式 | 大小 |
+|---|---|---|
+| **TGAI NB V2.7** | `.tg`（本引擎原生格式）| 5.6 GB |
+| TGAI NB V2.6 / V2.5 / V2 / V1 | `.gguf` | 1.6 ~ 5.5 GB |
+
+> 📦 <https://modelscope.cn/models/JXW7777/TGAI_NB>
+
+---
+
+## 快速开始
 
 ```bash
 # 一键部署

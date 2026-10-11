@@ -17,7 +17,7 @@ print(m.generate("什么是机器学习？", max_tokens=128))
 |---|---|
 | **零编译安装** | 原生引擎（C + OpenMP）以预编译库随包分发，`pip install tgai-go` 即可用 |
 | **无外部依赖** | 引擎只依赖系统 `kernel32`（静态链接 CRT）；Python 侧只要 `numpy` |
-| **CPU 推理** | 纯 CPU，8 线程实测 **12.0 tok/s**（28 层 MoE，5.6 GB BF16 权重） |
+| **CPU 推理** | 纯 CPU，**4 线程实测约 11 tok/s**（28 层 MoE，5.6 GB BF16 权重）—— 已达内存带宽的约 92% |
 | **多轮对话** | 内置 KV cache 复用，跨轮只算新增 token |
 | **配置随模型走** | `.TG` 可内嵌对话模板（九标记 / ChatML / 纯文本），库自动读取 |
 | **流式输出** | `for chunk in m.stream(...)` 逐段拿文本 |
@@ -32,6 +32,28 @@ pip install tgai-go
 ```
 
 > 平台：Windows x64 已实测；Linux/macOS 需自行编译原生库（见文末）。
+
+---
+
+## 模型从哪来
+
+本库是**推理引擎**，不含模型权重。TGAI 系列模型请在魔搭社区下载：
+
+| 模型 | 格式 | 大小 | 说明 |
+|---|---|---|---|
+| **TGAI NB V2.7** | `.tg` | 5.6 GB | **最新**（域隔离 MoE + 9 标记结构化对话）|
+| TGAI NB V2.6 | `.gguf` | 5.5 GB | 需用转换工具转成 `.tg` |
+| TGAI NB V2.6 Q4_K_M | `.gguf` | 1.7 GB | 量化版（低配/手机）|
+
+```bash
+pip install modelscope
+modelscope download --model JXW7777/TGAI_NB TGAI_NB_V2.7.tg --local_dir .
+```
+
+**推荐直接用 V2.7 的 `.tg` 文件** —— 它是本引擎的原生格式，
+对话模板、停止符、采样默认值全部内嵌，加载后引擎自动读取，无需手工配置。
+
+> 📦 模型主页：<https://modelscope.cn/models/JXW7777/TGAI_NB>
 
 ---
 

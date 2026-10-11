@@ -58,3 +58,6 @@ tests/*.exe
 
 # 实验残留（instrumented 副本，非源码）
 *.exp_*
+
+# 备份集（清理时统一收进来的，可随时删）
+_backups_*/

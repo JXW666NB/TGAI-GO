@@ -404,7 +404,23 @@ ITAL = _E + '3m'
 
 
 class ThinkStream:
-    """思考档流式渲染器"""
+    """思考档流式渲染器
+
+    ★ 两个状态，切换点就是 <回答>：
+        phase='think'   思考段：暗色(245) + 斜体 + 左侧竖线 ▏
+        phase='answer'  正文段：委托 MdStream 做 Markdown 渲染
+      <思考> / <回答> 标记一律吃掉。
+
+    ★ 流式实现（2026-10-11 修，用户反馈"思考内容不是流式输出"）：
+      第一版只在攒够一整行（遇到 \n）时才 _emit_think ⇒ 思考段是
+      "一行一行蹦"，不像正文那样逐字吐。
+      现在与 MdStream 用同一套做法：
+        · 未完成的行进 [实时区]：立即画出，每来一个 token 就【追加】新字符
+        · 收到 \n：擦掉实时区（\r\033[K + 上移），正式打印该行
+        · 遇到 <回答>：擦掉实时区，切到正文 MdStream
+      增量追加（不是整行重画）—— 这是之前 MdStream 踩过的性能坑：
+      整行重画在长行下会产生 O(行长) 的输出量，把日志刷爆。
+    """
 
     def __init__(self, width=76, prefix='', cont_prefix='',
                  hidden=False, answer_marker='<回答>', think_open='<思考>'):
@@ -418,10 +434,50 @@ class ThinkStream:
         self.think_len = 0
         self.done = False
         self.md = None
+        self._live_n = 0        # 实时区已占行数
+        self._live_done = ''    # 实时区当前行已画出的内容
+
+    # ── 实时区 ──
+    def _live_avail(self):
+        return max(16, self.width - dw(self.cont_prefix) - 2)
+
+    def _clear_live(self):
+        _sys.stdout.flush()
+        if self._live_n > 0:
+            _sys.stdout.write('\r\033[K')
+            for _ in range(self._live_n - 1):
+                _sys.stdout.write('\033[A\r\033[K')
+            self._live_n = 0
+        self._live_done = ''
+        _sys.stdout.flush()
+
+    def _draw_live(self):
+        """把未完成的行实时画出（增量追加）"""
+        if self.hidden or self.done:
+            return
+        avail = self._live_avail()
+        segs = wrap(self.buf, avail) or ['']
+        while self._live_n < len(segs):
+            i = self._live_n
+            if i > 0:
+                _sys.stdout.write('\n')
+            body = segs[i]
+            if i == len(segs) - 1:
+                # 最后一行"正在长"：只追加新增部分
+                prev = self._live_done
+                if body.startswith(prev):
+                    body = body[len(prev):]
+                self._live_done = segs[i]
+            head = ('%s%s▏%s %s%s' % (self.cont_prefix, THINK_BAR, RST,
+                                      ITAL, THINK)) if i == 0 \
+                else ('%s%s▏%s %s%s' % (' ' * dw(self.cont_prefix), THINK_BAR,
+                                        RST, ITAL, THINK))
+            _sys.stdout.write(head + body if i == len(segs) - 1 else head + body)
+            self._live_n += 1
+        _sys.stdout.flush()
 
     # ── 标记处理 ──
     def _clean(self, s):
-        """吃掉档位标记；返回 (剩余文本, 是否出现 <回答>)"""
         if self.think_open:
             s = s.replace(self.think_open, '')
         if self.answer_marker and self.answer_marker in s:
@@ -429,18 +485,20 @@ class ThinkStream:
             return s[:k] + s[k + len(self.answer_marker):], True
         return s, False
 
-    # ── 思考行输出 ──
+    # ── 落定一行 ──
     def _emit_think(self, line):
         self.think_len += dw(line)
         if self.hidden or not line.strip():
             return
-        avail = max(16, self.width - dw(self.cont_prefix) - 2)
+        avail = self._live_avail()
         for seg in (wrap(line, avail) or ['']):
-            print('%s%s▏%s %s%s%s%s' % (self.cont_prefix, THINK_BAR, RST,
-                                        ITAL, THINK, seg, RST), flush=True)
+            _sys.stdout.write('%s%s▏%s %s%s%s%s\n'
+                              % (self.cont_prefix, THINK_BAR, RST,
+                                 ITAL, THINK, seg, RST))
+        _sys.stdout.flush()
 
     def _switch(self):
-        """从思考切到正文"""
+        self._clear_live()
         self.done = True
         if self.hidden and self.think_len:
             print('%s%s▏%s %s[思考 %d 字已隐藏 · /think show 可显示]%s'
@@ -454,45 +512,31 @@ class ThinkStream:
         if self.done:
             self.md.feed(chunk)
             return
-        self.buf += chunk
-        while '\n' in self.buf:
-            line, self.buf = self.buf.split('\n', 1)
-            line, hit = self._clean(line)
-            if line:
-                self._emit_think(line)
-            if hit:
-                self._switch()
-                rest, self.buf = self.buf, ''
-                if rest:
-                    self.md.feed(rest)
-                return
+        for ch in chunk:
+            if ch == '\n':
+                line, self.buf = self.buf, ''
+                self._clear_live()
+                line, hit = self._clean(line)
+                if line:
+                    self._emit_think(line)
+                if hit:
+                    self._switch()
+                    return
+            else:
+                self.buf += ch
+        self._draw_live()
 
     def flush(self):
         if self.done:
             self.md.flush()
             return
+        self._clear_live()
         rest, hit = self._clean(self.buf)
         self.buf = ''
         if rest:
             self._emit_think(rest)
-        self._switch()          # 没出 <回答> 也切（保证正文样式恢复）
+        self._switch()
 
-
-# ══════════════════════════════════════════════════════════════
-#  底部输入框 + 状态栏（2026-10-10 加，用户要求"输入框在下面，类似 xiaoli"）
-#
-#  视觉（参考小狸 CLI）：
-#      ╭──────────────────────────────────────────────╮
-#      │ > 输入消息 … （/help 命令 · /params 调参）    │
-#      ╰──────────────────────────────────────────────╯
-#      就绪 │ v27_merged_bf16.TG · 8K · 4线程 │ /exit 退出
-#
-#  实现要点：
-#    输入框画完后用 ANSI 把光标移回中间行，用户就在框内打字；
-#    下次再画之前先向上擦掉 3 行（框高），避免框越堆越多。
-# ══════════════════════════════════════════════════════════════
-INBOX = _c(110)      # 输入框边线（蓝）
-INBOX_BG = _c(236)   # 状态栏底色
 
 
 def _input_fallback(prompt_text='> '):

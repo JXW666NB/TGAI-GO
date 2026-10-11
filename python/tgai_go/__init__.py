@@ -31,7 +31,7 @@
 import logging as _logging
 import os as _os
 
-__version__ = '1.0.4'
+__version__ = '1.0.5'
 
 # 库默认不往 stdout 输出（脚本版会打印，库不该）
 _logging.getLogger('tgai_go').addHandler(_logging.NullHandler())
@@ -41,13 +41,14 @@ from ._session import (ChatSession, generate,       # noqa: E402
                         kv_safe_text)
 from ._meta import parse_tg_chat_meta             # noqa: E402
 from .params import Params, describe as describe_params   # noqa: E402
+from . import gpu                                   # noqa: E402
 from ._sampling import sample_numpy, apply_penalties   # noqa: E402
 
 __all__ = [
     'TGEngine', 'ChatSession', 'generate', 'load', 'Model',
     'parse_tg_chat_meta', 'sample_numpy', 'apply_penalties',
     'native_dir', 'native_available', 'chat_meta_of', '__version__',
-    'kv_safe_text', 'Params', 'describe_params',
+    'kv_safe_text', 'Params', 'describe_params', 'gpu',
 ]
 
 

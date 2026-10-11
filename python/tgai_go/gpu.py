@@ -417,6 +417,82 @@ def auto_install(src_root=None, force=None, verbose=True):
     return 'cpu', False, res
 
 
+# ══════════════════════════════════════════════════════════════
+#  一条函数强制启用 GPU（用户要求："如果可以允许用户用一条函数强制继续编译和启用GPU"）
+# ══════════════════════════════════════════════════════════════
+def force_gpu(src_root=None, verbose=True):
+    """强制编译并启用 CUDA GPU 后端。失败则抛异常（不静默回落 CPU）
+
+    与 auto_install() 的区别：
+        auto_install()  : 自动判断，失败【静默回落 CPU】（适合开机自动配置）
+        force_gpu()     : 用户明确要求，失败【抛异常并说明原因】
+                          （适合"我就是要 GPU，编不出来告诉我为什么"）
+
+    ★ 为什么只支持 CUDA：
+        实测（2026-10-11）查明，本项目唯一有可复现构建路径的 GPU 后端是 CUDA：
+          build_cuda.bat: nvcc -o libtgai_engine_gpu.dll  tgai_cuda.cu + tgai_engine.c
+                          ⇒ 产出【完整引擎 + CUDA 后端】，可用 --dll 加载
+        而 Vulkan 那条路是"架子"，接不上：
+          · tgai_backend.c/h 是孤立文件，没有任何 .c include 它
+          · tgai_engine.c 里完全没有 backend 抽象层的引用
+          · TG_BE_HAS_VULKAN 全项目无人 define ⇒ 那段代码永不参与编译
+          · build_vulkan.bat 只编译自检程序 test_vulkan.exe
+        ⇒ 所以本函数对 vulkan 直接报错，而不是给用户虚假希望。
+
+    返回编译出的 DLL 路径。异常类型 RuntimeError（带可操作的原因）。
+    """
+    rep = probe()
+    if verbose:
+        print(describe(rep))
+        print()
+
+    # ── 前置检查（给出可操作的错误，不是一句"失败"）──────────
+    nv = [g for g in rep['gpus'] if g['vendor'] == 'nvidia']
+    if not nv:
+        got = '/'.join(sorted({g['vendor'] for g in rep['gpus']})) or '无'
+        raise RuntimeError(
+            '未检测到 NVIDIA 显卡（检测到: %s）。\n'
+            '  CUDA 后端需要 NVIDIA 显卡；AMD/Intel 目前没有可用的 GPU 后端。\n'
+            '  继续用 CPU 即可（功能完整）。' % got)
+    if not rep['msvc'][0]:
+        raise RuntimeError(
+            '缺少 C/C++ 编译器（MSVC 或 gcc）—— 无法编译。\n'
+            '  装 Visual Studio Build Tools（含 C++ 工作负载）后重试。')
+    if not rep['cuda'][0]:
+        raise RuntimeError(
+            '缺 CUDA Toolkit（nvcc）。\n'
+            '  下载: https://developer.nvidia.com/cuda-downloads\n'
+            '  装完确认 nvcc --version 可用，然后重试。\n'
+            '  当前检测到 CUDA: %s' % (rep['cuda'][1] or '无'))
+
+    ok, res = build('cuda', src_root=src_root, verbose=verbose)
+    if not ok:
+        raise RuntimeError('CUDA 编译失败：\n%s' % res)
+    if verbose:
+        print()
+        print('  ✅ GPU 后端已就绪: %s' % res)
+        print('     引擎加载时会自动优先使用它；也可显式指定：')
+        print('       TGEngine(dll=%r)' % res)
+    return res
+
+
+def enable(src_root=None, verbose=True):
+    """自动检测 → 能上 GPU 就上，不能就 CPU（永不抛异常）
+
+    这是"给最终用户的一键函数"：
+        from tgai_go import gpu
+        gpu.enable()          # 有 N 卡就编译启用，没有就用 CPU
+        # 之后正常 TGEngine().load(...) 即可
+    """
+    try:
+        backend, ok, msg = auto_install(src_root=src_root, verbose=verbose)
+        return backend
+    except Exception as exc:                                    # noqa: BLE001
+        if verbose:
+            print('  ⚠️ GPU 配置失败，继续使用 CPU: %s' % exc)
+        return 'cpu'
+
+
 def main(argv=None):
     """命令行入口：python -m tgai_go.gpu [--force cuda|vulkan|cpu] [--check]"""
     import argparse
@@ -425,7 +501,10 @@ def main(argv=None):
         description='TGAI GO GPU 后端自动检测与编译（CPU 兜底）')
     ap.add_argument('--check', action='store_true', help='只检测不编译')
     ap.add_argument('--force', choices=['cpu', 'cuda', 'vulkan'],
-                    help='强制指定后端（默认自动判断）')
+                    help='强制指定后端（默认自动判断）。'
+                         '注意 vulkan 当前不可用，会报错说明原因')
+    ap.add_argument('--gpu', action='store_true',
+                    help='强制编译并启用 GPU（失败即报错，不静默回落）')
     ap.add_argument('--src', help='TGAI GO 源码根目录')
     a = ap.parse_args(argv)
 
@@ -439,6 +518,22 @@ def main(argv=None):
         print()
         print('  当前已装后端: %s' % installed_backend())
         return 0
+    if a.force == 'vulkan':
+        print('  ❌ Vulkan 后端当前不可用。原因（实测查明）：')
+        print('     · tgai_backend.c/h 是孤立文件，没有任何 .c include 它')
+        print('     · tgai_engine.c 里没有 backend 抽象层的引用')
+        print('     · TG_BE_HAS_VULKAN 全项目无人 define ⇒ 永不参与编译')
+        print('     · build_vulkan.bat 只编自检程序 test_vulkan.exe')
+        print('     ⇒ 目前唯一可用的 GPU 后端是 CUDA（需 NVIDIA 卡）')
+        return 1
+    if a.gpu:
+        try:
+            force_gpu(src_root=a.src)
+            return 0
+        except RuntimeError as exc:
+            print()
+            print('  ❌ %s' % exc)
+            return 1
     backend, ok, _ = auto_install(src_root=a.src, force=a.force)
     return 0 if ok else 1
 

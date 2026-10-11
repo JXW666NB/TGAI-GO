@@ -1,84 +1,185 @@
 @echo off
 REM ============================================================
-REM  TGAI GO —— PyPI 发布脚本（在本机运行，token 不写进任何文件）
+REM  TGAI GO -- PyPI publish script
 REM
-REM  用法：
-REM    1) 先撤销你之前泄露的那个 token，重新生成一个：
+REM  WHY THIS FILE IS PURE ASCII (no Chinese text at all):
+REM    cmd.exe reads .bat files using the OEM codepage (936/GBK on
+REM    Chinese Windows), NOT UTF-8. A UTF-8 Chinese comment gets
+REM    mis-decoded into garbage which cmd then tries to EXECUTE as
+REM    a command -- the script dies instantly with
+REM    "'t...' is not recognized as an internal or external command".
+REM    So: keep every byte of this file ASCII.
+REM
+REM  WHY WE FORCE UTF-8 FOR PYTHON:
+REM    twine's progress bar uses rich, which prints U+2022 (bullet).
+REM    On a GBK console rich raises
+REM      UnicodeEncodeError: 'gbk' codec can't encode character '\u2022'
+REM    and the upload dies AFTER building successfully -- very
+REM    confusing. Setting PYTHONUTF8=1 makes Python use UTF-8 for
+REM    stdio regardless of the console codepage. (chcp 65001 alone
+REM    is not enough; some terminals still report GBK to Python.)
+REM
+REM  USAGE
+REM    1) Revoke any token you leaked, then create a new one:
 REM         https://pypi.org/manage/account/token/
-REM    2) 在【当前命令行窗口】里设一次环境变量（只影响这个窗口）：
+REM    2) In the SAME cmd window, set the credentials ONCE:
 REM         set TWINE_USERNAME=__token__
-REM         set TWINE_PASSWORD=pypi-你的新token
-REM       ⚠️ 不要把 token 写进这个 bat 文件、不要提交到 git、不要贴到聊天里
-REM    3) 运行本脚本：
-REM         publish_pypi.bat            发布到正式 PyPI
-REM         publish_pypi.bat test       先发到 TestPyPI 试一遍（推荐首次）
-REM
-REM  脚本做的事：
-REM    清理旧产物 → 构建 wheel+sdist → twine check → 上传
+REM         set TWINE_PASSWORD=pypi-YOUR-NEW-TOKEN
+REM       Do NOT put the token in this file and do NOT commit it.
+REM    3) Run:
+REM         publish_pypi.bat test     -> TestPyPI (try this first)
+REM         publish_pypi.bat          -> real PyPI
 REM ============================================================
-setlocal
+
+setlocal EnableDelayedExpansion
+chcp 65001 >nul 2>&1
+
+REM --- force UTF-8 for every python child process (see note above) ---
+set "PYTHONUTF8=1"
+set "PYTHONIOENCODING=utf-8"
+
 cd /d "%~dp0python"
 
 set "PY=python"
 set "MODE=%~1"
+set "FAILED=0"
 
+echo.
+echo ============================================================
+echo   TGAI GO  --  PyPI publish
+echo ============================================================
+echo.
+
+REM ---------- step 0: check python ----------
+echo [0/6] Checking Python ...
+"%PY%" --version >nul 2>&1
+if errorlevel 1 (
+  echo   [ERROR] "python" not found in PATH.
+  echo           Open a normal cmd window where  python --version  works.
+  set "FAILED=1"
+  goto :done
+)
+"%PY%" --version
+echo.
+
+REM ---------- step 1: check credentials ----------
+echo [1/6] Checking credentials ...
 if "%TWINE_USERNAME%"=="" (
-  echo [ERROR] 未设置 TWINE_USERNAME
-  echo         请先在本窗口执行:  set TWINE_USERNAME=__token__
-  echo         以及:              set TWINE_PASSWORD=pypi-你的新token
-  exit /b 1
+  echo   [ERROR] TWINE_USERNAME is not set.
+  echo.
+  echo   Fix it - run these two lines in THIS window, then retry:
+  echo       set TWINE_USERNAME=__token__
+  echo       set TWINE_PASSWORD=pypi-YOUR-NEW-TOKEN
+  echo.
+  echo   The token stays in this window only. Never write it into a
+  echo   file and never commit it to git.
+  set "FAILED=1"
+  goto :done
 )
 if "%TWINE_PASSWORD%"=="" (
-  echo [ERROR] 未设置 TWINE_PASSWORD（应为 pypi- 开头的 token）
-  echo         ^(提示：token 只在本窗口临时用，不要写进文件^)
-  exit /b 1
+  echo   [ERROR] TWINE_PASSWORD is not set ^(should start with pypi-^).
+  set "FAILED=1"
+  goto :done
 )
-
+echo   username = %TWINE_USERNAME%
+echo   password = ***hidden***
 echo.
-echo === 0/5 确认打包依赖 ===
-%PY% -m pip install --quiet --upgrade build twine || exit /b 1
 
+REM ---------- step 2: ensure build tools ----------
+echo [2/6] Installing build tools if needed ...
+"%PY%" -m pip install --quiet --disable-pip-version-check --upgrade build twine
+if errorlevel 1 (
+  echo   [ERROR] pip install build twine failed. Check network / mirror.
+  set "FAILED=1"
+  goto :done
+)
+echo   ok
 echo.
-echo === 1/5 清理旧产物 ===
+
+REM ---------- step 3: clean ----------
+echo [3/6] Cleaning old artifacts ...
 if exist build rmdir /s /q build
 if exist dist  rmdir /s /q dist
 if exist tgai_go.egg-info rmdir /s /q tgai_go.egg-info
+echo   ok
+echo.
 
+REM ---------- step 4: build ----------
+echo [4/6] Building wheel + sdist ...
+"%PY%" -m build
+if errorlevel 1 (
+  echo   [ERROR] build failed - see messages above.
+  set "FAILED=1"
+  goto :done
+)
 echo.
-echo === 2/5 构建 wheel + sdist ===
-%PY% -m build || exit /b 1
-
-echo.
-echo === 3/5 检查产物内容 ===
-%PY% -m twine check dist\* || exit /b 1
-echo.
-echo   产物列表:
+echo   Artifacts:
 dir /b dist
 echo.
-echo   ^(wheel 内应包含 tgai_go\_native\libtgai_engine.dll 与 libomp.dll^)
 
-echo.
-echo === 4/5 校验 wheel 里确实带了原生库 ===
-%PY% -c "import zipfile,glob,sys; w=sorted(glob.glob('dist/*.whl'))[-1]; z=zipfile.ZipFile(w); n=[x for x in z.namelist() if '_native' in x]; print('  wheel:',w); [print('   ',x) for x in n]; sys.exit(0 if any(x.endswith('.dll') for x in n) else 1)" || (
-  echo [ERROR] wheel 里没有原生 DLL —— 检查 pyproject.toml 的 package-data 配置
-  exit /b 1
+REM ---------- step 5: check + verify native lib ----------
+echo [5/6] Checking metadata and bundled native library ...
+"%PY%" -m twine check dist\*
+if errorlevel 1 (
+  echo   [ERROR] twine check failed.
+  set "FAILED=1"
+  goto :done
 )
-
+"%PY%" -c "import zipfile,glob,sys; w=sorted(glob.glob('dist/*.whl'))[-1]; z=zipfile.ZipFile(w); n=[x for x in z.namelist() if '_native' in x]; print('  wheel:',w); [print('   ',x) for x in n]; sys.exit(0 if any(x.endswith('.dll') or x.endswith('.so') for x in n) else 1)"
+if errorlevel 1 (
+  echo   [ERROR] The wheel does NOT contain the native engine library.
+  echo           Check [tool.setuptools.package-data] in pyproject.toml.
+  set "FAILED=1"
+  goto :done
+)
+echo   ok - native library is inside the wheel
 echo.
+
+REM ---------- step 6: upload ----------
 if /i "%MODE%"=="test" (
-  echo === 5/5 上传到 TestPyPI ^(试运行^) ===
-  %PY% -m twine upload --repository testpypi dist\* || exit /b 1
+  echo [6/6] Uploading to TestPyPI ...
+  "%PY%" -m twine upload --repository testpypi dist\*
+  if errorlevel 1 (
+    echo   [ERROR] upload failed - see messages above.
+    set "FAILED=1"
+    goto :done
+  )
+  set "FAILED=2"
   echo.
-  echo 完成。试安装：
-  echo   pip install -i https://test.pypi.org/simple/ tgai-go
+  echo ============================================================
+  echo   DONE - uploaded to TestPyPI
+  echo   Verify with:
+  echo     pip install -i https://test.pypi.org/simple/ tgai-go
+  echo ============================================================
 ) else (
-  echo === 5/5 上传到正式 PyPI ===
-  %PY% -m twine upload dist\* || exit /b 1
+  echo [6/6] Uploading to PyPI ...
+  "%PY%" -m twine upload dist\*
+  if errorlevel 1 (
+    echo   [ERROR] upload failed - see messages above.
+    set "FAILED=1"
+    goto :done
+  )
+  set "FAILED=2"
   echo.
-  echo 完成。任何人现在都可以：
-  echo   pip install tgai-go
+  echo ============================================================
+  echo   DONE - published to PyPI
+  echo   Anyone can now run:   pip install tgai-go
+  echo   Clear the token from this window:  set TWINE_PASSWORD=
+  echo ============================================================
 )
 
+:done
 echo.
-echo 提示：上传后 token 就可以在本窗口 set TWINE_PASSWORD= 清掉了。
+if "%FAILED%"=="1" (
+  echo ************************************************************
+  echo   SCRIPT STOPPED WITH AN ERROR - read the message above.
+  echo ************************************************************
+)
+if "%FAILED%"=="2" (
+  echo   Finished successfully.
+)
+echo.
+echo   Press any key to close this window . . .
+pause >nul
 endlocal
+exit /b 0

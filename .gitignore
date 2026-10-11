@@ -61,3 +61,5 @@ tests/*.exe
 
 # 备份集（清理时统一收进来的，可随时删）
 _backups_*/
+
+python/dist/

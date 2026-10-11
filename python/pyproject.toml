@@ -8,7 +8,12 @@ version = "1.0.0"
 description = "TGAI GO —— 纯 Python 的 TGAI 模型推理库（CPU 引擎，零编译安装）"
 readme = "README.md"
 requires-python = ">=3.8"
-license = { text = "MIT" }
+# ★ license 用 SPDX 字符串（2026-10-11 改）
+#   原来写的是 license = { text = "MIT" }（TOML 表形式），
+#   setuptools >= 77 已弃用，构建时会刷一大段警告并声明
+#   2027-02-18 后不再支持。改成 SPDX 表达式即可（加 license-files 更规范）。
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "TGAI" }]
 keywords = ["tgai", "llm", "inference", "moe", "chinese", "llama"]
 classifiers = [
@@ -40,7 +45,14 @@ Documentation = "https://github.com/tgai/tgai-go#readme"
 tgai-go = "tgai_go.__main__:main"
 
 [tool.setuptools]
-packages = ["tgai_go"]
+# ★ _native 必须显式列出（2026-10-11 修）
+#   它是只装 .dll 的数据目录、没有 __init__.py，但仍被 Python 视为
+#   "可导入的包"。只写 packages = ["tgai_go"] 时 setuptools 会警告：
+#     Package 'tgai_go._native' is absent from the `packages` configuration
+#     -> Package would be ignored
+#   虽然实测 DLL 仍被打进 wheel（靠 package-data），但该警告属"配置含糊"，
+#   随时可能在某个 setuptools 版本变成真的丢文件。显式列出最稳。
+packages = ["tgai_go", "tgai_go._native"]
 include-package-data = true
 zip-safe = false
 

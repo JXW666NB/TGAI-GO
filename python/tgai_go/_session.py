@@ -332,9 +332,36 @@ class ChatSession:
             #   （依据：官方 Jinja 模板 _tgai_v27.jinja 的格式说明）
             #   实测收益：第 3 轮首 token 31.85s → 1.86s（快 17 倍）。
             _am = getattr(self, 'answer_marker', '<回答>')
+            # ★★ 修（2026-10-12）：历史段的档位标记必须与【模型实际生成】的一致。
+            #
+            #    否则 KV cache 前缀与下一轮重建的 prompt 差 1 个 token，
+            #    LCP 就断在这里，断点之后的全部历史都被重算。
+            #
+            #    实测（D:\tgai_build\find_break.py，模拟多轮）修复前：
+            #        轮 #2  LCP=12 处断裂：
+            #            cache : … ？ | <TGAI> | <思考> | \n | 嗯 | 用 | 户 | …
+            #            prompt: … ？ | <TGAI> | <回答> | \n | 嗯 | 用 | 户 | …
+            #        轮 #3  LCP=229 同样断在 <思考>/<回答> 之差
+            #        ⇒ 每轮仍要 prefill 300+ token，首 token 16~18 秒
+            #        （全量 prefill 实测 47~53 ms/token；809 token = 43 秒）
+            #
+            #    修复后实测（同一脚本）：
+            #        轮 #2  reused 314 / prefill 17 → 首 token 0.956s（原 15.978s）
+            #        轮 #3  reused 631 / prefill 12 → 首 token 0.716s（原 16.981s）
+            #        轮 #4  reused 927 / prefill  9 → 首 token 0.567s（原 17.963s）
+            #
+            #    原因：思考档时末尾喂的是 <TGAI><思考>\n（见下方 tail），
+            #          模型据此【首吐 <思考>】并把它写进 KV cache；
+            #          而历史段此前硬编码 <回答> ⇒ 正好差这 1 个 token。
+            #    修法：历史段标记跟随同一档位（think → <思考>）。
+            #    ★ 与官方 Jinja 模板一致：
+            #        直答档: <用户>\n{q}\n<TGAI><回答>\n{a}
+            #        思考档: <用户>\n{q}\n<TGAI><思考>\n{t}
+            _hist_marker = ('<思考>' if getattr(self, 'think_mode', 'direct') == 'think'
+                            else _am)
             for u, a in self.history[-self.max_turns:]:
                 parts.append(f"<用户>\n{u}")
-                parts.append(f"<TGAI>{_am}\n{a}")
+                parts.append(f"<TGAI>{_hist_marker}\n{a}")
             parts.append(f"<用户>\n{msg}")
             mode = getattr(self, 'think_mode', 'direct')
             tail = '<思考>' if mode == 'think' else '<回答>'

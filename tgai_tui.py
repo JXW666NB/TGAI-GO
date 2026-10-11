@@ -19,6 +19,8 @@ import sys
 import threading
 import time
 
+import sys as _sys
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 
@@ -213,6 +215,48 @@ ENV_SPEC = [
 #        · POSIX 用 select + termios（取不到就退化为不支持）
 #  注意：只是在【token 边界】检查，不会影响正在进行的 C 前向调用。
 # ══════════════════════════════════════════════════════════════
+class _Spinner:
+    """prefill 期间的思考指示器（后台线程，写 stderr 不干扰 stdout 流式）"""
+
+    FRAMES = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+
+    def __init__(self, label='思考中'):
+        self.label = label
+        self.stop = False
+        self.th = None
+        self.t0 = 0.0
+
+    def _run(self):
+        import itertools
+        import time as _t
+        for ch in itertools.cycle(self.FRAMES):
+            if self.stop:
+                break
+            el = _t.time() - self.t0
+            _sys.stderr.write('\r\033[K  %s%s%s %s  %.1fs  （按 Esc 可中断）'
+                              % (U.META, ch, U.RST, self.label, el))
+            _sys.stderr.flush()
+            _t.sleep(0.12)
+        _sys.stderr.write('\r\033[K')
+        _sys.stderr.flush()
+
+    def start(self, label=None):
+        import threading
+        import time as _t
+        if label:
+            self.label = label
+        self.t0 = _t.time()
+        self.stop = False
+        self.th = threading.Thread(target=self._run, daemon=True)
+        self.th.start()
+        return self
+
+    def done(self):
+        self.stop = True
+        if self.th:
+            self.th.join(timeout=0.5)
+
+
 def _kbhit_esc():
     """非阻塞探键盘：按了 Esc 或 q 返回 True"""
     try:
@@ -835,10 +879,21 @@ def main():
                 ctx['lock'].acquire()
                 try:
                     _, ids = chat.build_prompt(ui)
+                    # ★ 按下回车【立刻】给反馈（2026-10-11 加）
+                    #   长上下文时 prefill 要十几秒，这期间原来界面全静默，
+                    #   用户以为"回车没反应"。现在先打一行状态 + 起思考指示器，
+                    #   第一个 token 到达就撤掉。
+                    _cached = len(getattr(engine.kv_handle(), 'ids', []) or [])
+                    _pre = max(0, len(ids) - _cached)
+                    print('%s  已收到 · prompt %d token（需算 ~%d）%s'
+                          % (U.META, len(ids), _pre, U.RST), flush=True)
+                    _sp = _Spinner().start('思考中')
                     out, cnt = '', 0
                     for tok in generate(engine, ids, params,
                                         eos_id=chat.eos, eos_set=chat.eos_set,
                                         kv=engine.kv_handle()):
+                        if cnt == 0:
+                            _sp.done()      # 首个 token 到达，撤掉指示器
                         stream.feed(tok)    # 实时：字符立刻出现，落定套 MD 样式
                         out += tok
                         cnt += 1
@@ -848,6 +903,10 @@ def main():
                                   % (U.WARN, U.RST))
                             break
                 finally:
+                    try:
+                        _sp.done()
+                    except Exception:
+                        pass
                     ctx['lock'].release()
                 stream.flush()
                 el = time.time() - t0

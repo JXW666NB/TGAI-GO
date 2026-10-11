@@ -449,8 +449,14 @@ def input_box(width=None, hint='输入消息 …', extra=''):
     try:
         s = input()
     finally:
-        # 回车后光标在新行；擦掉该行（框保留在历史里，滚动式输出）
+        # ★ 回车后【立刻】擦掉输入行并回到行首
+        #   （滚动式输出：框保留在历史里）
+        #   踩坑：原来只写 \033[A\r\033[K，光标停在框内那一行的行首，
+        #   紧接着是十几秒的 prefill（长上下文），屏幕上没有任何变化
+        #   ⇒ 用户以为"回车没反应/没换行"。现在擦完再补一个换行，
+        #   光标落到新行，观感上"消息已发出"。
         _sys.stdout.write('\033[A\r\033[K')
+        _sys.stdout.write('\n')
         _sys.stdout.flush()
     return s.strip()
 

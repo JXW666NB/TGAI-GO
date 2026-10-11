@@ -382,6 +382,103 @@ def md_print(text, width=76, indent='', prefix=''):
 
 
 # ══════════════════════════════════════════════════════════════
+#  思考档渲染（2026-10-11 加，用户需求）
+#
+#  V2.7 思考档的原始输出形如：
+#      <思考>
+#      用户说你好，我想让你知道我是谁……<回答>
+#      你好！有什么我可以帮助你的吗？
+#
+#  问题（用户截图）：
+#    · 思考内容与正文同字体，看不出边界 → 用暗色+斜体+左侧竖线区分
+#    · <思考> / <回答> 档位标记直接打在屏幕上 → 一律吃掉
+#    · 希望可以隐藏思考内容 → hidden=True 只留一行摘要
+#
+#  实现：两个状态，切换点就是 <回答>
+#      phase='think'  逐行打印思考（THINK 暗色 + 斜体 + ▏）
+#      phase='answer' 委托 MdStream 做正文的 Markdown 渲染
+# ══════════════════════════════════════════════════════════════
+THINK = _c(245)
+THINK_BAR = _c(238)
+ITAL = _E + '3m'
+
+
+class ThinkStream:
+    """思考档流式渲染器"""
+
+    def __init__(self, width=76, prefix='', cont_prefix='',
+                 hidden=False, answer_marker='<回答>', think_open='<思考>'):
+        self.width = width
+        self.prefix = prefix
+        self.cont_prefix = cont_prefix
+        self.hidden = hidden
+        self.answer_marker = answer_marker
+        self.think_open = think_open
+        self.buf = ''
+        self.think_len = 0
+        self.done = False
+        self.md = None
+
+    # ── 标记处理 ──
+    def _clean(self, s):
+        """吃掉档位标记；返回 (剩余文本, 是否出现 <回答>)"""
+        if self.think_open:
+            s = s.replace(self.think_open, '')
+        if self.answer_marker and self.answer_marker in s:
+            k = s.find(self.answer_marker)
+            return s[:k] + s[k + len(self.answer_marker):], True
+        return s, False
+
+    # ── 思考行输出 ──
+    def _emit_think(self, line):
+        self.think_len += dw(line)
+        if self.hidden or not line.strip():
+            return
+        avail = max(16, self.width - dw(self.cont_prefix) - 2)
+        for seg in (wrap(line, avail) or ['']):
+            print('%s%s▏%s %s%s%s%s' % (self.cont_prefix, THINK_BAR, RST,
+                                        ITAL, THINK, seg, RST), flush=True)
+
+    def _switch(self):
+        """从思考切到正文"""
+        self.done = True
+        if self.hidden and self.think_len:
+            print('%s%s▏%s %s[思考 %d 字已隐藏 · /think show 可显示]%s'
+                  % (self.cont_prefix, THINK_BAR, RST, THINK,
+                     self.think_len, RST), flush=True)
+        self.md = MdStream(width=self.width, prefix=self.prefix,
+                           cont_prefix=self.cont_prefix)
+
+    # ── 对外 ──
+    def feed(self, chunk):
+        if self.done:
+            self.md.feed(chunk)
+            return
+        self.buf += chunk
+        while '\n' in self.buf:
+            line, self.buf = self.buf.split('\n', 1)
+            line, hit = self._clean(line)
+            if line:
+                self._emit_think(line)
+            if hit:
+                self._switch()
+                rest, self.buf = self.buf, ''
+                if rest:
+                    self.md.feed(rest)
+                return
+
+    def flush(self):
+        if self.done:
+            self.md.flush()
+            return
+        rest, hit = self._clean(self.buf)
+        self.buf = ''
+        if rest:
+            self._emit_think(rest)
+        self._switch()          # 没出 <回答> 也切（保证正文样式恢复）
+
+
+# ══════════════════════════════════════════════════════════════
 #  底部输入框 + 状态栏（2026-10-10 加，用户要求"输入框在下面，类似 xiaoli"）
 #
 #  视觉（参考小狸 CLI）：

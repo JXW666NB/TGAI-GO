@@ -98,18 +98,25 @@ def ui_user(text, width=None):
     print()
 
 
-def ui_ai_start():
-    """助手回复起始：返回流式 Markdown 渲染器
+def ui_ai_start(think=False, hidden=False):
+    """助手回复起始：返回流式渲染器
 
-    ★ 前缀只落首行（cont_prefix=''）：定版观感是
-          TGAI › 你好！……
-          续行/段落顶格
-      而不是每行都带前缀（那是窗框版左侧栏的做法）。
-    ★ 宽度取终端宽度（term_width，54~158 夹取），续行可顶到最右。
+    ★ 思考档（2026-10-11 加，用户需求）：
+        V2.7 思考档的原始输出是 "<思考>…思考…<回答>…正文"。
+        原来整段用同一种样式打印，用户看不出思考与正文的边界，
+        且 <回答> 标记直接打在屏幕上。
+        现在：
+          · think=True → 返回 ThinkStream：思考段暗色+斜体+左侧竖线 ▏，
+            遇到 <回答> 自动切到正文的正常 Markdown 渲染，标记一律吃掉
+          · hidden=True → 思考内容不打印，只在切换处留一行摘要
+          · think=False → 仍是普通 MdStream（直答档）
     """
-    return MdStream(width=U.term_width(),
-                    prefix='%s%sTGAI ›%s ' % (U.AI, U.BLD, U.RST),
-                    cont_prefix='')
+    pfx = '%s%sTGAI ›%s ' % (U.AI, U.BLD, U.RST)
+    W = U.term_width()
+    if think:
+        return U.ThinkStream(width=W, prefix=pfx, cont_prefix='',
+                             hidden=hidden)
+    return MdStream(width=W, prefix=pfx, cont_prefix='')
 
 
 def ui_ai_meta(cnt, sec, tps, note=''):
@@ -735,9 +742,26 @@ def handle_command(line, ctx):
         else:
             print(f"{C.DIM}没有可撤销的{C.RST}")
     elif cmd == 'think':
+        # ★ /think            → 在 direct / think 之间切换档位
+        #   /think show|hide  → 思考档下是否显示思考内容（用户需求："还有隐藏"）
+        #   /think on|off     → 明确设定档位
+        _arg = (args[0].lower() if args else '')
         cur = getattr(chat, 'think_mode', 'direct')
-        chat.think_mode = 'think' if cur == 'direct' else 'direct'
-        print(f"{C.GRN}档位 -> {chat.think_mode}{C.RST}")
+        if _arg in ('show', 'hide'):
+            ctx['think_hidden'] = (_arg == 'hide')
+            print('%s思考内容 -> %s%s'
+                  % (C.GRN, '隐藏' if _arg == 'hide' else '显示', C.RST))
+        elif _arg in ('on', 'off'):
+            chat.think_mode = 'think' if _arg == 'on' else 'direct'
+            print(f"{C.GRN}档位 -> {chat.think_mode}{C.RST}")
+        else:
+            chat.think_mode = 'think' if cur == 'direct' else 'direct'
+            _hid = '隐藏' if ctx.get('think_hidden') else '显示'
+            print('%s档位 -> %s  （思考内容：%s）%s'
+                  % (C.GRN, chat.think_mode, _hid, C.RST))
+            if chat.think_mode == 'think':
+                print('%s  提示：/think hide 可隐藏思考过程；'
+                      '/think show 显示%s' % (C.DIM, C.RST))
     elif cmd == 'history':
         if not chat.history:
             print(f"{C.DIM}（空）{C.RST}")
@@ -888,7 +912,13 @@ def main():
                 continue
 
             t0 = time.time()
-            stream = ui_ai_start()          # ★ 流式 Markdown（逐行实时渲染）
+            # ★ 按档位选渲染器（2026-10-11）
+            #    think 档 → ThinkStream（思考段暗色斜体，遇 <回答> 切正文）
+            #    direct 档 → MdStream（普通 Markdown）
+            #    ctx['think_hidden'] 由 /think hide|show 控制
+            stream = ui_ai_start(
+                think=(getattr(chat, 'think_mode', 'direct') == 'think'),
+                hidden=bool(ctx.get('think_hidden', False)))
             try:
                 # ★ 与接口请求串行：引擎非线程安全（C 侧全局 scratch + 线程池）
                 ctx['lock'].acquire()

@@ -14,105 +14,100 @@
 """
 import argparse
 import os
+import queue
 import sys
+import threading
 import time
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 
 from tgai_chat import (C, TGEngine, ChatSession, generate,   # noqa: E402
-                       DRY_BREAKERS)
+                       DRY_BREAKERS, kv_safe_text)
 
 # ══════════════════════════════════════════════════════════════
-#  视觉层 —— 全部委托给 tgai_ui（在终端里渲染「GUI 聊天窗口」观感）
+#  视觉层 —— 朴素前缀风格（2026-10-11 按用户要求定版，只动"怎么画"）
 #
-#  为什么抽成独立模块：
-#    业务逻辑（命令 / 调参 / 生成循环）与"怎么画"分离，
-#    改视觉只动 tgai_ui.py，不动这个已经稳定跑通的 TUI 主流程。
-#  风格参考：小狸 CLI / Claude Code —— 不用聊天气泡，靠
-#    前缀字形 + 色块 + Markdown 样式区分角色与结构。
+#  定版样式（用户截图确认）：
+#      You ›  <输入>                     ← 绿色前缀；输入行本身即回显
+#      TGAI › <回答……>                   ← 蓝色前缀只落【首行】，续行顶格
+#        332 tok | 25.8s | 12.9 tok/s    ← 灰色速度行（上方空一行）
+#
+#  ★ 明确保留（用户要求）：
+#      · 启动 ASCII logo（tgai_art.splash_lines，见 main）
+#      · Markdown 渲染机制（MdStream：实时吐字 + 行落定重绘样式）
+#  ★ 去掉：窗框 / 消息气泡 / 底部输入框 / 状态栏 —— 回到滚动式输出，
+#    渲染是"逐行 print"的滚动式，没有全屏重画 ⇒ 天然逐字流式。
 # ══════════════════════════════════════════════════════════════
-from tgai_ui import (Frame, MdStream, md_render, md_print,      # noqa: E402
-                     term_width, dw, wrap, trunc_pad)           # noqa: E402
-import tgai_ui as U                                            # noqa: E402
-
-# 窗框（全局单例，宽度随终端取一次）
-FRAME = Frame(title='TGAI GO', right='')
+from tgai_ui import MdStream                                 # noqa: E402
+import tgai_ui as U                                          # noqa: E402
 
 
-def ui_begin(model_name, right=''):
-    """画窗口顶栏 + 状态行（模型加载完成后调用一次）"""
-    FRAME.right = right
-    FRAME.top()
+def ui_ask(ctx=None, poll=0.05):
+    """读取一行输入（提示符 You ›）
 
-
-def ui_rule(label=''):
-    FRAME.rule(label)
-
-
-def ui_row(text='', color=''):
-    FRAME.row(text, color)
-
-
-def ui_status(pairs):
-    """顶部参数摘要（灰色，三行）
-
-    视觉（2026-10-10 美化）：
-        ────────────────────────────────────────────────────────
-          ◈ TGAI GO                                8K · 4线程
-          模型 v27_merged_bf16.TG · 层 28 · 维度 1024 · 专家 8/2
-          /help 命令 · /params 调参 · /threads 线程 · /exit 退出
-    分组：右侧放最常看的两个量，中间放模型结构，末行放操作提示。
+    ★ 2026-10-11 改：Windows 交互终端下用 msvcrt.kbhit() 非阻塞轮询，
+      等待期间每 poll 秒 drain 一次接口事件队列 ⇒ 请求到达即显示，
+      不必等用户输入。
+    ★ 非 TTY（管道/重定向）：input() 会立即抛 EOFError 或读到换行，
+      接口事件在"读输入前"的 drain 里统一显示，无需轮询。
     """
-    inner = FRAME.W - 4
-    FRAME.row('')
-    # 第一行：品牌 + 右对齐的关键标签
-    left = '%s%s◈ TGAI GO%s' % (U.BRAND, U.BLD, U.RST)
-    right = ''
-    for k, tag in (('上下文', None), ('线程', None)):
-        for kk, vv in pairs:
-            if kk == k:
-                right += '%s%s%s  ' % (U.META, vv, U.RST)
-    gap = max(1, inner - U.dw(left) - U.dw(right) - 4)
-    FRAME.row('  ' + left + ' ' * gap + right)
-    # 第二行：模型结构（灰色，· 分隔）
-    struct = ['%s %s' % (k, v) for k, v in pairs
-              if k in ('模型', '层', '维度', '专家')]
-    if struct:
-        FRAME.row('  ' + U.META + ' · '.join(struct) + U.RST)
-    # 第三行：操作提示
-    FRAME.row('  ' + U.META
-              + '/help 命令 · /params 调参 · /threads 线程 · /exit 退出' + U.RST)
-    FRAME.row('')
-
-
-def ui_user(text):
-    """用户消息（无气泡，前缀字形区分）
-
-    ★ 这里【只打印一次】：输入框本身已经把用户输入回显过了，
-      若再打一遍就会出现"> You 你好"连续两条的重复观感
-      （实测踩坑：以前输入框只有裸 input()，回显在框内不算重复）。
-    """
-    print('%s%s%s %s%s> You%s  %s' % (U.LINE, U.V, U.RST, U.USER, U.BLD, U.RST, text))
+    prompt = '%s%sYou ›%s ' % (U.USER, U.BLD, U.RST)
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        s = input(prompt).strip()
+        if not sys.stdout.isatty():
+            print()      # 管道：终端不回显输入、也不替你换行 ⇒ 手动补换行
+        return s
+    # Windows 交互终端：非阻塞轮询（Input 没有非阻塞 API，用 msvcrt）
+    import msvcrt                       # noqa: F401   （仅 Windows 可用）
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+    buf = []
+    while True:
+        if ctx and ctx.get('api_queue'):
+            _drain_api_echo(ctx)        # 等输入间隙：实时显示接口请求/回复
+        if msvcrt.kbhit():
+            ch = msvcrt.getwch()
+            if ch in ('\r', '\n'):       # 回车
+                sys.stdout.write('\n')
+                sys.stdout.flush()
+                return ''.join(buf).strip()
+            if ch == '\x03':             # Ctrl+C
+                raise KeyboardInterrupt
+            if ch == '\b':               # 退格
+                if buf:
+                    buf.pop()
+                    sys.stdout.write('\b \b')
+                    sys.stdout.flush()
+                continue
+            buf.append(ch)
+            sys.stdout.write(ch)
+            sys.stdout.flush()
+        else:
+            import time as _t
+            _t.sleep(poll)
 
 
 def ui_ai_start():
-    """助手回复起始行；返回流式渲染器（内容区宽 = 窗口内宽 - 6）"""
-    print('%s%s%s %s%s◆ TGAI%s' % (U.LINE, U.V, U.RST, U.AI, U.BLD, U.RST))
-    pfx = '%s%s%s   ' % (U.LINE, U.V, U.RST)
-    return MdStream(width=FRAME.W - 6, prefix=pfx)
+    """助手回复起始：返回流式 Markdown 渲染器
+
+    ★ 前缀只落首行（cont_prefix=''）：定版观感是
+          TGAI › 你好！……
+          续行/段落顶格
+      而不是每行都带前缀（那是窗框版左侧栏的做法）。
+    ★ 宽度取终端宽度（term_width，54~158 夹取），续行可顶到最右。
+    """
+    return MdStream(width=U.term_width(),
+                    prefix='%s%sTGAI ›%s ' % (U.AI, U.BLD, U.RST),
+                    cont_prefix='')
 
 
 def ui_ai_meta(cnt, sec, tps, note=''):
-    s = '  %d tok · %.1fs · %.1f tok/s' % (cnt, sec, tps)
+    """速度行（灰色；与定版截图一致：两空格缩进、'|' 分隔、上方空一行）"""
+    s = '  %d tok | %.1fs | %.1f tok/s' % (cnt, sec, tps)
     if note:
-        s += ' · ' + note
-    FRAME.row('')
-    FRAME.row(s, U.META)
-
-
-def ui_end():
-    FRAME.bottom()
+        s += '  %s[%s]%s' % (U.WARN, note, U.RST)
+    print('\n%s%s%s' % (U.META, s, U.RST))
 
 
 # ══════════════════════════════════════════════════════════════
@@ -171,6 +166,42 @@ PRESETS = {
 }
 
 
+# ══════════════════════════════════════════════════════════════
+#  生成行为环境变量表（/help 展示、/env 查当前生效值）
+#
+#  ★ 为什么是环境变量而不是 /set 参数：
+#    这些值是 tgai_chat.py 在【模块导入时】读取的模块级常量（其顶部 _env_f），
+#    进程启动后即固定 ⇒ 只能"先 set 再启动"，进程内不可热改。
+#    const 列 = tgai_chat 里的常量名（/env 用它读真实生效值；None 表示该
+#    变量由 generate() 直接读 os.environ，不落模块常量）。
+# ══════════════════════════════════════════════════════════════
+ENV_SPEC = [
+    # (环境变量名, tgai_chat 常量名, 默认值, 说明)
+    ('TGAI_SOFT_STOP_PER_TOK', 'SOFT_STOP_PER_TOK', 0.08,
+     '框外收尾：每 token 递增的 logit（0=整体关闭）'),
+    ('TGAI_SOFT_STOP_AT_REMAIN', 'SOFT_STOP_AT_REMAIN', 64,
+     '框外收尾：剩余多少 token 时开始施加'),
+    ('TGAI_SOFT_STOP_AFTER', 'SOFT_STOP_AFTER', 256,
+     '框外收尾：已生成多少 token 后开始施加（与上一条取先到）'),
+    ('TGAI_SOFT_STOP_MAX_LOGIT', 'SOFT_STOP_MAX_LOGIT', 3.0,
+     '★ 框外收尾最大 logit 加常数（+1≈×2.7、+3≈×20、+5≈×148）'),
+    ('TGAI_CODE_CLOSE_SLOPE', 'CODE_CLOSE_SLOPE', 0.03,
+     '代码块内：每 token 给闭合反引号加的 logit（线性斜坡）'),
+    ('TGAI_CODE_CLOSE_MAX_LOGIT', 'CODE_CLOSE_MAX_LOGIT', 3.0,
+     '★ 代码块内闭合偏置上限'),
+    ('TGAI_CODE_REPEAT_PENALTY', 'CODE_REPEAT_PENALTY', 1.10,
+     '代码块内：重复惩罚（防函数名复读）'),
+    ('TGAI_CODE_DRY_MULTIPLIER', 'CODE_DRY_MULTIPLIER', 2.5,
+     '代码块内：DRY 强度'),
+    ('TGAI_CODE_FREQ_PENALTY', 'CODE_FREQ_PENALTY', 0.1,
+     '代码块内：频率惩罚'),
+    ('TGAI_STOP', None, '',
+     '追加停止串（多个用 | 分隔）'),
+    ('TGAI_STOP_TRACE', None, '',
+     '设 1 时打印停止原因（排查"输出被腰斩"）'),
+]
+
+
 def default_params():
     return {n: d for n, _t, d, _r, _h in PARAM_SPEC}
 
@@ -182,34 +213,26 @@ def show_help():
     print(f"""
 {C.BLD}═══ TGAI GO 命令 ═══{C.RST}
 
-{C.CYN}对话{C.RST}
-  直接输入文字即可对话（回车发送）
+{C.CYN}对话{C.RST}    直接输入文字后回车发送（You › 提示符）
 
-{C.CYN}参数调优（立即生效，无需重启）{C.RST}
-  {C.GRN}/params{C.RST}                 显示当前所有参数
-  {C.GRN}/set <名> <值>{C.RST}           改一个参数     例：/set temperature 0.3
-  {C.GRN}/get <名>{C.RST}                看一个参数
-  {C.GRN}/preset <名>{C.RST}             套用预设
-  {C.GRN}/presets{C.RST}                 列出预设
+{C.CYN}参数{C.RST}    /params 看全部 · /set <名> <值> 改一个 · /get <名> 看一个
+        /preset <名> 套预设 · /presets 列预设       {C.DIM}(立即生效){C.RST}
+{C.CYN}会话{C.RST}    /think 档位 · /clear 清空 · /undo 撤销一轮
+        /save <文件> 存对话 · /params-save <文件.json> 存参数
+{C.CYN}模型{C.RST}    /model 看当前模型 · /model <TG路径> 换模型（历史清空）
+        /stats 模型/性能 · /threads [N] 推理线程数
+{C.CYN}服务{C.RST}    /server [端口] 开 OpenAI 兼容服务（与聊天同进程）
+        {C.DIM}接口调用为单次调用、不带本机历史；请求/回复会显示在对话里{C.RST}
+{C.CYN}环境{C.RST}    /env 收尾偏置 / 代码块参数（环境变量，启动前 set）
+{C.CYN}其它{C.RST}    /help · /exit 退出
 
-{C.CYN}对话控制{C.RST}
-  {C.GRN}/think{C.RST}                   切换档位（直答 ⇄ 思考）
-  {C.GRN}/clear{C.RST}                   清空历史（同时重置 KV cache）
-  {C.GRN}/undo{C.RST}                    撤销最后一轮
-  {C.GRN}/save <文件>{C.RST}             保存对话到文件
-  {C.GRN}/params-save <文件>{C.RST}      保存当前参数为 JSON
-
-{C.CYN}信息{C.RST}
-  {C.GRN}/stats{C.RST}                   模型 / 性能信息
-  {C.GRN}/threads [N]{C.RST}             查看 CPU 线程数；给 N 则设置
-                                 {C.DIM}例：/threads 8（本机物理核数通常最优）{C.RST}
-  {C.GRN}/history{C.RST}                 查看对话历史
-  {C.GRN}/help{C.RST}                    本帮助
-  {C.GRN}/exit{C.RST}                    退出
-
-{C.DIM}提示：参数改动会被记录，/params 里带 * 的是被改过的{C.RST}
+{C.DIM}启动参数（cmd：tgai.bat …）：
+  models               列出可用模型（序号 + 大小 + 自动选中项）
+  chat -m <序号|名称|路径>   指定模型进入对话
+  chat --server 8080   对话 + 同进程开 OpenAI 服务
+  server --port 11435  只开 OpenAI 兼容服务器（独立进程）
+  help                 全部子命令{C.RST}
 """)
-
 
 def show_params(params, changed):
     print(f"\n{C.BLD}═══ 当前参数 ═══{C.RST}")
@@ -235,6 +258,264 @@ def show_presets():
     print(f"\n  用法：{C.GRN}/preset balanced{C.RST}\n")
 
 
+def show_env():
+    """显示生成行为环境变量的当前生效值（/env）
+
+    ★ 只能看、不能进程内改：这些值是 tgai_chat.py 在【模块导入时】
+      读取的模块级常量（见其顶部 _env_f），启动后即固定。
+      要改：先 set 再启动（cmd 例见 /help 的「生成行为」段）。
+    ★ 生效值优先取 tgai_chat 的常量（导入时已解析，最真实）；
+      无常量（TGAI_STOP / TGAI_STOP_TRACE）时直接显示环境变量值。
+    """
+    import os as _os
+    import tgai_chat as _tc
+    print(f"\n{C.BLD}═══ 生成行为参数（环境变量） ═══{C.RST}")
+    print(f"  {C.DIM}{'环境变量':<27}{'生效值':<12}{'默认':<10}说明{C.RST}")
+    print(f"  {C.DIM}{'-' * 94}{C.RST}")
+    for name, const, dflt, help_ in ENV_SPEC:
+        raw = _os.environ.get(name, '')
+        if const and hasattr(_tc, const):
+            cur = getattr(_tc, const)      # 导入时已解析的真实生效值
+        else:
+            cur = raw if raw else dflt
+        star = f"{C.YLW}*{C.RST}" if raw else ' '
+        col = C.YLW if raw else ''
+        print(f"  {star}{col}{name:<26}{C.RST}{str(cur):<12}{str(dflt):<10}"
+              f"{C.DIM}{help_}{C.RST}")
+    print(f"\n  {C.DIM}* = 已被环境变量改写；改动需先 set 再启动（进程内不可热改）{C.RST}")
+    print(f"  {C.DIM}示例：set TGAI_SOFT_STOP_MAX_LOGIT=5.0"
+          f" & set TGAI_SOFT_STOP_PER_TOK=0.15{C.RST}\n")
+
+
+# ══════════════════════════════════════════════════════════════
+#  模型切换 / 内嵌 OpenAI 服务（2026-10-11 加，UI 与服务编排层）
+#
+#  ★ 设计依据（用户定版）：
+#    · 换模型 = 直接输入 .TG 文件路径（工程测试面板，不做选择菜单）
+#    · OpenAI 服务与聊天【同进程共用引擎】：接口请求是单次调用、
+#      不带任何本机对话历史（与独立 tgai_server 语义一致），
+#      但请求/回复会同步打印到对话里，便于盯着看。
+#    · 引擎非线程安全 ⇒ 聊天与接口共用一把锁（ctx['lock']）；
+#      接口侧另有自己的 KV cache（kv=None），不碰本机会话缓存。
+# ══════════════════════════════════════════════════════════════
+TG_MAGIC = 0x49414754          # .TG 文件头魔数（"TGAI" little-endian）
+
+
+def _check_tg_file(path):
+    """换模型前的轻量校验：存在 + .TG 魔数
+
+    ★ 为什么先校验：换模型的顺序是"先释放旧的、再加载新的"，
+      万一新文件是坏的，旧模型还在 ⇒ 回退成本最低。
+    """
+    if not os.path.isfile(path):
+        return '文件不存在: %s' % path
+    try:
+        with open(path, 'rb') as f:
+            head = f.read(4)
+    except OSError as exc:
+        return '无法读取: %s' % exc
+    if len(head) < 4 or int.from_bytes(head, 'little') != TG_MAGIC:
+        return '不是 .TG 模型文件（文件头魔数不符）: %s' % path
+    return ''
+
+
+def apply_model_defaults(engine, params, changed):
+    """应用模型内嵌的 gen_defaults（启动与 /model 共用）；返回提示文本"""
+    gd = (getattr(engine, 'chat_meta', None) or {}).get('gen_defaults') or {}
+    n = 0
+    for k, v in gd.items():
+        if k not in SPEC_BY_NAME:
+            continue                      # 未知键忽略（向前兼容）
+        try:
+            pv = SPEC_BY_NAME[k][1](v)
+        except (TypeError, ValueError):
+            continue
+        params[k] = pv
+        n += 1
+        if pv != SPEC_BY_NAME[k][2]:
+            changed.add(k)
+    if not n:
+        return ''
+    applied = ', '.join('%s=%s' % (k, params[k]) for k in list(gd)[:4])
+    return '模型自带默认值 %d 项（%s…）' % (n, applied)
+
+
+def print_model_info(engine, chat, params, mname):
+    """灰色小字：模型结构 + 运行参数（启动与 /model 切换后共用）"""
+    cfg = engine.cfg
+    ctx_s = '%dK' % (cfg['max_seq'] // 1024) if cfg.get('max_seq') else '?'
+    exp = '%d/%d' % (cfg.get('n_experts', 0), cfg.get('n_activated', 0)) \
+        if cfg.get('n_experts') else 'dense'
+    nthr = engine.get_threads() if hasattr(engine, 'get_threads') else 4
+    print('%s  模型 %s · 层 %s · 维度 %s · 专家 %s%s'
+          % (U.META, mname, cfg.get('n_layers', '?'),
+             cfg.get('d_model', '?'), exp, U.RST))
+    print('%s  %s · %d线程 · 档位 %s · temp %s · top_k %s%s'
+          % (U.META, ctx_s, nthr, getattr(chat, 'think_mode', 'direct'),
+             params.get('temperature', 0.3), params.get('top_k', 60), U.RST))
+
+
+def reload_model(path, ctx):
+    """换模型：释放旧引擎 → 加载新模型 → 重建会话（历史清空）
+
+    ★ 为什么进程内换是安全的（不是重启进程）：
+      引擎 C 侧 tg_engine_shutdown() 只关线程池，并把 g_pool_ready 复位；
+      下一次推理时 tg_pool_ensure() 会【自动重建线程池】（见 tgai_engine.c）。
+      tg_load/tg_free 的其余状态都是 per-model 的，DLL 也保持加载。
+    """
+    err = _check_tg_file(path)
+    if err:
+        print('%s[换模型失败] %s%s' % (U.ERR, err, U.RST))
+        print('%s  当前模型: %s%s'
+              % (U.META, ctx.get('model_path', '?'), U.RST))
+        return False
+
+    old_path = ctx.get('model_path')
+    old_think = getattr(ctx.get('chat'), 'think_mode', 'direct')
+    lock = ctx['lock']
+    with lock:                     # 与接口请求串行，避免并发换模型/并发推理
+        old = ctx.get('engine')
+        try:
+            if old is not None:
+                old.free()         # 释放 KV + 模型 + 关线程池（下次推理自动重建）
+        except Exception as exc:                                # noqa: BLE001
+            print('%s[警告] 旧模型释放异常: %s%s' % (U.WARN, exc, U.RST))
+
+        new_engine = TGEngine(dll_path=ctx.get('dll'))
+        try:
+            new_engine.load(path, extend_ctx=ctx.get('extend', 0) or 0)
+        except Exception as exc:                                # noqa: BLE001
+            print('%s[换模型失败] 加载出错: %s%s' % (U.ERR, exc, U.RST))
+            if old_path and not _check_tg_file(old_path):
+                try:
+                    new_engine = TGEngine(dll_path=ctx.get('dll'))
+                    new_engine.load(old_path,
+                                    extend_ctx=ctx.get('extend', 0) or 0)
+                    print('%s  已回退到原模型%s' % (U.WARN, U.RST))
+                except Exception:                               # noqa: BLE001
+                    print('%s  回退失败，请退出后重新启动%s' % (U.ERR, U.RST))
+                    ctx['engine'] = None
+                    ctx['chat'] = None
+                    return False
+            else:
+                ctx['engine'] = None
+                ctx['chat'] = None
+                return False
+
+        chat = ChatSession(new_engine, sys_prompt=ctx.get('sys', ''))
+        chat.think_mode = old_think            # 档位是 UI 偏好，跟着走
+        ctx['engine'] = new_engine
+        ctx['chat'] = chat
+        ctx['model_path'] = path
+        ctx['last_stat'] = None
+        note = apply_model_defaults(new_engine, ctx['params'], ctx['changed'])
+
+    print('%s  已切换模型（对话历史已清空）%s' % (U.WARN, U.RST))
+    print_model_info(ctx['engine'], ctx['chat'], ctx['params'],
+                     os.path.basename(path))
+    if note:
+        print('%s  %s%s' % (U.META, note, U.RST))
+    return True
+
+
+_API_QUEUE = None          # 内嵌服务时指向 ctx['api_queue']（start_inprocess_server 设置）
+
+
+def _api_enqueue(kind, info):
+    """OpenAI 接口事件 → 入队（HTTP 线程调用；只入队，绝不 print）
+
+    ★ 2026-10-11 改：原 _api_echo 在 HTTP 线程里直接 print，会插进
+      MdStream 实时区中间，被下一次 \r/ESC[K/ESC[A 擦掉或打乱 ⇒ 看不到。
+      改为入队，由主循环在安全时机（生成结束 / 读输入前）统一打印。
+    ★ 队列对象来自全局 _API_QUEUE（start_inprocess_server 时设置）。
+    """
+    if _API_QUEUE is not None:
+        try:
+            _API_QUEUE.put((kind, info))
+        except Exception:                                        # noqa: BLE001
+            pass
+
+
+def _drain_api_echo(ctx, max_show=6):
+    """主循环在安全时机排空 API 事件队列并打印到聊天框
+
+    ★ 调用时机必须【没有任何实时区】：
+      · 一轮生成结束（stream.flush() 之后）
+      · 读取输入之前
+    ★ 只显示，不写入本机对话历史；HTTP 线程已用 on_event 入队。
+    """
+    q = ctx.get('api_queue')
+    if not q:
+        return
+    n = 0
+    while True:
+        try:
+            kind, info = q.get_nowait()
+        except queue.Empty:
+            break
+        try:
+            if kind == 'start':
+                txt = (info.get('user_text') or '').replace('\n', ' ').strip()
+                if len(txt) > 60:
+                    txt = txt[:60] + '…'
+                extra = ' · stream' if info.get('stream') else ''
+                print('\n%s[API]%s %s%s  ← %s'
+                      % (U.WARN, U.RST, info.get('endpoint', '?'), extra, txt),
+                      flush=True)
+            elif kind == 'end':
+                a = (info.get('text') or '').replace('\n', ' ').strip()
+                if len(a) > 60:
+                    a = a[:60] + '…'
+                sec = float(info.get('sec') or 0.0)
+                nn = int(info.get('tokens') or 0)
+                tps = (nn / sec) if sec > 0 else 0.0
+                print('%s[API]%s → %d tok · %.1fs · %.1f tok/s · %s\n'
+                      % (U.META, U.RST, nn, sec, tps, a), flush=True)
+        except Exception:                                        # noqa: BLE001
+            pass
+        n += 1
+        if n >= max_show:          # 一次排空太多会刷屏，分批显示
+            break
+
+
+def start_inprocess_server(ctx, port, host='127.0.0.1'):
+    """在【当前进程】开 OpenAI 兼容服务（与聊天共用引擎与锁）
+
+    ★ 语义（用户定版）：接口调用为单次调用，不带任何本机历史；
+      请求/回复通过 _api_echo 同步显示在对话里。
+    """
+    import tgai_server
+    if ctx.get('server'):
+        try:
+            p = ctx['server'].server_address[1]
+        except Exception:                                       # noqa: BLE001
+            p = port
+        print('%s  服务已在运行: http://%s:%s/v1  （累计 %d 次请求）%s'
+              % (U.WARN, host, p, tgai_server.STATE['n_requests'], U.RST))
+        return True
+    tgai_server.STATE['engine'] = ctx['engine']
+    tgai_server.STATE['params'] = ctx['params']
+    tgai_server.STATE['lock'] = ctx['lock']
+    tgai_server.STATE['model_name'] = os.path.splitext(
+        os.path.basename(ctx.get('model_path') or ''))[0] or 'tgai'
+    global _API_QUEUE
+    _API_QUEUE = ctx.get('api_queue')
+    try:
+        srv, _th = tgai_server.start_server(host, port, on_event=_api_enqueue)
+    except OSError as exc:
+        print('%s[服务启动失败] 端口 %d 可能被占用: %s%s'
+              % (U.ERR, port, exc, U.RST))
+        return False
+    ctx['server'] = srv
+    print('%s  OpenAI 兼容服务已开启：http://%s:%d/v1%s'
+          % (U.WARN, host, port, U.RST))
+    print('%s    模型名 %s · 单次调用（不带本机历史）· 请求会显示在本对话里%s'
+          % (U.META, tgai_server.STATE['model_name'], U.RST))
+    print('%s    测试: curl http://%s:%d/v1/models%s'
+          % (U.META, host, port, U.RST))
+    return True
+
+
 # ══════════════════════════════════════════════════════════════
 #  命令处理
 # ══════════════════════════════════════════════════════════════
@@ -256,6 +537,27 @@ def handle_command(line, ctx):
         show_params(P, changed)
     elif cmd == 'presets':
         show_presets()
+    elif cmd == 'env':
+        show_env()
+    elif cmd == 'model':
+        if not args:
+            print('%s  当前模型: %s%s'
+                  % (U.META, ctx.get('model_path', '?'), U.RST))
+            print('%s  换模型：/model <TG 文件完整路径>（切换后对话历史清空）%s'
+                  % (U.META, U.RST))
+        else:
+            path = ' '.join(args).strip().strip('"').strip("'")
+            reload_model(path, ctx)
+    elif cmd == 'server':
+        port = 8080
+        if args:
+            try:
+                port = int(args[0])
+            except ValueError:
+                print('%s用法: /server [端口]   例：/server 11435%s'
+                      % (U.ERR, U.RST))
+                return True
+        start_inprocess_server(ctx, port)
     elif cmd == 'preset':
         if not args:
             print(f"{C.RED}用法: /preset <名>  （/presets 看列表）{C.RST}")
@@ -390,12 +692,14 @@ def main():
     ap.add_argument('--extend', type=int, default=0, help='上下文扩展目标长度')
     ap.add_argument('--preset', default='balanced',
                     choices=list(PRESETS.keys()), help='启动预设')
+    ap.add_argument('--server', nargs='?', const=8080, type=int, default=None,
+                    help='启动同进程 OpenAI 兼容服务（可给端口，默认 8080）')
     args = ap.parse_args()
 
     _mname = os.path.basename(args.model or '') or '(自动)'
     _W = U.term_width()
 
-    # ── 启动横幅：ASCII logo + 颜文字（用户指定保留）──
+    # ── 启动横幅：ASCII logo + 颜文字（用户指定保留，勿动）──
     #   ★ 刻意【不做全屏】：全屏要整屏重画，会把流式输出干掉。
     #     这里是 CLI/TUI 原生的滚动式输出，流式才能逐 token 出来。
     try:
@@ -421,79 +725,52 @@ def main():
             if v != SPEC_BY_NAME[k][2]:
                 changed.add(k)
 
-    # ★ 模型内嵌的 gen_defaults 优先（2026-10-10 加）
-    #   动机：.TG 文件自己声明"我该用什么采样参数"（与对话模板、停止符同源），
-    #        这样第三方模型/调过参的模型无需改引擎代码即可生效。
-    #   为什么放在 preset 之后：模型自带参数是【该模型的权威默认值】，
-    #        而 --preset 是通用取向模板；若用户显式 /set 过则仍以 /set 为准。
-    #   实测踩坑：V2.7 自带 temperature=0.3/top_k=60，但 balanced 预设的
-    #        0.6/40 会把它覆盖掉，导致"改了模型配置却不生效"。
-    _meta_gd = (getattr(engine, 'chat_meta', None) or {}).get('gen_defaults') or {}
-    _n_meta = 0
-    for _k, _v in _meta_gd.items():
-        if _k not in SPEC_BY_NAME:
-            continue                      # 未知键忽略（向前兼容）
-        _typ = SPEC_BY_NAME[_k][1]
-        try:
-            _pv = _typ(_v)
-        except (TypeError, ValueError):
-            continue
-        params[_k] = _pv
-        _n_meta += 1
-        if _pv != SPEC_BY_NAME[_k][2]:
-            changed.add(_k)
-    if _n_meta:
-        _applied = ', '.join('%s=%s' % (k, params[k]) for k in list(_meta_gd)[:4])
-        changed.add('__meta__')          # 仅用于状态行提示，不参与参数比较
-        _meta_note = '模型自带默认值 %d 项（%s…）' % (_n_meta, _applied)
+    # ★ 模型内嵌的 gen_defaults 优先（2026-10-10 加；逻辑已抽到
+    #   apply_model_defaults，与 /model 换模型共用同一份实现）
+    _meta_note = apply_model_defaults(engine, params, changed)
+    if _meta_note:
+        changed.add('__meta__')          # 仅用于提示，不参与参数比较
     else:
         _meta_note = ''
 
     ctx = {'engine': engine, 'chat': chat, 'params': params,
-           'changed': changed, 'last_stat': None, 'changed_turns': 0}
+           'changed': changed, 'last_stat': None, 'changed_turns': 0,
+           # ★ 2026-10-11 加：/model 与 /server 需要
+           'lock': threading.Lock(),      # 引擎非线程安全（聊天/接口共用）
+           'dll': args.dll, 'extend': args.extend, 'sys': args.sys,
+           'model_path': args.model, 'server': None,
+           'api_queue': queue.Queue()}    # 接口事件队列（HTTP 线程入队/主循环打印）
 
-    # ── 视觉：把加载信息压成一行状态摘要（不再刷屏）──
-    _cfg = engine.cfg
-    _ctx = '%dK' % (_cfg['max_seq'] // 1024) if _cfg.get('max_seq') else '?'
-    _exp = '%d/%d' % (_cfg.get('n_experts', 0), _cfg.get('n_activated', 0)) \
-        if _cfg.get('n_experts') else 'dense'
-    _pairs = [
-        ('模型', _mname),
-        ('层', _cfg.get('n_layers', '?')),
-        ('维度', _cfg.get('d_model', '?')),
-        ('上下文', _ctx),
-        ('专家', _exp),
-        ('线程', engine.get_threads() if hasattr(engine, 'get_threads') else 4),
-        ('档位', getattr(chat, 'think_mode', 'direct')),
-        ('temp', params.get('temperature', 0.3)),
-        ('top_k', params.get('top_k', 60)),
-    ]
-    ui_rule('对话')
-    ui_status(_pairs)
+    # ── 启动信息（灰色小字，无窗框；与 /model 切换后共用同一格式）──
+    print_model_info(engine, chat, params, _mname)
+    print('%s  /help 命令 · /params 调参 · /server 服务 · /exit 退出%s'
+          % (U.META, U.RST))
     if _meta_note:
-        ui_row('  ' + U.META + _meta_note + U.RST)
-    ui_row('')
+        print('%s  %s%s' % (U.META, _meta_note, U.RST))
+    print()
 
-    # 底部状态栏内容（运行中会带上"上轮速度"）
-    _nthr = engine.get_threads() if hasattr(engine, 'get_threads') else 4
-    _bar_mid = '%s · %s · %d线程' % (_mname, _ctx, _nthr)
+    # ★ --server：启动即开同进程 OpenAI 兼容服务（聊天 + 服务一个进程）
+    if args.server:
+        start_inprocess_server(ctx, args.server)
+        print()
 
     # ══════════════════════════════════════════════════════════
-    #  主循环（滚动式 CLI/TUI —— 刻意不做全屏）
+    #  主循环（滚动式 CLI/TUI —— 刻意不做全屏整屏重画）
     #
     #  ★ 为什么不做全屏整屏重画（2026-10-10 决策，踩坑记录）：
     #    全屏要"生成完再整屏重画"，才能保证布局不错位；
     #    但那会把【流式输出】干掉 —— 用户看不到逐字吐出的过程，
     #    而这恰恰是 TUI 最该有的手感。
-    #    ⇒ 采用原生滚动式：内容一路往下堆，输入框在末尾，
-    #      流式 Markdown 逐行渲染（MdStream），历史天然保留、可复制。
+    #    ⇒ 采用原生滚动式：内容一路往下堆，流式 Markdown 逐行渲染
+    #      （MdStream），历史天然保留、可复制。
     # ══════════════════════════════════════════════════════════
     try:
         _eof = 0
         while True:
+            # ★ 读输入前：把排队中的接口事件打印进聊天框（此时无实时区）
+            _drain_api_echo(ctx)
             try:
-                ui = U.input_box(hint='输入消息 …',
-                                 extra='/help 命令 · /exit 退出').strip()
+                ui = ui_ask(ctx=ctx)   # 等待输入期间也实时 drain 接口事件
             except (EOFError, KeyboardInterrupt):
                 # ★ stdin 结束（管道/重定向）时 input() 立刻抛 EOFError。
                 #   踩坑：原实现只 print() 不 break ⇒ 管道测试时死循环刷屏。
@@ -504,47 +781,53 @@ def main():
                 continue
             _eof = 0
             if not ui:
-                U.status_bar(left='就绪', mid=_bar_mid, right='/exit 退出')
                 continue
             if ui.startswith('/'):
                 if not handle_command(ui, ctx):
                     break
-                U.status_bar(left='就绪', mid=_bar_mid, right='/exit 退出')
+                # ★ /model 可能换过引擎/会话 ⇒ 同步局部引用与模型名
+                engine, chat, params = ctx['engine'], ctx['chat'], ctx['params']
+                _mname = os.path.basename(ctx.get('model_path') or '') or _mname
                 continue
 
-            ui_user(ui)
             t0 = time.time()
-            _, ids = chat.build_prompt(ui)
             stream = ui_ai_start()          # ★ 流式 Markdown（逐行实时渲染）
             try:
-                out, cnt = '', 0
-                for tok in generate(engine, ids, params,
-                                    eos_id=chat.eos, eos_set=chat.eos_set,
-                                    kv=engine.kv_handle()):
-                    stream.feed(tok)        # 实时：字符立刻出现，行落定时套 MD 样式
-                    out += tok
-                    cnt += 1
+                # ★ 与接口请求串行：引擎非线程安全（C 侧全局 scratch + 线程池）
+                ctx['lock'].acquire()
+                try:
+                    _, ids = chat.build_prompt(ui)
+                    out, cnt = '', 0
+                    for tok in generate(engine, ids, params,
+                                        eos_id=chat.eos, eos_set=chat.eos_set,
+                                        kv=engine.kv_handle()):
+                        stream.feed(tok)    # 实时：字符立刻出现，落定套 MD 样式
+                        out += tok
+                        cnt += 1
+                finally:
+                    ctx['lock'].release()
                 stream.flush()
                 el = time.time() - t0
                 tps = cnt / el if el > 0 else 0.0
                 ctx['last_stat'] = {'n': cnt, 'sec': el, 'tps': tps}
-                txt = out.strip()
+                txt = out.strip()          # 显示用（去首尾空白）
+                hist_txt = kv_safe_text(out)   # ★ 写回历史用（保留前导 \n，见 kv_safe_text 注释）
                 ui_ai_meta(cnt, el, tps, '' if txt else '空回复')
                 if txt:
-                    chat.add(ui, txt)
-                _bar_mid = ('%s · %s · %d线程 · 上轮 %.1f tok/s'
-                            % (_mname, _ctx, _nthr, tps))
-                U.status_bar(left='就绪', mid=_bar_mid, right='/exit 退出')
-                ui_row('')
+                    chat.add(ui, hist_txt)
+                # ★ 生成结束、实时区已落定 ⇒ 排空接口事件（安全时机）
+                _drain_api_echo(ctx)
             except Exception as exc:                                # noqa: BLE001
-                print('%s   %s[生成失败] %s%s' % (U.LINE + U.V + U.RST,
-                                                  U.ERR, exc, U.RST))
-                U.status_bar(left='出错', mid=_bar_mid, right='/exit 退出')
+                print('%s[生成失败] %s%s' % (U.ERR, exc, U.RST))
     except KeyboardInterrupt:
         print()
     finally:
-        ui_end()
-        engine.free()
+        _live = ctx.get('engine')       # /model 后局部 engine 可能已不是活的
+        if _live is not None:
+            try:
+                _live.free()
+            except Exception:                                   # noqa: BLE001
+                pass
         print('%s  再见！%s' % (U.META, U.RST))
 
 

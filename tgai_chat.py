@@ -491,6 +491,32 @@ def _build_turn_eog(engine):
     return ids
 
 
+def kv_safe_text(out):
+    """把模型输出转成"可以拼回历史"的文本（★ 只去尾部空白，保留前导换行）
+
+    ★★ 为什么必须保留前导空白（2026-10-10 定位到的严重性能 bug）★
+
+      模型生成时的实际序列是：
+          <TGAI> → <回答> → \n → \n → 我是由……
+      （它在 <回答> 之后【自己又吐了一个 \n】）
+
+      而 build_prompt 拼历史时写的是：
+          f"<TGAI>{marker}\n{a}"
+
+      ⇒ 若 a 用 out.strip()，那个前导 \n 会被删掉，拼出来变成
+          <TGAI><回答>\n我是由……
+      ⇒ 与 KV cache 的前缀差【1 个 token】⇒ LCP 从此处断裂
+      ⇒ 后面整段历史全部重算（实测 534 token，首 token 31.85 秒 / 0.7 tok/s）
+
+      正确做法：a = out 去掉【尾部】空白即可，前导 \n 原样保留，
+      拼回去就是 <TGAI><回答>\n\n我是由……，与 cache 逐 token 一致。
+
+    注意：显示给别人看时仍应 strip()（去掉首尾空白更好看），
+          这个函数只用于【写回历史】的那一份。
+    """
+    return out.rstrip() if out else out
+
+
 def apply_penalties(logits, recent, p):
     """在采样前对 logits 施加【历史相关】的惩罚项（原地修改并返回）。
 
@@ -1524,7 +1550,7 @@ def main():
                 st = "[OK]" if out.strip() else "[EMPTY]"
                 print(f"\n{C.DIM}  {st} {cnt} tokens | {el:.1f}s | {tps:.1f} tok/s{C.RST}")
 
-                if out.strip(): chat.add(ui, out.strip())
+                if out.strip(): chat.add(ui, kv_safe_text(out))
             except Exception as e:
                 print(f"\n{C.RED}[Error] {e}{C.RST}")
 

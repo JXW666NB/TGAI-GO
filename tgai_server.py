@@ -47,6 +47,9 @@ STATE = {
     'created': int(time.time()),
     'n_requests': 0,
     'n_tokens': 0,
+    # ★ 事件回调（2026-10-11 加）：内嵌到 TUI 时把请求同步显示到对话框。
+    #   签名 on_event(kind, info)；kind = 'start' / 'end'；异常绝不影响接口。
+    'on_event': None,
 }
 
 DEFAULT_PARAMS = {
@@ -57,6 +60,32 @@ DEFAULT_PARAMS = {
     'dry_multiplier': 0.8, 'dry_base': 1.75,
     'dry_allowed_length': 3, 'dry_penalty_last_n': 256,
 }
+
+
+def _emit_event(kind, **info):
+    """对外抛事件（回调异常吞掉，绝不影响接口本身）"""
+    cb = STATE.get('on_event')
+    if not cb:
+        return
+    try:
+        cb(kind, info)
+    except Exception:                                        # noqa: BLE001
+        pass
+
+
+def _last_user_text(msgs):
+    """取最后一条 user 消息的纯文本（用于把请求同步到对话框）"""
+    for m in reversed(msgs or []):
+        if not isinstance(m, dict) or m.get('role') != 'user':
+            continue
+        c = m.get('content')
+        if isinstance(c, str):
+            return c
+        if isinstance(c, list):
+            return ''.join(p.get('text', '') for p in c
+                           if isinstance(p, dict))
+        return ''
+    return ''
 
 
 def apply_openai_sampling(body, base):
@@ -246,6 +275,10 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:                            # noqa: BLE001
                 return self._send_err('prompt build failed: %s' % exc, 500, 'server_error')
             STATE['n_requests'] += 1
+            _t0 = time.time()
+            _emit_event('start', endpoint=self.path.split('?')[0],
+                        stream=want_stream, prompt_tokens=len(ids),
+                        user_text=_last_user_text(msgs))
 
             if not want_stream:
                 full = ''
@@ -256,6 +289,8 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as exc:                        # noqa: BLE001
                     return self._send_err('generation failed: %s' % exc, 500, 'server_error')
                 ntok = max(1, len(full))
+                _emit_event('end', stream=False, text=full, tokens=ntok,
+                            prompt_tokens=len(ids), sec=time.time() - _t0)
                 now = int(time.time())
                 if legacy:
                     self._send_json({
@@ -287,10 +322,16 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             obj_kind = 'text_completion' if legacy else 'chat.completion.chunk'
 
+            _closed = threading.Event()          # 客户端已断开（静默终止）
             def sse(obj):
+                if _closed.is_set():
+                    return
                 data = json.dumps(obj, ensure_ascii=False)
-                self.wfile.write(('data: %s\n\n' % data).encode('utf-8'))
-                self.wfile.flush()
+                try:
+                    self.wfile.write(('data: %s\n\n' % data).encode('utf-8'))
+                    self.wfile.flush()
+                except (ConnectionError, OSError):       # 断连 → 静默、停止后续写
+                    _closed.set()
 
             first = {'id': req_id, 'object': obj_kind, 'created': int(time.time()),
                      'model': model_name}
@@ -300,10 +341,12 @@ class Handler(BaseHTTPRequestHandler):
                 first['choices'] = [{'index': 0, 'finish_reason': None,
                                      'delta': {'role': 'assistant', 'content': ''}}]
             sse(first)
+            _acc = []
             try:
                 for piece in run_generation(engine, chat, ids, params, True):
                     if isinstance(piece, dict):
                         continue
+                    _acc.append(piece)
                     if not piece:
                         continue
                     if legacy:
@@ -317,7 +360,8 @@ class Handler(BaseHTTPRequestHandler):
                              'choices': [{'index': 0, 'finish_reason': None,
                                           'delta': {'content': piece}}]})
             except Exception as exc:                            # noqa: BLE001
-                sse({'error': {'message': str(exc), 'type': 'server_error'}})
+                if not _closed.is_set():
+                    sse({'error': {'message': str(exc), 'type': 'server_error'}})
             last = {'id': req_id, 'object': obj_kind, 'created': int(time.time()),
                     'model': model_name}
             if legacy:
@@ -325,8 +369,15 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 last['choices'] = [{'index': 0, 'finish_reason': 'stop', 'delta': {}}]
             sse(last)
-            self.wfile.write(b'data: [DONE]\n\n')
-            self.wfile.flush()
+            try:
+                if not _closed.is_set():
+                    self.wfile.write(b'data: [DONE]\n\n')
+                    self.wfile.flush()
+            except (ConnectionError, OSError):
+                _closed.set()
+            _emit_event('end', stream=True, text=''.join(_acc),
+                        tokens=len(_acc), prompt_tokens=len(ids),
+                        sec=time.time() - _t0)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -399,7 +450,29 @@ def run_tui(engine, model_name):
                 print(piece, end='', flush=True)
         print()
         if full.strip():
-            chat.add(ui, full.strip())
+            chat.add(ui, kv_safe_text(full) if 'kv_safe_text' in dir() else full.rstrip())
+
+
+def start_server(host='127.0.0.1', port=8080, on_event=None):
+    """启动 HTTP 服务线程，返回 (srv, thread)
+
+    ★ 独立进程用（main）；也被 TUI 内嵌复用（/server、--server）：
+        tgai_server.STATE['engine'] = <共享引擎>
+        tgai_server.STATE['params'] = <TUI 当前采样参数字典>
+        tgai_server.STATE['lock']   = <TUI 的生成锁>   ← 引擎非线程安全
+        srv, th = tgai_server.start_server('127.0.0.1', 8080, on_event=cb)
+
+    ★ 接口语义（用户定版）：单次调用 —— 每请求自建 ChatSession +
+      独立 KV cache（_chat 里 kv=None），【不带任何对话历史】。
+    """
+    if on_event is not None:
+        STATE['on_event'] = on_event
+    srv = ThreadingHTTPServer((host, port), Handler)
+    srv.daemon_threads = True
+    th = threading.Thread(target=srv.serve_forever, daemon=True,
+                          name='tgai-http')
+    th.start()
+    return srv, th
 
 
 def main():
@@ -435,10 +508,7 @@ def main():
         STATE['params']['temperature'] = args.temp
     STATE['model_name'] = args.name or os.path.splitext(os.path.basename(mp))[0]
 
-    srv = ThreadingHTTPServer((args.host, args.port), Handler)
-    srv.daemon_threads = True
-    th = threading.Thread(target=srv.serve_forever, daemon=True)
-    th.start()
+    srv, th = start_server(args.host, args.port)
 
     print('  模型名: %s' % STATE['model_name'])
     print()

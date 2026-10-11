@@ -48,49 +48,36 @@ import tgai_ui as U                                          # noqa: E402
 def ui_ask(ctx=None, poll=0.05):
     """读取一行输入（提示符 You ›）
 
-    ★★ 2026-10-11 定版：改回 input()（中文输入法唯一可靠的方式）
+    ★★★ 2026-10-11 定版：不做任何 ANSI 擦除，从源头消除"消息重复/被吞"
 
-      为什么放弃 msvcrt.kbhit() 轮询（走过的弯路，两次踩坑）：
+      这个函数为了"用户消息在屏幕上的呈现"改过四版，前三次都栽在
+      ANSI 擦行上（不同终端对 \033[K / \033[A 的支持有差异）：
 
-      坑①「忙等卡死」：轮询循环里只有"没按键"分支才 sleep。而功能键在
-          msvcrt 里是【前缀(\x00/\xe0) + 扫描码】两个字符，前缀被当成普通
-          字符存进缓冲后，紧随的 kbhit() 仍为真 ⇒ sleep 被跳过 ⇒ 全速空转，
-          每轮还调一次 _drain_api_echo ⇒ CPU 打满，回车要排很久才处理。
+        ① 保留 input() 的原生回显（无样式）
+           → 与主循环自己 print 的回显【重复】，屏幕两条 "You › 你好"
+        ② 回车后用 \033[A\r\033[K 擦掉原生回显，再由 ui_user 重打
+           → 擦的时候把用户消息一起擦了，用户反馈"把我的消息吞了"
+        ③ 按"占了几行"精确上移再擦
+           → 用户终端里仍然残留，截图显示还是两条
 
-      坑②「中文输入法不兼容」（决定性线索：用户反馈"输入中文才有这个问题"）：
-          · IME 需要主线程跑 Windows 消息循环才能弹出/更新候选词窗口，
-            而我们的 while 循环把消息循环饿死；
-          · IME 提交的是多字节 UTF-8，getwch() 逐字节读，拼不出完整汉字；
-          · 打字过程中 IME 合成状态被反复打断。
-          ⇒ 表现为"按回车没反应 / 要等好久"。
+      定版思路：别再跟擦除较劲，换成【不做擦除】：
+        · 把样式直接放进 input() 的 prompt：
+              "\033[<user色>\033[1mYou ›\033[0m "
+          用户进入输入时屏幕上就是最终样式，无需事后重打。
+        · 回车后只补一个换行，什么都不擦。
+        · 主循环不再打印 ui_user 的回显（那一行已经就是它）。
+        · 只有管道/非 TTY 时才由调用方补一条（终端不回显输入）。
 
-      input() 把控制台输入模式完全交还给系统：IME 候选词、方向键、退格、
-      行内编辑、多行粘贴全部由 Windows 正确处理。代价是等待输入期间无法
-      再"顺便"刷接口事件 —— 这是可接受的取舍，输入可靠性优先。
-      接口事件改为在读输入【之前】和生成【之后】这两个安全时机排空。
-
-      非 TTY（管道/重定向）同样走 input()，行为一致。
+      代价：多行粘贴时续行没有悬挂缩进（可接受，换来的是行为完全可预测）。
     """
     prompt = '%s%sYou ›%s ' % (U.USER, U.BLD, U.RST)
     try:
         s = input(prompt)
     except (EOFError, KeyboardInterrupt):
         raise
-    txt = s.strip()
-    if sys.stdout.isatty():
-        try:
-            cols = _sys.stdout.get_terminal_size().columns or 80
-        except Exception:                                       # noqa: BLE001
-            cols = 80
-        used = U.dw(prompt + s)          # 用【未 strip 的原串】算宽度
-        rows = max(1, (used + cols - 1) // cols)
-        _sys.stdout.write('\r\033[K')
-        for _ in range(rows - 1):
-            _sys.stdout.write('\033[A\r\033[K')
-        _sys.stdout.flush()
-    else:
+    if not sys.stdout.isatty():
         print()          # 管道：终端不回显输入、也不替你换行 ⇒ 手动补换行
-    return txt
+    return s.strip()
 
 
 def ui_user(text, width=None):
@@ -885,13 +872,13 @@ def main():
             _eof = 0
             if not ui:
                 continue
-            # ★★ 正式回显用户消息（2026-10-11）
-            #    ui_ask 已把 input() 的原生回显擦掉，这里补一条格式化的：
-            #      · 带颜色（与 TGAI › 视觉对齐）
-            #      · 前后留空行（观感上把每一轮分开）
-            #      · 长句按显示宽度折行（中文 2 列）
-            #    这样屏幕上只有一条，且滚动后仍可回看。
-            ui_user(ui)
+            # ★★ 用户消息回显（2026-10-11 定版）
+            #    TTY 下：input() 的 prompt 本身就是 "You › " 带样式，
+            #    用户敲的字紧跟在后面 ⇒ 屏幕上那一行【已经是最终呈现】，
+            #    这里【绝不能再打一遍】，否则就是两条（用户截图指出过）。
+            #    非 TTY 下（管道/重定向）：终端不回显输入，必须补一条。
+            if not sys.stdout.isatty():
+                ui_user(ui)
             if ui.startswith('/'):
                 if not handle_command(ui, ctx):
                     break

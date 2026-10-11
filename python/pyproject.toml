@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tgai-go"
-version = "1.0.0"
+version = "1.0.1"
 description = "TGAI GO —— 纯 Python 的 TGAI 模型推理库（CPU 引擎，零编译安装）"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -36,8 +36,10 @@ tokenizer = ["tokenizers>=0.15"]
 dev = ["pytest>=7"]
 
 [project.urls]
-Homepage = "https://github.com/tgai/tgai-go"
-Documentation = "https://github.com/tgai/tgai-go#readme"
+Homepage = "https://github.com/JXW666NB/TGAI-GO"
+Issues = "https://github.com/JXW666NB/TGAI-GO/issues"
+Documentation = "https://github.com/JXW666NB/TGAI-GO#readme"
+Repository = "https://github.com/JXW666NB/TGAI-GO"
 
 [project.scripts]
 # 命令行入口（可选）：tgai-go chat -m model.TG

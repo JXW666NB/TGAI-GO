@@ -76,17 +76,39 @@ def ui_ask(ctx=None, poll=0.05):
         s = input(prompt)
     except (EOFError, KeyboardInterrupt):
         raise
-    # ★★ 不要擦掉提示行（2026-10-11 修，我上一版擦错了）
-    #    input() 的回显里【包含用户敲的字】： "You › 你好"
-    #    我上一版为了"看起来已提交"而用 ANSI 上移+清行把整行擦掉，
-    #    结果把用户的消息一起擦没了 —— 用户反馈"把我的消息吞了"。
-    #    正解：保留这一行（它就是输入回显），只在下面补个空行分隔。
+    txt = s.strip()
     if sys.stdout.isatty():
-        _sys.stdout.write('\n')
+        try:
+            cols = _sys.stdout.get_terminal_size().columns or 80
+        except Exception:                                       # noqa: BLE001
+            cols = 80
+        used = U.dw(prompt + s)          # 用【未 strip 的原串】算宽度
+        rows = max(1, (used + cols - 1) // cols)
+        _sys.stdout.write('\r\033[K')
+        for _ in range(rows - 1):
+            _sys.stdout.write('\033[A\r\033[K')
         _sys.stdout.flush()
     else:
         print()          # 管道：终端不回显输入、也不替你换行 ⇒ 手动补换行
-    return s.strip()
+    return txt
+
+
+def ui_user(text, width=None):
+    """格式化回显用户消息
+
+    ★ 同事重构时删掉了这个函数，导致用户消息在屏幕上留不下来
+      （input() 的原生回显一开始生成就被滚动覆盖）—— 用户反馈"把我的消息吞了"。
+    ★ 与 TGAI › 对齐：同色系前缀、前后空行、按显示宽度折行。
+    """
+    W = width or U.term_width()
+    head = '%s%sYou ›%s ' % (U.USER, U.BLD, U.RST)
+    body = ' ' * U.dw(head)
+    print()
+    lines = U.wrap(text, W - U.dw(head)) or ['']
+    for i, l in enumerate(lines):
+        print(('%s%s' % (head if i == 0 else body, l)) if i == 0
+              else ('%s%s' % (body, l)))
+    print()
 
 
 def ui_ai_start():
@@ -863,11 +885,13 @@ def main():
             _eof = 0
             if not ui:
                 continue
-            # ★★ 回显用户消息（2026-10-11 修：同事重构时把 ui_user 删掉了，
-            #    导致用户消息在屏幕上一闪而过/完全看不见 —— 用户反馈"把我的消息吞了"。
-            #    input() 的原生回显只到"回车"为止，之后生成过程会滚动覆盖，
-            #    所以必须在聊天流里正式打印一条，才能留下可回看的记录。
-            print('%s%sYou ›%s %s' % (U.USER, U.BLD, U.RST, ui))
+            # ★★ 正式回显用户消息（2026-10-11）
+            #    ui_ask 已把 input() 的原生回显擦掉，这里补一条格式化的：
+            #      · 带颜色（与 TGAI › 视觉对齐）
+            #      · 前后留空行（观感上把每一轮分开）
+            #      · 长句按显示宽度折行（中文 2 列）
+            #    这样屏幕上只有一条，且滚动后仍可回看。
+            ui_user(ui)
             if ui.startswith('/'):
                 if not handle_command(ui, ctx):
                     break

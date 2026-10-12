@@ -63,3 +63,9 @@ tests/*.exe
 _backups_*/
 
 python/dist/
+
+# 本地私人物品（不入库）
+WX*.bat
+tools/wx_*.py
+*_bot.log
+wechatauto_logs/

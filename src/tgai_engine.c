@@ -77,6 +77,21 @@
  *   - 线程数在首次并行时按 g_nthreads 固定; g_nthreads<=1 或任务过小时单线程
  *   - TG_SINGLE_THREAD (嵌入式/简化编译) 时整个块不编译 */
 #if !defined(TG_SINGLE_THREAD)
+
+/* ★★ TG_MAX_THREADS 必须定义在【平台分支之外】（2026-10-12 修）
+ *
+ *  bug：原来它写在 #if defined(_WIN32) 的 Windows 分支里（L100），
+ *       而 L161/L162 的线程池数组、L310/L962 的上限钳制、以及
+ *       tgai_gpu_dispatch.c 都引用它
+ *       ⇒ Linux/macOS 编译必然报 "TG_MAX_THREADS undeclared"
+ *       ⇒ 这是本引擎【一直没能干净地在 Linux 上编译】的直接原因之一
+ *         （Windows/MSVC 下走对了分支，所以从未暴露）
+ *  修法：上移到平台分支之前，两边共用。
+ *  实测依据：在 Linux 上按 README 编译时首先撞到的就是这个错误。 */
+#if !defined(TG_MAX_THREADS)
+#define TG_MAX_THREADS 16
+#endif
+
 #if defined(_WIN32) && !defined(__MINGW32__) && !defined(__MINGW64__)
     /* ══════════════════════════════════════════════════════════════════
      * Win32 线程兼容层（2026-10-09 加，为让 MSVC 能编译本引擎）
@@ -97,7 +112,9 @@
     #include <windows.h>
     #include <process.h>
 
-    #define TG_MAX_THREADS 16
+    /* ★ TG_MAX_THREADS 已上移到平台无关区（见本 #if 之前）——
+     *   Linux 分支也要用，放在 Windows 分支里会导致 Linux 编译报
+     *   "TG_MAX_THREADS undeclared"（tg_gpu_dispatch / 线程池都引用它）。 */
 
     typedef CRITICAL_SECTION pthread_mutex_t;
     typedef CONDITION_VARIABLE pthread_cond_t;
@@ -790,6 +807,17 @@ static inline float tg_dot(const float* a, const float* b, int n) {
 #define TG_Q4K_NSUB    8
 #define TG_Q4K_BLOCK (2 + TG_Q4K_NSUB + TG_Q4K_SUPER / 2)   /* 138 */
 #define TG_Q4K_SUBFIX 128.0f
+
+/* ★★ f16_to_f32 前置声明（2026-10-12 修）
+ *
+ *  bug：f16_to_f32 的【定义】在 L926，而 tg_dot_q4k 在 L811 就调用它
+ *       ⇒ Linux/gcc 直接报 "implicit declaration of function 'f16_to_f32'"
+ *         （C99 起隐式声明是 error；MSVC 默认宽容所以 Windows 下没暴露）
+ *       ⇒ 这是本引擎 Linux 编译的第二个拦路错误
+ *  修法：在 Q4K 内核之前放前置声明。函数签名与下方定义必须一致
+ *       （typedef uint16_t tg_f16 在定义处，此处直接用 uint16_t 避免依赖顺序）。
+ *  实测依据：Linux 上按 README 编译时撞到的就是这个错误。 */
+static inline float f16_to_f32(uint16_t h);
 
 static inline float tg_dot_q4k(const float* x, const uint8_t* raw, int n) {
     int sblocks = (n + TG_Q4K_SUPER - 1) / TG_Q4K_SUPER;

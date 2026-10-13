@@ -197,47 +197,89 @@ def kv_reuse_enabled():
 
 
 def kv_for_request(engine):
-    """返回本次请求【专属】的 KV 槽；返回 None 则让 generate() 自己新建。
+    """借一个 KV 槽（固定池复用，指针不增长）。
 
-    ★ 2026-10-13 关键修正（HTTP 并发乱码的根因）：
-      原实现在 TGAI_KV_REUSE=1 时返回 engine.kv_handle()，而 kv_handle() 是
-      【引擎级单例】—— 并发请求共用同一个 TGKVCache* ⇒ 落到同一个 GPU 槽
-      ⇒ 各自推进 position ⇒ 互相触发 "position gap -> clearing this slot's KV"
-      ⇒ 每个 token 都被清一次 KV ⇒ 输出乱码。
-
-      实测日志（并发 4 请求时刷屏）：
-          [CUDA-SLOT] + acquire slot 1  key=000002051208D7A0  (live=2)
-          [CUDA-SLOT] slot 1: position gap (cache_pos=25 > last_pos=24) -> clearing this slot's KV
-
-      现改为 new_kv_slot()：每请求一条独立序列（独立 KV + 独立激活工作区
-      + 独立 CUDA 流 + 独立 cuBLAS handle），配套引擎的 KV 多槽设计。
-      HTTP 服务本来每请求就新建 ChatSession、不做跨请求历史复用，
-      所以放弃单例复用【不损失】任何缓存命中。
+    ★ 2026-10-13 二次修正：
+      上一版每请求 engine.new_kv_slot()，而引擎按 TGKVCache* 指针记账，
+      每个新指针永久占一个 CUDA 槽名额 ⇒ 第 15 个请求起 tg_kvcache_new
+      返回 NULL ⇒ 输出 [KV error]（实测第 14 条开始复现）。
+      现改为固定池：只创建最多 TGAI_KV_POOL_SIZE（默认 8）个，
+      借出/归还复用同一批指针 ⇒ 名额不增长。
     """
     try:
-        return engine.new_kv_slot()
-    except Exception:                                           # noqa: BLE001
+        return _kv_pool_acquire(engine)
+    except Exception:
         return None
 
 
 def kv_slot_release(kv):
-    """释放请求专属槽（避免把 16 个槽用光）。失败静默。"""
+    """归还 KV 槽到池（不销毁 —— 指针必须复用）。"""
+    _kv_pool_release(kv)
+
+
+# ── KV 槽池的状态变量 ──
+#   ★ 2026-10-13: 池大小默认 2。
+#     每个槽在引擎侧占一个 CUDA 名额（按 TGKVCache* 指针记），
+#     且 CPU 侧已把容量压到 1（见 _engine.py new_kv_slot），
+#     所以 2 个槽的 host 开销可忽略，同时覆盖并发需求。
+#     需要更高并发可用环境变量 TGAI_KV_POOL_SIZE 覆盖。
+import os as _os
+import threading as _threading
+import time as _time
+
+try:
+    _KV_POOL_SIZE = max(1, int(_os.environ.get('TGAI_KV_POOL_SIZE') or 4))
+except Exception:
+    _KV_POOL_SIZE = 2
+
+_KV_POOL = []                # 空闲槽
+_KV_POOL_ALL = []            # 已创建的全部槽
+_KV_POOL_LOCK = _threading.Lock()
+
+def _kv_pool_acquire(engine, wait_sec=5.0):
+    """借一个 KV 槽；池满且都占用时等待，超时返回 None。"""
+    t0 = _time.time()
+    while True:
+        with _KV_POOL_LOCK:
+            if _KV_POOL:
+                kv = _KV_POOL.pop()
+                # 复位（清 KV 与 ids 记账，保证下个请求从零开始）
+                try:
+                    r = getattr(kv, 'reset', None)
+                    if callable(r):
+                        r()
+                    else:
+                        kv.ids = []
+                except Exception:
+                    pass
+                return kv
+            if len(_KV_POOL_ALL) < _KV_POOL_SIZE:
+                # 还没到上限 ⇒ 新建一个（指针从此固定复用）
+                try:
+                    kv = engine.new_kv_slot()
+                    _KV_POOL_ALL.append(kv)
+                    return kv
+                except Exception:
+                    return None
+        # 池满且都被占用 ⇒ 等一会儿再试
+        if _time.time() - t0 > wait_sec:
+            return None
+        _time.sleep(0.05)
+
+
+def _kv_pool_release(kv):
+    """归还槽（不销毁 —— 指针必须复用，否则引擎侧名额增长）。"""
     if kv is None:
         return
-    try:
-        rel = getattr(kv, 'release', None)
-        if callable(rel):
-            rel()
-            return
-    except Exception:                                           # noqa: BLE001
-        pass
-    try:
-        e = getattr(kv, 'engine', None) or getattr(kv, 'e', None)
-        if e is not None and hasattr(e, 'release_kv_slot'):
-            e.release_kv_slot(kv)
-    except Exception:                                           # noqa: BLE001
-        pass
+    with _KV_POOL_LOCK:
+        if kv not in _KV_POOL:
+            _KV_POOL.append(kv)
 
+
+def kv_pool_stats():
+    with _KV_POOL_LOCK:
+        return {'size': _KV_POOL_SIZE, 'created': len(_KV_POOL_ALL),
+                'idle': len(_KV_POOL), 'busy': len(_KV_POOL_ALL) - len(_KV_POOL)}
 
 
 class ServerHandle:
@@ -349,10 +391,12 @@ def _make_handler(h):
                     pass                 # 老引擎/非 V2.7 无此属性，忽略
                 _, ids = chat.build_prompt(user_text)
                 try:
+                    # ★ _STD_COMPLETIONS: 把 path 传下去，用于区分响应格式
+                    _is_chat = path.endswith('chat/completions')
                     if want_stream:
-                        self._stream(chat, ids, params)
+                        self._stream(chat, ids, params, _is_chat)
                     else:
-                        self._once(chat, ids, params)
+                        self._once(chat, ids, params, _is_chat)
                 except BrokenPipeError:
                     pass             # 客户端断开，正常
                 except Exception as exc:                        # noqa: BLE001
@@ -373,11 +417,26 @@ def _make_handler(h):
             kv_slot_release(_req_kv)
             return ''.join(out)
 
-        def _once(self, chat, ids, params):
+        def _once(self, chat, ids, params, is_chat=True):
             txt = self._collect(chat, ids, params)
             n = len(txt)
             h.n_tokens += n
             now = int(time.time())
+            # ★ _STD_COMPLETIONS: /v1/completions 用 OpenAI 标准 text 形态；
+            #   /v1/chat/completions 保持 chat 形态不变。
+            if not is_chat:
+                self._json(200, {
+                    'id': 'cmpl-%d' % now,
+                    'object': 'text_completion',
+                    'created': now,
+                    'model': h.model_name,
+                    'choices': [{'text': txt, 'index': 0, 'logprobs': None,
+                                 'finish_reason': 'stop'}],
+                    'usage': {'prompt_tokens': len(ids),
+                              'completion_tokens': n,
+                              'total_tokens': len(ids) + n},
+                })
+                return
             self._json(200, {
                 'id': 'chatcmpl-%d' % now,
                 'object': 'chat.completion',
@@ -389,44 +448,81 @@ def _make_handler(h):
                           'total_tokens': len(ids) + n},
             })
 
-        def _stream(self, chat, ids, params):
-            """SSE 流式：逐 token 推送（OpenAI 的 delta 格式）"""
+        def _stream(self, chat, ids, params, is_chat=True):
+            """SSE 流式：逐 token 推送（OpenAI 的 delta 格式）
+            
+            ★ 2026-10-13 _STREAM_FIX_V2：改为【先算完再按 SSE 发送】。
+              原因：实测 stream=True 时客户端 30s 收不到任何字节（0 字节超时），
+                    而同样参数的 stream=False 0.22s 就返回 —— 流式那条路是坏的。
+                    站点每次都要先等原生 /v1/completions 读超时，才回退 chat 接口，
+                    用户感受就是"第一个 token 死活出不来"。
+              改法：与 _collect 走同一条已验证的生成路径，只把输出改成 SSE 格式；
+                    出错也要发 [DONE]，避免客户端永久挂起。
+              代价：失去增量流式的观感（首字节 = 整段生成时间）。正确性优先。
+            """
             _req_kv = kv_for_request(h.engine)
+            toks = []
+            _err = None
+            try:
+                for tok in generate(h.engine, ids, params, chat.eos,
+                                    eos_set=chat.eos_set,
+                                    kv=_req_kv):
+                    if tok:
+                        toks.append(tok)
+            except Exception as _e:
+                _err = _e
+            finally:
+                kv_slot_release(_req_kv)
+            
             self.send_response(200)
             self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
             self.send_header('Cache-Control', 'no-cache')
-            self.send_header('Connection', 'keep-alive')
             self.send_header('Access-Control-Allow-Origin', '*')
+            self.send_header("Connection", "close")
             self.end_headers()
-            cid = 'chatcmpl-%d' % int(time.time())
+            cid = ('chatcmpl-%d' if is_chat else 'cmpl-%d') % int(time.time())
             now = int(time.time())
-
+            
             def send(delta, finish=None):
-                chunk = {
-                    'id': cid, 'object': 'chat.completion.chunk',
-                    'created': now, 'model': h.model_name,
-                    'choices': [{'index': 0, 'delta': delta,
-                                 'finish_reason': finish}],
-                }
+                # ★ _STD_COMPLETIONS_SEND: /v1/completions 用 OpenAI 标准 text 形态，
+                #   /v1/chat/completions 保持 delta 形态不变。只影响 v2.7 这一个服务。
+                if not is_chat:
+                    chunk = {
+                        'id': cid, 'object': 'text_completion',
+                        'created': now, 'model': h.model_name,
+                        'choices': [{'text': (delta.get('content') or '')
+                                              if isinstance(delta, dict) else '',
+                                     'index': 0, 'logprobs': None,
+                                     'finish_reason': finish}],
+                    }
+                else:
+                    chunk = {
+                        'id': cid, 'object': 'chat.completion.chunk',
+                        'created': now, 'model': h.model_name,
+                        'choices': [{'index': 0, 'delta': delta,
+                                     'finish_reason': finish}],
+                    }
                 self.wfile.write(b'data: ' +
                                  json.dumps(chunk, ensure_ascii=False).encode('utf-8') +
                                  b'\n\n')
-                self.wfile.flush()
-
-            send({'role': 'assistant', 'content': ''})
-            n = 0
-            for tok in generate(h.engine, ids, params, chat.eos,
-                                eos_set=chat.eos_set,
-                                kv=_req_kv):
-                if tok:
+            
+            try:
+                send({'role': 'assistant', 'content': ''})
+                n = 0
+                for tok in toks:
                     send({'content': tok})
                     n += 1
-            h.n_tokens += n
-            send({}, 'stop')
-            kv_slot_release(_req_kv)
-            self.wfile.write(b'data: [DONE]\n\n')
-            self.wfile.flush()
-
+                h.n_tokens += n
+                send({}, 'stop')
+                self.wfile.write(b'data: [DONE]\n\n')
+                self.wfile.flush()
+            except BrokenPipeError:
+                pass
+            if _err is not None:
+                import sys as _s
+                _s.stderr.write('[stream] generate error: %r\n' % (_err,))
+                _s.stderr.flush()
+            return
     return Handler
 
 

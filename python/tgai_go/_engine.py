@@ -592,7 +592,12 @@ class TGEngine:
         """
         if not hasattr(self, '_slots'):
             self._slots = set()
-        seq = int(max_seq or self.max_seq)
+        # ★ 2026-10-13: CPU 侧容量默认降到 1 —— CUDA 路径不用这份数组，
+        #   而 seq=max_seq(8192) 会让每个槽 calloc 1.88 GB host 内存，
+        #   8 个槽 = 15 GB，实测把 32 GB 机器吃满 ⇒ tg_kvcache_new
+        #   返回 NULL ⇒ 输出 "[KV error]"。给 1 即可，显式传值仍尊重调用方。
+        _KV_CPU_SEQ_MIN = 1
+        seq = int(max_seq or _KV_CPU_SEQ_MIN)
         c = self.lib.tg_kvcache_new(self.model, seq)
         if not c:
             raise RuntimeError('KV slot alloc failed (tg_kvcache_new returned NULL)')

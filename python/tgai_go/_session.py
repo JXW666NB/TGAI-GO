@@ -172,16 +172,56 @@ def generate(engine, input_ids, params, eos_id, eos_set=None, kv=None):
         _recent = []; _so_far = ""; _first = True
         # ★ TURN_SCOPED_DRY：仅本轮生成的 token（DRY 的作用域）
         _turn_ids = []
+        # _THINK_CLOSE_REAL: 思考档 <回答> 收束偏置（此前只定义未实现）
+        _tc_on = bool(params.get(chr(95) + "think_mode", False))
+        _tc_slope = float(params.get("think_close_slope", 0.02) or 0.0)
+        _tc_max = float(params.get("think_close_max_logit", 2.5) or 0.0)
+        _tc_limit = int(params.get("think_soft_limit", 220) or 0)
+        # _TC_EOS_GUARD: 思考档下抬高 EOS 阈值，逼模型先思考够再收束
+        #   实测：不抬时会三五十 token 就 EOS，<回答> 只出 4/10。
+        #   取 think_soft_limit 的一半（默认 220/2=110），下限 40。
+        _tc_eos_min = 0
+        if _tc_on and _tc_limit > 0:
+            _tc_eos_min = max(40, _tc_limit // 2)
+        elif _tc_on:
+            _tc_eos_min = 110
+        _tc_ans = -1
+        if _tc_on and _tc_slope > 0.0:
+            _tc_mark = chr(60) + chr(0x56DE) + chr(0x7B54) + chr(62)
+            try:
+                _tc_n = int(lib.tg_has_special(model))
+            except Exception:
+                _tc_n = 0
+            for _tc_i in range(_tc_n):
+                try:
+                    _tc_t = int(lib.tg_special_id(model, _tc_i))
+                    if engine._token_str(_tc_t) == _tc_mark:
+                        _tc_ans = _tc_t
+                        break
+                except Exception:
+                    pass
+        if not (_tc_on and _tc_ans >= 0):
+            _tc_on = False
+        else:
+            import sys as _tcs
+            _tcs.stderr.write(chr(91) + "think-close" + chr(93) + " ans_id=%d slope=%s max=%s limit=%d" % (_tc_ans, _tc_slope, _tc_max, _tc_limit) + chr(10))
+            _tcs.stderr.flush()
 
         for step in range(max_tok):
             arr = np.ctypeslib.as_array(ctypes.cast(lp, FloatArr), shape=(vocab,)).copy()
 
             if _con >= 3: arr[_lid] -= _con * 5.0
             if _con > 15: break
-            if step < min_tok:
+            if step < (max(min_tok, _tc_eos_min) if _tc_on else min_tok):  # _TC_EOS_GUARD
                 for e in eos_set:
                     if 0 <= e < vocab: arr[e] = -np.inf
 
+            # _THINK_CLOSE_REAL: 思考档收束偏置（仅思考档生效）
+            if _tc_on and _tc_ans >= 0:
+                _tc_steps = step
+                if _tc_limit > 0 and step > _tc_limit:
+                    _tc_steps = _tc_limit
+                arr[_tc_ans] += min(_tc_slope * _tc_steps, _tc_max)
             tid = sample_numpy(arr, temp, top_k, top_p, vocab,
                                p=params, recent=_recent,
                                decode_fn=engine.decode,

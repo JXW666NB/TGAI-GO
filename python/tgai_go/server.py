@@ -236,6 +236,19 @@ _KV_POOL = []                # 空闲槽
 _KV_POOL_ALL = []            # 已创建的全部槽
 _KV_POOL_LOCK = _threading.Lock()
 
+THINK_MARKER = chr(60) + chr(0x601D) + chr(0x8003) + chr(62)
+ANSWER_MARKER = chr(60) + chr(0x56DE) + chr(0x7B54) + chr(62)
+
+
+def _apply_think_prefix(txt, chat):
+    # _THINK_PREFIX_DISABLED (2026-10-13)
+    # 原实现：思考档下给输出补 <思考> 前缀。那是引擎思考机制还没打通时的
+    # 权宜之计。现在站点已补上 think_level 字段、引擎的 <回答> 收束偏置与
+    # EOS 压制都真正生效，模型会自己吐 <思考> ⇒ 再补就重复了。
+    # 保留函数与调用点（避免动 _once/_stream），只让它变成恒等返回。
+    return txt
+
+
 def _kv_pool_acquire(engine, wait_sec=5.0):
     """借一个 KV 槽；池满且都占用时等待，超时返回 None。"""
     t0 = _time.time()
@@ -380,6 +393,28 @@ def _make_handler(h):
             if _lv == 'off' and not _has_think_key(body):
                 _lv = getattr(h, 'default_think_level', 'off')
             _tm = think_mode_of(_lv)
+            # _THINK_MODE_PARAM: 激活引擎侧思考机制（此前只设了 chat.think_mode，
+            #   而引擎的 think_close 偏置 / EOS 压制都依赖 params[_think_mode]）。
+            try:
+                params[chr(95) + "think_mode"] = (_tm == "think")
+            except Exception:
+                pass
+            # _DBG_THINKREQ: 打印本次请求的档位，便于排查链路
+            try:
+                import sys as _dbs
+                _dbs.stderr.write("[thinkreq] lv=%s tm=%s p_tm=%s stream=%s" % (_lv, _tm, params.get(chr(95) + "think_mode"), want_stream) + chr(10))
+                _dbs.stderr.flush()
+            except Exception:
+                pass
+            # _DBG_FULLPARAMS: 打印本次请求的完整参数（排查站点下发）
+            try:
+                import sys as _dbp, json as _dbj
+                _dbp.stderr.write("[fullparams] body=%s" % _dbj.dumps({k: v for k, v in body.items() if k != "messages"}, ensure_ascii=False)[:600] + chr(10))
+                _dbp.stderr.write("[fullparams] eff=%s" % _dbj.dumps({k: v for k, v in params.items() if not k.startswith(chr(95))}, ensure_ascii=False)[:400] + chr(10))
+                _dbp.stderr.write("[fullparams] prompt_tail=%r ids=%d" % (user_text[-60:], len(ids)) + chr(10))
+                _dbp.stderr.flush()
+            except Exception:
+                pass
 
             # ★ 2026-10-13: 默认并发（KV 多槽改造后引擎已支持多序列）
             #   设 TGAI_SERIALIZE=1 可回退串行
@@ -419,6 +454,7 @@ def _make_handler(h):
 
         def _once(self, chat, ids, params, is_chat=True):
             txt = self._collect(chat, ids, params)
+            txt = _apply_think_prefix(txt, chat)  # _THINK_PREFIX
             n = len(txt)
             h.n_tokens += n
             now = int(time.time())
@@ -507,6 +543,11 @@ def _make_handler(h):
                                  b'\n\n')
             
             try:
+                # _THINK_PREFIX: 思考档补 <思考> 前缀
+                _joined = ''.join(toks)
+                _fixed = _apply_think_prefix(_joined, chat)
+                if _fixed != _joined:
+                    toks = [_fixed]
                 send({'role': 'assistant', 'content': ''})
                 n = 0
                 for tok in toks:

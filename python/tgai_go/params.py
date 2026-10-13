@@ -65,7 +65,7 @@ SPEC = [
     # ── 思考档 ──
     ('think_close_slope',     'tslp', float, 0.02, (0.0, 1.0),  '思考档：<回答> 偏置递增率（0=关）'),
     ('think_close_max_logit', 'tmax', float, 2.5,  (0.0, 20.0), '思考档：<回答> 偏置上限'),
-    ('think_soft_limit',      'tlim', int,   220,  (0, 4096),   '思考档：最长 token 数（超过后偏置拉满）'),
+    ('think_soft_limit',      'tlim', int,   400,  (0, 4096),   '思考档：最长 token 数（超过后偏置拉满）'),
     # ── 代码块 ──
     ('code_repeat_penalty',  'crp',  float, 1.10, (1.0, 2.0),  '代码块内：重复惩罚'),
     ('code_dry_multiplier',  'cdry', float, 2.5,  (0.0, 20.0), '代码块内：DRY 强度'),

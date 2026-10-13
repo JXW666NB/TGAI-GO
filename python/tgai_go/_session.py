@@ -270,7 +270,27 @@ class ChatSession:
         #   注意：轮数越多 prompt 越长 ⇒ prefill 越慢，8 轮是折中
         self.max_turns = 8
         self.eos = engine.cfg.get('eos_id', 3)
-        # ★★ 轮次边界标记作为停止符（TGAI 专属，见模块顶部 TGAI_TURN_EOG 注释）
+        # ★★ 每条会话一个【独立 KV 槽】（2026-10-13 多序列改造）
+        #
+        #  为什么必须这样（两条真实的线上故障都出在这里）：
+        #   ① 并发串扰：改造前 KV 在 C 层是"模型级单份"，且 Python 侧只有
+        #      engine.kv_handle() 这一个引擎级单例。多序列并发时会共用同一份
+        #      KV 与同一份 ids 记账 ⇒ 串味 / 退化。
+        #   ② 档位互相污染：think_mode 决定提示词末尾标记（<回答> vs <思考>），
+        #      而 KV 前缀正是按这个标记逐 token 对齐的。若两个并发请求（一个
+        #      直答、一个思考）共用一份 KV，"前缀复用(LCP)"就会在一个错误的
+        #      前缀上做增量 prefill ⇒ 输出立刻变垃圾（实测症状 '我我我我'）。
+        #      ⇒ 「一个 ChatSession = 一个槽 = 一个 think_mode」必须成立。
+        #
+        #  兼容性：老引擎/DLL 没有 new_kv_slot() 时自动回落到原来的
+        #          engine.kv_handle() 单例路径，行为与改造前一致。
+        #  可用环境变量 TGAI_KV_SLOT=0 关掉（方便二分定位）。
+        self.kv = None
+        if os.environ.get('TGAI_KV_SLOT', '1') != '0':
+            try:
+                self.kv = engine.new_kv_slot()
+            except Exception:                                     # noqa: BLE001
+                self.kv = None
         self.turn_eog = _build_turn_eog(engine)
         # ChatML 模型通常有两个停止 token: <|im_end|> (eos_id) 和 <|endoftext|> (151643)
         # generate() 遇到 eos_set 中任意 token 都停止生成
@@ -431,6 +451,10 @@ class ChatSession:
         """
         return ''.join(self.stream(msg, **kw))
 
+    def _kv(self):
+        """本会话的 KV 槽（没有独立槽时回落到引擎级单例，保证行为不倒退）。"""
+        return self.kv if self.kv is not None else self.e.kv_handle()
+
     def stream(self, msg, **kw):
         """流式对话：逐段 yield 文本（生成结束后才写入 history）"""
         params = self._params(kw)
@@ -438,7 +462,7 @@ class ChatSession:
         out = []
         for tok in generate(self.e, ids, params,
                             eos_id=self.eos, eos_set=self.eos_set,
-                            kv=self.e.kv_handle()):
+                            kv=self._kv()):
             out.append(tok)
             yield tok
         # ★ 写回历史必须保留前导 \n（kv_safe_text），否则与 KV cache 前缀
@@ -453,7 +477,7 @@ class ChatSession:
         out = []
         for tok in generate(self.e, ids, params,
                             eos_id=self.eos, eos_set=self.eos_set,
-                            kv=self.e.kv_handle()):
+                            kv=self._kv()):
             out.append(tok)
         text = ''.join(out).strip()
         # ★ 返回给调用方的是 strip 过的（好显示）；写回历史必须保留前导 \n，
@@ -463,6 +487,15 @@ class ChatSession:
         return text, prompt
 
     def add(self, q, a): self.history.append((q, a))
-    def clear(self): self.history.clear(); self.e.reset_cache()
+
+    def clear(self):
+        self.history.clear()
+        # ★ 多序列：历史清空后 KV 前缀也失效，必须重置。
+        #   有独立槽时【只清自己的槽】—— 老路径 reset_cache() 清的是引擎级
+        #   那一份，在多会话下等于把别的会话的 KV 也清了。
+        if self.kv is not None:
+            self.kv.reset()
+        else:
+            self.e.reset_cache()
 
 

@@ -110,6 +110,13 @@ CODE_CLOSE_MAX_LOGIT = _env_f('TGAI_CODE_CLOSE_MAX_LOGIT', 3.0)
 CODE_CLOSE_SLOPE = _env_f('TGAI_CODE_CLOSE_SLOPE', 0.03)
 
 DLL_CANDIDATES = [
+    # ★ 2026-10-13 加：python 包自带的原生库目录。
+    #   V100 部署时只有 tgai_go 包被同步过去，libtgai_engine.dll 躺在
+    #   python\tgai_go\_native\ 而没有 cpu\build\ ⇒ 旧清单全部落空，
+    #   报 "DLL not found"（V100 实测）。这里把包的 _native 目录排到最前。
+    os.path.join(SCRIPT_DIR, 'python', 'tgai_go', '_native', 'libtgai_engine.dll'),
+    os.path.join(SCRIPT_DIR, 'python', 'tgai_go', '_native', 'libtgai_engine.so'),
+    os.path.join(SCRIPT_DIR, 'python', 'tgai_go', '_native', 'libtgai_engine_vk.dll'),
     os.path.join(SCRIPT_DIR, 'cpu', 'build', 'libtgai_engine.dll'),
     os.path.join(SCRIPT_DIR, 'cpu', 'build', 'libtgai_engine.so'),
     os.path.join(ROOT, 'scripts', 'tgai_cuda_engine.so'),

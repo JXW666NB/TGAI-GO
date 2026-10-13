@@ -18,6 +18,18 @@
 
 #include "tgai_engine.h"
 
+/* ★ CUDA 接线桥声明（2026-10-13 加）
+ *   必须放在文件最前面：#ifdef TG_ENGINE_HAS_CUDA_BRIDGE 的调用点分布在
+ *   tg_load / tg_free / tg_kvcache_reset / tg_forward 里（都在文件后部），
+ *   而 MSVC 默认 C89 语义：若先调用后声明，会先按隐式 int 声明，随后与真
+ *   声明冲突 ⇒ error C2371/C2040「重定义；不同的基类型」。
+ *   （实测踩过：声明放在文件中部的 #include 位置就会这样。）
+ *   这条"缝"是【整模型驻留 GPU】的一次前向接管，实现在 cuda/tgai_cuda_bridge.c；
+ *   不定义该宏的构建（纯 CPU / Vulkan / 手机）行为逐位不变。 */
+#ifdef TG_ENGINE_HAS_CUDA_BRIDGE
+#include "../cuda/tgai_cuda_bridge.h"
+#endif
+
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -2183,11 +2195,31 @@ TGModel* tg_load(const char* path, int use_mmap, TGError* out_err) {
     }
 
     if (out_err) *out_err = TG_OK;
+
+#ifdef TG_ENGINE_HAS_CUDA_BRIDGE
+    /* ★ CUDA 接管尝试（2026-10-13 加）
+     *   放在工作区分配【之后】：桥接层内部会调 tg_preload_all() 解码权重，
+     *   而 CUDA 装载要读 get_cached_weight()。/ 未开 TGAI_USE_GPU 时这里
+     *   只打印一行"未开启"就返回 0，CPU 行为逐位不变。
+     *   有意不把 init 失败当致命：GPU 是可选加速，失败必须能回落 CPU。 */
+    {
+        int _gpu = tg_engine_cuda_init(m);
+        printf("[tg_load] GPU forward: %s (%s)\n",
+               _gpu ? "TAKEN OVER" : "CPU fallback", tg_engine_cuda_reason());
+    }
+#endif
     return m;
 }
 
 void tg_free(TGModel* m) {
     if (!m) return;
+#ifdef TG_ENGINE_HAS_CUDA_BRIDGE
+    /* ★ 必须先释放 GPU 资源（2026-10-13 加）：
+     *   GPU 侧权重是从 m->cached_weights 拷上去的，但 tgen_cuda_free 只碰显存，
+     *   与下面的 CPU 释放互不干扰。放在最前面是为了让"GPU 已卸载"这件事
+     *   在任何 CPU 内存被回收之前就成立（顺序错了会有悬空窗口）。 */
+    tg_engine_cuda_shutdown();
+#endif
     free(m->weight_lookup);
     free(m->vocab);
     free(m->vocab_strbuf);
@@ -2308,6 +2340,12 @@ TGKVCache* tg_kvcache_new(const TGModel* m, int max_seq_len) {
 
 void tg_kvcache_free(TGKVCache* c) {
     if (!c) return;
+#ifdef TG_ENGINE_HAS_CUDA_BRIDGE
+    /* ★ 多序列槽改造（2026-10-13）：这条序列的 GPU KV 槽要还回去
+     *   （归还显存 + 回收槽位给下一条序列）。必须在 free(c) 之前调——
+     *   槽的归属键就是 c 这个指针本身。 */
+    tg_engine_cuda_free_slot(c);
+#endif
     free(c->k); free(c->v); free(c->pos);
     free(c);
 }
@@ -2315,6 +2353,17 @@ void tg_kvcache_free(TGKVCache* c) {
 void tg_kvcache_reset(TGKVCache* c) {
     if (!c) return;
     memset(c->pos, 0, (size_t)c->n_layers * sizeof(int));
+#ifdef TG_ENGINE_HAS_CUDA_BRIDGE
+    /* ★ GPU 侧 KV cache 也要清（2026-10-13 加）：
+     *   CUDA 前向不用这个 TGKVCache，它自己维护 GPU 上的 K/V。
+     *   只清 CPU 侧 = 新对话会读到上一轮的上下文 ⇒ 输出污染。
+     * ★ 多序列槽改造（2026-10-13）：改成【只清这一条序列的槽】。
+     *   原来是无参的 tg_engine_cuda_reset()（清全局唯一那份）。
+     *   现在 KV 是每序列一份，用 c 当键只清自己的槽：
+     *   否则"A 开新对话"会把"B 正在解码"的 KV 一起清掉 ⇒ 静默数据损坏。
+     *   （tg_engine_cuda_reset() 仍然保留，供全局重置 tg_gpu_cache_clear 用。） */
+    tg_engine_cuda_reset_slot(c);
+#endif
 }
 
 /* ─── 数学操作 ────────────────────────────────── */
@@ -2331,6 +2380,7 @@ static void matmul_q4(float* out, const float* x, const uint8_t* q4, const float
  *   默认未启用 ⇒ tg_gpu_try_* 立即返回 0 ⇒ 走下面的 CPU 原路径，
  *   保证与接线前【逐位相同】。 */
 #include "tgai_gpu_bridge.h"
+
 
 static void rmsnorm(float* out, const float* x, const float* weight, int seq, int d, float eps) {
     /* ★ GPU 快速路径（默认关闭；TGAI_USE_GPU=1 启用）
@@ -2493,8 +2543,14 @@ TG_EXPORT int tg_gpu_matmul(float* out, const float* x, const float* w, int seq,
 }
 #endif
 
-/* GPU 后端初始化/释放（同样默认空桩；返回 1 = 就绪） */
-#if !defined(TG_LINK_GPU_SEPARATE)
+/* GPU 后端初始化/释放（同样默认空桩；返回 1 = 就绪）
+ *
+ * ★ 2026-10-13：当同时启用 CUDA 接线桥（TG_ENGINE_HAS_CUDA_BRIDGE）时，
+ *   这一组【空桩要让位】—— 真实现由 cuda/tgai_cuda_bridge.c 提供。
+ *   否则链接期会报 LNK2005 "已经在 tgai_engine.obj 中定义"。
+ *   注意 tg_gpu_matmul 不在此列：它由下面的独立 #if 管，且桥接层不实现它
+ *   （GPU 接管粒度是"一次前向"，不是逐算子），所以这里必须保留它的空桩。 */
+#if !defined(TG_LINK_GPU_SEPARATE) && !defined(TG_ENGINE_HAS_CUDA_BRIDGE)
 TG_EXPORT int tg_gpu_backend_init(void) { return 0; }
 TG_EXPORT void tg_gpu_backend_shutdown(void) { }
 /* 状态查询空桩 —— 让"未接 GPU"也能被查询，调用方不必区分 |
@@ -3492,6 +3548,22 @@ static void transformer_block(TGModel* m, float* x, int seq,
 const float* tg_forward(TGModel* m, const int32_t* input_ids, int seq_len,
                         TGKVCache* cache, int cache_pos) {
     if (!m || seq_len <= 0) return NULL;
+
+#ifdef TG_ENGINE_HAS_CUDA_BRIDGE
+    /* ★ GPU 前向接管（2026-10-13 加）—— 本文件里唯一的 CUDA 分派点。
+     *   返回 1 且拿到 logits ⇒ 直接返回，CPU 路径一行都不执行；
+     *   返回 0（未开启 / 没 GPU / 本次失败）⇒ 落到下面的 CPU 原路径。
+     *   为什么放在自旋锁【之前】：CUDA 路径有自己的互斥量，两条锁不嵌套，
+     *   避免"持 CPU 锁去做 GPU 同步"这种把 CPU 线程池堵住的写法。
+     *   契约一致：CPU 路径失败时返回 NULL；GPU 路径失败时同样落到 CPU 路径，
+     *   由 CPU 路径决定返回值（不会让调用方拿到陈旧 logits）。 */
+    {
+        const float* _lg = NULL;
+        if (tg_engine_cuda_forward(m, input_ids, seq_len, cache, cache_pos, &_lg) && _lg) {
+            return _lg;
+        }
+    }
+#endif
 
     _forward_lock_acquire();
 

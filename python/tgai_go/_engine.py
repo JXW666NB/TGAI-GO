@@ -8,6 +8,7 @@
        改为 logging（默认 WARNING，调用方可开 INFO）
     3) C / FloatArr 等 ctypes 辅助类型在本文件内定义（不依赖脚本）
 """
+import threading
 import ctypes
 import logging
 import os
@@ -151,6 +152,56 @@ def _pick_gpu_dll():
     if want in ('gpu', 'vk', 'vulkan'):
         return vk
     return vk if _has_discrete_gpu() else None
+
+
+class _KVSlot:
+    """一条序列【独立】的 KV 槽句柄（多序列并发用）。
+
+    与 kv_handle() 返回的老式 _KV 的区别：
+      · 每次 new_kv_slot() 都对应一份【新的】TGKVCache ⇒ C 层按指针给它
+        一个独立的 GPU KV 槽（独立 KV + 独立激活值工作区）⇒ 并发不串扰；
+      · ids 记账只属于本槽自己，不会被别的请求覆盖
+        （这正是"HTTP 服务层跨请求串 KV ⇒ 输出 '我我我我'"那条线上 bug 的根因）；
+      · 析构时自动归还槽位，不会把 C 层的槽池耗光。
+
+    接口与 kv_handle() 兼容（.cache / .ids），可直接做 generate(kv=...)。
+    """
+    __slots__ = ('engine', 'cache', 'ids', 'think_mode', '_released')
+
+    def __init__(self, engine, cache):
+        self.engine = engine
+        self.cache = cache
+        self.ids = []
+        self.think_mode = 'direct'
+        self._released = False
+
+    def reset(self):
+        """只清【本槽】的 KV（C 层按 cache 指针定位，不会碰别的序列）。"""
+        if not self._released and self.cache and self.engine.lib:
+            try:
+                self.engine.lib.tg_kvcache_reset(self.cache)
+            except Exception:
+                pass
+        self.ids = []
+
+    def release(self):
+        if self._released:
+            return
+        self._released = True
+        try:
+            self.engine._release_kv_slot(self)
+        except Exception:
+            pass
+
+    def __del__(self):
+        try:
+            self.release()
+        except Exception:
+            pass
+
+    def __repr__(self):
+        return '<KVSlot cache=%s ids=%d%s>' % (
+            hex(self.cache or 0), len(self.ids), ' released' if self._released else '')
 
 
 class TGEngine:
@@ -429,11 +480,27 @@ class TGEngine:
     #     首个前导空格；本实现与之对齐。
     _SP_MARK = '\u2581'
 
+    def _detok_state(self):
+        # 2026-10-13: 按线程隔离的 detokenize 状态（懒创建）
+        #   原来 _detok_first/_detok_pend/_detok_prev 挂在引擎实例上（全局单份），
+        #   并发请求会互相清状态 ⇒ 输出乱码。
+        #   HTTP 服务是 ThreadingHTTPServer，每请求一线程 ⇒ 线程本地 == 请求本地。
+        tl = getattr(self, '_detok_tl', None)
+        if tl is None:
+            tl = threading.local()
+            self._detok_tl = tl
+        if not hasattr(tl, 'first'):
+            tl.first = True
+            tl.pend = False
+            tl.prev = None
+        return tl
+
     def detok_reset(self):
         """开始一次新的生成/解码序列时调用，重置 detokenize 状态"""
-        self._detok_first = True
-        self._detok_pend = False
-        self._detok_prev = None
+        tl = self._detok_state()
+        tl.first = True
+        tl.pend = False
+        tl.prev = None
 
     def decode(self, tid, detok=None):
         """token id → 文本
@@ -448,7 +515,8 @@ class TGEngine:
         """
         if self.sidecar:
             return self.sidecar.decode([tid])
-        if not hasattr(self, '_detok_first'):
+        tl = self._detok_state()
+        if not hasattr(tl, 'first'):
             self.detok_reset()
         buf = ctypes.create_string_buffer(256)
         self.lib.tg_token_to_str(self.model, tid, buf, 256)
@@ -456,32 +524,41 @@ class TGEngine:
         if detok is False:
             return s
         if detok is True:
-            self._detok_first = True
-            self._detok_pend = False
-        self._detok_prev = s
+            tl.first = True
+            tl.pend = False
+        tl.prev = s
 
         # ① token 本身就是裸 ▁（词表 id=9）：只登记待定空格，本次不输出
         if s == self._SP_MARK:
-            self._detok_pend = True
+            tl.pend = True
             return ''
         # ② token 以 ▁ 开头（如 '▁的'）：剥掉 ▁，按位置决定补不补空格
         if s.startswith(self._SP_MARK):
             out = s[len(self._SP_MARK):]
-            if not self._detok_first:
+            if not tl.first:
                 out = ' ' + out
         # ③ 普通 token：若前面有待定 ▁ 则补空格
-        elif self._detok_pend:
-            out = s if self._detok_first else (' ' + s)
+        elif tl.pend:
+            out = s if tl.first else (' ' + s)
         else:
             out = s
 
-        self._detok_pend = False
+        tl.pend = False
         if out:
-            self._detok_first = False     # 产出过可见内容，后续不再吞前导空格
+            tl.first = False              # 产出过可见内容，后续不再吞前导空格
         return out
 
     def kv_handle(self):
-        """★ KV_CACHE_REUSE：返回可复用的 KV cache 句柄（跨轮保留）"""
+        """★ KV_CACHE_REUSE：返回可复用的 KV cache 句柄（跨轮保留）
+
+        ⚠️ 这是【引擎级单例】：同一个 TGEngine 的所有调用方拿到的是同一个对象、
+        同一份 KV cache。单会话场景没问题，但它有两条已知的副作用：
+          ① 多序列并发时 KV 会串（所有请求共用一份 KV 与一份 ids 记账）；
+          ② 不同档位（<回答>/<思考>）的请求也会共用同一份 KV，
+             前缀一断就退化成全量重算或更糟。
+        ⇒ 并发/多会话场景请改用 new_kv_slot()，「一会话一槽」。
+        这里保留原实现，纯属向后兼容（老脚本/TGEngine 单会话路径）。
+        """
         if not hasattr(self, '_kvh'):
             class _KV: pass
             h = _KV()
@@ -491,6 +568,77 @@ class TGEngine:
         # 若底层 cache 被重建（如 extend_ctx 变更），同步句柄
         self._kvh.cache = self.kvcache
         return self._kvh
+
+    # ══════════════════════════════════════════════════════════════════
+    #  ★★ 多序列 KV 槽（2026-10-13 加）—— 单进程多序列并发的入口
+    #
+    #  背景：改造前 KV 在 C 层是"模型级单份"，所以一个进程同一时刻只能跑
+    #  一条序列；server.py 被迫 `with h.lock:` 把所有请求串起来。
+    #  C 层现在改成"按 TGKVCache* 指针自动分槽"：每条序列一个槽，
+    #  槽内独占 KV + 全部激活值工作区；权重仍然只有一份。
+    #
+    #  所以 Python 侧只需要做一件事：**每条并发序列各 tg_kvcache_new 一份**。
+    #  new_kv_slot() 就是这件事，返回的句柄与 kv_handle() 接口兼容，
+    #  可以直接传给 _session.generate(kv=...)。
+    # ══════════════════════════════════════════════════════════════════
+    def new_kv_slot(self, max_seq=None):
+        """申请一条【独立的】KV 槽（自己的 TGKVCache ⇒ C 层自己的 GPU KV 槽）。
+
+        max_seq: 该槽的 CPU 侧容量；None = 用引擎的 max_seq。
+                 （GPU 侧容量由 C 层按 TGAI_CUDA_KV_SLOT_SEQ 懒分配并自动增长，
+                  与这里的值无关；这里只是 TGKVCache 结构体自己的 k/v 数组，
+                  CUDA 路径根本不用它，所以给大给小于正确性无影响。）
+        返回: 句柄对象（.cache / .ids / .reset() / .release()），可直接做 kv= 参数。
+        """
+        if not hasattr(self, '_slots'):
+            self._slots = set()
+        seq = int(max_seq or self.max_seq)
+        c = self.lib.tg_kvcache_new(self.model, seq)
+        if not c:
+            raise RuntimeError('KV slot alloc failed (tg_kvcache_new returned NULL)')
+        h = _KVSlot(self, c)
+        self._slots.add(h)
+        return h
+
+    def _release_kv_slot(self, h):
+        """内部：把槽还回去（tg_kvcache_free ⇒ C 层释放该序列的 GPU KV 槽）。"""
+        try:
+            if hasattr(self, '_slots'):
+                self._slots.discard(h)
+        except Exception:
+            pass
+        c, h.cache = h.cache, None
+        if c and self.lib and not getattr(self, '_freed', False):
+            try:
+                self.lib.tg_kvcache_free(c)
+            except Exception:
+                pass
+
+    def kv_slot_info(self):
+        """GPU 侧槽表快照（用来【证明】多槽真的生效，而不是靠推断）。"""
+        try:
+            self.lib.tg_gpu_kv_slot_report.restype = ctypes.c_char_p
+            s = self.lib.tg_gpu_kv_slot_report()
+            return s.decode('utf-8', 'replace') if s else ''
+        except AttributeError:
+            return '(this DLL has no multi-slot support: tg_gpu_kv_slot_report missing)'
+
+    def kv_slot_of(self, h):
+        """该句柄实际落在哪个 GPU 槽号（-1 = 没分到 / DLL 不支持）。"""
+        try:
+            self.lib.tg_gpu_kv_slot_of.restype = ctypes.c_int
+            self.lib.tg_gpu_kv_slot_of.argtypes = [ctypes.c_void_p]
+            return int(self.lib.tg_gpu_kv_slot_of(h.cache))
+        except AttributeError:
+            return -1
+
+    def kv_slot_live(self):
+        """当前在用槽数（-1 = 不支持/未接 GPU）。"""
+        try:
+            self.lib.tg_gpu_kv_slot_live.restype = ctypes.c_int
+            return int(self.lib.tg_gpu_kv_slot_live())
+        except AttributeError:
+            return -1
 
     # ── 库新增：线程数 / 预加载（2026-10-10） ──
     def set_threads(self, n):
@@ -541,6 +689,14 @@ class TGEngine:
             self._kvh.ids = []
 
     def free(self):
+        if getattr(self, '_slots', None):
+            for h in list(self._slots):
+                try:
+                    h.release()
+                except Exception:
+                    pass
+            self._slots.clear()
+        self._freed = True
         if self.kvcache: self.lib.tg_kvcache_free(self.kvcache); self.kvcache = None
         if self.model: self.lib.tg_free(self.model); self.model = None
         # 终止线程池并等待 worker 退出: 必须在 DLL 被卸载 (进程退出) 前调用,

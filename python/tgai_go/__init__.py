@@ -31,7 +31,7 @@
 import logging as _logging
 import os as _os
 
-__version__ = '1.1.2'
+__version__ = '1.2.0'
 
 # 库默认不往 stdout 输出（脚本版会打印，库不该）
 _logging.getLogger('tgai_go').addHandler(_logging.NullHandler())

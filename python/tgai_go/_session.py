@@ -177,6 +177,8 @@ def generate(engine, input_ids, params, eos_id, eos_set=None, kv=None):
         _tc_slope = float(params.get("think_close_slope", 0.02) or 0.0)
         _tc_max = float(params.get("think_close_max_logit", 2.5) or 0.0)
         _tc_limit = int(params.get("think_soft_limit", 220) or 0)
+        # _tc_floor: 最少思考 token 数（下限保护，详见 _add_think_floor 注释）
+        _tc_floor = int(params.get("think_floor", 0) or 0)
         # _TC_EOS_GUARD: 思考档下抬高 EOS 阈值，逼模型先思考够再收束
         #   实测：不抬时会三五十 token 就 EOS，<回答> 只出 4/10。
         #   取 think_soft_limit 的一半（默认 220/2=110），下限 40。
@@ -207,45 +209,107 @@ def generate(engine, input_ids, params, eos_id, eos_set=None, kv=None):
             _tcs.stderr.write(chr(91) + "think-close" + chr(93) + " ans_id=%d slope=%s max=%s limit=%d" % (_tc_ans, _tc_slope, _tc_max, _tc_limit) + chr(10))
             _tcs.stderr.flush()
 
+        # ══ _CODE_FENCE_GUARD (2026-10-14) ══
+        # 从 tgai_chat.py 移植的【代码块保护】。服务端原先完全没有这套守卫，
+        # 导致模型写到 ```python\nimport random 就 EOS（实测 41~54 token 硬截断）。
+        _fence_open = 0        # 围栏开/闭（异或翻转）
+        _ticks = 0             # 连续反引号计数（词表把 ``` 拆成 '``'+'`'）
+        _in_code = False
+        _at_line_start = True
+        _code_len = 0          # 进入围栏后已生成的 token 数（催闭合用）
+        _code_overrides = False
+        _saved_params = {}
+        _closing_tid = -1
+        try:
+            _tk = engine.encode('`', add_bos=False)
+            if _tk:
+                _closing_tid = int(_tk[0])
+        except Exception:                                          # noqa: BLE001
+            _closing_tid = -1
+        # 块内防复读参数（2026-10-14 调猛，对齐 llama.cpp 调参台）
+        _CODE_RP = float(params.get('code_repeat_penalty', 1.25) or 1.25)
+        _CODE_DRY = float(params.get('code_dry_multiplier', 4.5) or 4.5)
+        _CODE_FP = float(params.get('code_freq_penalty', 0.25) or 0.25)
+        _CODE_CSLP = float(params.get('code_close_slope', 0.03) or 0.0)
+        _CODE_CMAX = float(params.get('code_close_max_logit', 3.0) or 0.0)
+        # ══ _stop_reason (2026-10-14)：记录哪条 break 结束了生成 ══
+        #   generate() 有 8 条 break，排查"输出被腰斩"没有它会绕大弯路。
+        #   设 TGAI_STOP_TRACE=1 打到 stderr。
+        _stop_reason = None
+        import os as _os2
+        _stop_trace = _os2.environ.get('TGAI_STOP_TRACE') == '1'
+
         for step in range(max_tok):
             arr = np.ctypeslib.as_array(ctypes.cast(lp, FloatArr), shape=(vocab,)).copy()
 
             if _con >= 3: arr[_lid] -= _con * 5.0
-            if _con > 15: break
+            if _con > 15:
+                _stop_reason = 'same-token x%d' % _con
+                break
             if step < (max(min_tok, _tc_eos_min) if _tc_on else min_tok):  # _TC_EOS_GUARD
                 for e in eos_set:
                     if 0 <= e < vocab: arr[e] = -np.inf
 
             # _THINK_CLOSE_REAL: 思考档收束偏置（仅思考档生效）
+            # _tc_floor: 思考下限 —— 未达步数前压掉 <回答>，逼模型继续思考
+            #   为什么需要：收束偏置只加速收束，无法保证最少思考量（实测会退化到
+            #   一两百 token）。这里在生成参数层面加下限，不碰任何提示词模板。
+            if _tc_on and _tc_ans >= 0 and _tc_floor > 0 and step < _tc_floor:
+                arr[_tc_ans] = -np.inf
             if _tc_on and _tc_ans >= 0:
                 _tc_steps = step
                 if _tc_limit > 0 and step > _tc_limit:
                     _tc_steps = _tc_limit
                 arr[_tc_ans] += min(_tc_slope * _tc_steps, _tc_max)
+            # _CODE_FENCE_GUARD ② 代码块内【禁用 EOS】—— 修腰斩的关键一条
+            _in_code = (_fence_open & 1) == 1
+            if _in_code:
+                for _e in eos_set:
+                    if 0 <= _e < vocab:
+                        arr[_e] = -np.inf
+                # ⑤ 催闭合：只在【行首】抬反引号（否则会污染成 `u']) 这类）
+                if _closing_tid >= 0 and _code_len > 4 and _at_line_start:
+                    if np.isfinite(arr[_closing_tid]) and _CODE_CMAX > 0.0:
+                        arr[_closing_tid] += min(_CODE_CMAX, _code_len * _CODE_CSLP)
             tid = sample_numpy(arr, temp, top_k, top_p, vocab,
                                p=params, recent=_recent,
                                decode_fn=engine.decode,
-                               turn_recent=_turn_ids)
+                               turn_recent=_turn_ids,
+                               # ★ Soft-Stop 收尾偏置（2026-10-14 移植）
+                               #   块内传空集 ⇒ 让路，免得催停半截代码
+                               max_tok=max_tok, step=step,
+                               eos_ids=(set() if _in_code else eos_set))
 
             # EOS check (after min_tokens) — 支持多 EOS token
-            if tid in eos_set and step >= min_tok: break
+            if tid in eos_set and step >= min_tok:
+                _stop_reason = 'EOS id=%d at step %d' % (tid, step)
+                break
 
             _con = _con + 1 if tid == _lid else 0; _lid = tid
             _recent.append(tid)
             _turn_ids.append(tid)
             if len(_recent) > 12: _recent = _recent[-12:]
-            if len(_recent) >= 6 and step >= min_tok:
-                if _recent[-2:] == _recent[-4:-2] == _recent[-6:-4]: break
-            if len(_recent) >= 9 and step >= min_tok:
-                if _recent[-3:] == _recent[-6:-3] == _recent[-9:-6]: break
+            # _CODE_FENCE_GUARD ③ 复读检测在代码块内让路（代码天然重复，
+            #   用中文对话阈值必然误杀：实测停在 def generate_random_）
+            if not _in_code:
+                if len(_recent) >= 6 and step >= min_tok:
+                    if _recent[-2:] == _recent[-4:-2] == _recent[-6:-4]:
+                        _stop_reason = '2-gram repeat at step %d' % step
+                        break
+                if len(_recent) >= 9 and step >= min_tok:
+                    if _recent[-3:] == _recent[-6:-3] == _recent[-9:-6]:
+                        _stop_reason = '3-gram repeat at step %d' % step
+                        break
             # ★ 模板复读检测（2026-10-10 加）
             #   训练语料的表单模板会成段重复（'[简称]|[机构名称]|[职称]|…'），
             #   特征是【8-gram 连续重复 3 次】。原 3/2-gram 检测抓不到长结构。
-            if len(_turn_ids) >= 24 and step >= min_tok:
+            if (not _in_code) and len(_turn_ids) >= 24 and step >= min_tok:
                 a3 = _turn_ids[-24:-16]
                 a2 = _turn_ids[-16:-8]
                 a1 = _turn_ids[-8:]
-                if a1 == a2 == a3: break
+                if a1 == a2 == a3:
+                    _stop_reason = '8-gram repeat at step %d' % step
+                    break
 
             ts = engine.decode(tid)
             if ts:
@@ -258,18 +322,64 @@ def generate(engine, input_ids, params, eos_id, eos_set=None, kv=None):
                             _so_far = _so_far[:idx]
                             break
                     break
-                # Non-Chinese flood detection
-                if step >= min_tok and step >= 15 and len(_so_far) >= 30:
+                # _CODE_FENCE_GUARD：先在 yield 前更新围栏状态（晚一拍会漏保护）
+                for _ch in ts:
+                    if _ch == '`':
+                        _ticks += 1
+                    else:
+                        _ticks = 0
+                    if _ticks >= 3:
+                        _fence_open ^= 1
+                        _ticks = 0
+                _at_line_start = ts.endswith(chr(10))
+                _in_code = (_fence_open & 1) == 1
+                if _in_code:
+                    _code_len += 1
+                else:
+                    _code_len = 0
+                # ④ 块内切换防复读参数（只调分数、不硬切，正好挡变体复读）
+                if _in_code and not _code_overrides:
+                    _saved_params = {_k: params.get(_k) for _k in
+                                     ('repeat_penalty', 'dry_multiplier',
+                                      'frequency_penalty')}
+                    params['repeat_penalty'] = _CODE_RP
+                    params['dry_multiplier'] = _CODE_DRY
+                    params['frequency_penalty'] = _CODE_FP
+                    _code_overrides = True
+                elif _code_overrides and not _in_code:
+                    for _k, _v in _saved_params.items():
+                        if _v is None:
+                            params.pop(_k, None)
+                        else:
+                            params[_k] = _v
+                    _code_overrides = False
+
+                # Non-Chinese flood detection（代码块内让路：代码天然全是 ASCII）
+                if (not _in_code) and step >= min_tok and step >= 15 and len(_so_far) >= 30:
                     tail = _so_far[-30:]
-                    if sum(1 for c in tail if c.isascii() and c.isalpha()) > 18: break
+                    if sum(1 for c in tail if c.isascii() and c.isalpha()) > 18:
+                        _stop_reason = 'ascii-flood at step %d' % step
+                        break
                 yield ts
 
             na = (ctypes.c_int32 * 1)(tid)
             lp = lib.tg_forward(model, na, 1, cache, cur)
-            if not lp: break
+            if not lp:
+                _stop_reason = 'forward failed'
+                break
             cur += 1
-            if cur >= max_seq: break
+            if cur >= max_seq:
+                _stop_reason = 'max_seq reached'
+                break
     finally:
+        if _stop_trace:
+            import sys as _sys2
+            _hint = ''
+            if _fence_open == 1:
+                _hint = '  ⚠️ 结束时仍在代码块内（围栏未闭合）'
+            _sys2.stderr.write('[stop] step=%d reason=%s%s\n'
+                               % (step, _stop_reason, _hint))
+            _sys2.stderr.flush()
         if own_cache:
             lib.tg_kvcache_free(cache)
         # 复用时把 cache 留给下一轮（engine.kvcache 持有）

@@ -16,6 +16,15 @@ import numpy as np
 __all__ = ['apply_penalties', 'sample_numpy']
 
 
+
+# ★ SOFT_STOP_MAX_LOGIT (2026-10-14 从 tgai_chat.py 移植)
+#   长度递增收尾偏置的上限（logit 加常数）。
+#   为什么需要：V2.7 自由生成时会一路写到 max_tokens 才停
+#   （实测 2048 token / 189 秒），既慢又挤爆上下文。
+#   有了它，越接近上限越倾向自然收尾，且不切断句子。
+#   调参直觉：+1 ≈ 概率 ×2.7；+3 ≈ ×20；+5 ≈ ×148。
+SOFT_STOP_MAX_LOGIT = 3.0
+
 def apply_penalties(logits, recent, p):
     """在采样前对 logits 施加【历史相关】的惩罚项（原地修改并返回）。
 
@@ -122,7 +131,8 @@ def _dry_penalize(logits, recent, p, decode_fn):
 
 
 def sample_numpy(logits, temp, top_k, top_p, vocab, p=None, recent=None,
-                 decode_fn=None, turn_recent=None):
+                 decode_fn=None, turn_recent=None,
+                 max_tok=0, step=0, eos_ids=None):
     """采样（linearly: penalties -> dry -> top_k -> top_p -> min_p -> multinomial）。
 
     p: 完整参数字典（含 seed / *_penalty / dry_* / min_p）；缺省时退化为旧行为。
@@ -149,8 +159,31 @@ def sample_numpy(logits, temp, top_k, top_p, vocab, p=None, recent=None,
             dfn = decode_fn or (lambda t: '')
             arr = _dry_penalize(arr, dry_hist, p, dfn)
 
+    # ★★ ②.5 长度递增收尾偏置（Soft-Stop，2026-10-14 从 tgai_chat.py 移植）
+    #
+    #  语义对齐 llama.cpp PR #14229 的 escalating EOG bias：
+    #      k    = max(已生成 - start_after, start_at_remain - 剩余)
+    #      bias = min(SOFT_STOP_MAX_LOGIT, k * per_tok)
+    #      arr[eos] += bias        （对本轮所有停止符）
+    #
+    #  为什么服务端以前没有：这套只在 tgai_chat.py 里实现过，
+    #  服务端（网页/机器人）路径从未移植 ⇒ 输出没有收尾引导，
+    #  该收尾时不收，硬撞 max_tokens 截断。
+    #
+    #  eos_ids 传空集 ⇒ 自动失效（代码块内就是这么用的是，避免催停半截代码）
+    _spt = float(p.get('soft_stop_per_tok', 0.0) or 0.0)
+    if _spt > 0.0 and eos_ids and max_tok > 0:
+        _n_remain = max_tok - step
+        _after = step - float(p.get('soft_stop_after', 256) or 0)
+        _at_rem = float(p.get('soft_stop_at_remain', 64) or 0) - _n_remain
+        _k = _after if _after > _at_rem else _at_rem
+        if _k > 0.0:
+            _bias = min(SOFT_STOP_MAX_LOGIT, _k * _spt)
+            for _e in eos_ids:
+                if 0 <= _e < arr.size and np.isfinite(arr[_e]):
+                    arr[_e] += _bias
+
     # ③ 温度
-    arr = arr / max(float(temp), 0.01)
 
     # ④ top_k
     if 0 < top_k < vocab:

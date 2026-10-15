@@ -56,14 +56,38 @@
 #include <stdlib.h>
 #include <math.h>
 
-/* ─── PSRAM support for ESP32 ──────────────────── */
+/* ─── PSRAM support for ESP32 ────────────────────
+ * ★ 2026-10-16 修（IDF 5.x 兼容）：TG_EMBED_ESP32 由 TGAI_GO.h 的 `#ifdef ESP32`
+ *   分支定义（该头在本文件更早处被 include），所以真机上 PSRAM 路径本来就是开的。
+ *   真正的坑是 **头文件名**：Arduino-ESP32 3.x（IDF 5.x）删掉了 esp_spiram.h，
+ *   改名 esp_psram.h，初始化函数也从 esp_spiram_is_initialized() 变成
+ *   esp_psram_is_initialized()。原来两处都硬写旧名字
+ *   ⇒ 在 esp32 core 3.3.12 上直接 "No such file"，整个库编不过（实测）。
+ *   这里按 __has_include 兼容两代 IDF；TGAI_GO.h 里做同样处理。 */
+#if defined(ESP32) && !defined(TG_EMBED_ESP32)
+  #define TG_EMBED_ESP32 1     /* 兜底：万一 TGAI_GO.h 没被先包含 */
+#endif
+
 #ifdef TG_EMBED_ESP32
+  #if defined(__has_include)
+    #if __has_include("esp_psram.h")
+      #include "esp_psram.h"
+      #define TGG_PSRAM_IS_INIT() esp_psram_is_initialized()
+    #elif __has_include("esp_spiram.h")
+      #include "esp_spiram.h"
+      #define TGG_PSRAM_IS_INIT() esp_spiram_is_initialized()
+    #else
+      #define TGG_PSRAM_IS_INIT() (true)
+    #endif
+  #else
+    #include "esp_spiram.h"
+    #define TGG_PSRAM_IS_INIT() esp_spiram_is_initialized()
+  #endif
   #include "esp_heap_caps.h"
-  #include "esp_spiram.h"
 
   static void* tg_embed_malloc(size_t size) {
       /* Prefer PSRAM for large allocations (>= 4KB) */
-      if (size >= 4096 && esp_spiram_is_initialized()) {
+      if (size >= 4096 && TGG_PSRAM_IS_INIT()) {
           void* ptr = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
           if (ptr) return ptr;
           /* Fall back to internal DRAM if PSRAM allocation fails */
@@ -163,6 +187,32 @@ typedef struct TGEmbedModel {
     /* Q4_0 direct pointers (avoid FP32 decode for large tensors) */
     const uint8_t*   emb_weight_q4;  /* token_embedding.weight Q4_0 raw */
     const uint8_t*   final_norm_q4;  /* final_norm.weight (small, keep FP32 ptr too) */
+
+    /* ═══ ★★ V3 支持（2026-10-16 加，语义与 tgai_engine.c v3.5 完全一致）═══
+     * 板载 sft5c 是 V3 架构，且与 V2.7 有三处结构性差异：
+     *   ① version=3（旧代码只认 1/2 ⇒ 连加载都进不去）
+     *   ② n_experts=0 的【稠密】FFN（blocks.{i}.ffn.w1/w2/w3），不是 MoE
+     *   ③ num_kv_heads=1 的 MQA（K/V 只投影到 32 维，不是 256）
+     * 另外带 QK-Norm 与 Block AttnRes。 */
+    int             n_kv_heads;      /* 已归一化：0/非法 ⇒ n_heads（V2.x 行为不变） */
+    int             is_dense_ffn;    /* 1 = blocks.{i}.ffn.*（按权重存在性判定，不信 header） */
+    int             v3_flags;        /* bit0 = QK-Norm, bit1 = Block AttnRes */
+    int             attn_res_block;  /* AttnRes 每几层收一次块（默认 4，可被扩展段覆盖） */
+    int             attn_res_active; /* 本次 forward 是否启用 AttnRes */
+    int             res_n_blocks;    /* 已收块数 */
+    int             max_blocks;      /* res_blk 槽数 = ceil(n_layers / attn_res_block) */
+    float*          res_blk;         /* [max_blocks][max_seq][d] 已收块快照（= torch.stack 的 blocks） */
+    float*          res_partial;     /* [max_seq][d] 当前 partial（= PyTorch 的 partial） */
+    float*          res_h;           /* [max_seq][d] attn 侧 AttnRes 输出 h */
+    float*          res_h2;          /* [max_seq][d] mlp  侧 AttnRes 输出（与 res_h 分开） */
+
+    /* ═══ 分词器加速（2026-10-16 加）═══
+     * 旧 embed_encode 对每个字符做 O(vocab) 线性 strcmp；V3 还要做最长匹配
+     * （最多 max_token_len 次查表）⇒ 必须 O(1)。开放寻址，-1 = 空槽。
+     * 表大小 cap >= 2*vocab ⇒ 未命中是确定的（最长匹配里无需线性兜底）。 */
+    int32_t*        vocab_hash;
+    uint32_t        vocab_hash_cap;
+    int             max_token_len;   /* 最长词条字节数（V3w 实测 19），最长匹配上界 */
 } TGEmbedModel;
 
 /* ─── FNV-1a hash (same as tgai_engine.c) ────────── */
@@ -173,6 +223,126 @@ static uint64_t embed_fnv1a_64(const char* s) {
         h *= 0x100000001b3ULL;
     }
     return h;
+}
+
+/* ═══ 版本戳 ══════════════════════════════════════════════════════════
+ * ★ 定义已移到 TGAI_GO.h（2026-10-16），这样 sketch 自己也能打印版本号
+ *   （刷板后从串口确认固件版本最快的办法）。这里不再重复定义。 */
+
+/* V3 特性位（与 tgai_engine.c 的 TG_V3_F_* 保持一致） */
+#define TGG_V3_F_QK_NORM   0x1
+#define TGG_V3_F_ATTN_RES  0x2
+
+/* .TG 扩展段（TLV）：V3 结构参数 */
+#define TGG_EXT_TYPE_V3CFG  1u
+#define TGG_EXT_MAGIC_V3CFG 0x33474354u   /* "TCG3" little-endian */
+
+/* ─── vocab 哈希表（2026-10-16 加）────────────────────────────────────
+ * 为什么必须加：旧 embed_encode 对每个字符做 O(vocab) 线性 strcmp；
+ * 而 V3 走「最长匹配」要对每个位置试 max_token_len(实测19) 个长度
+ * ⇒ 19*8192 次 strcmp/字符，ESP32 上不可接受。
+ * 开放寻址 + -1 空槽哨兵；cap >= 2*vocab ⇒ 未命中是确定的。 */
+static uint32_t embed_fnv1a32(const char* s, int len) {
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < len; i++) {
+        h ^= (uint8_t)s[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static void embed_vocab_hash_build(TGEmbedModel* m) {
+    if (!m || !m->vocab || m->vocab_size <= 0) return;
+    uint32_t cap = 1;
+    while (cap < (uint32_t)m->vocab_size * 2u) cap <<= 1;
+    if (cap < 16) cap = 16;
+    int32_t* tbl = (int32_t*)tg_embed_malloc((size_t)cap * sizeof(int32_t));
+    if (!tbl) return;
+    for (uint32_t i = 0; i < cap; i++) tbl[i] = -1;
+    for (int id = 0; id < m->vocab_size; id++) {
+        const char* tok = m->vocab[id];
+        if (!tok) continue;
+        int len = (int)strlen(tok);
+        if (len == 0) continue;
+        uint32_t h = embed_fnv1a32(tok, len) & (cap - 1u);
+        for (uint32_t probe = 0; probe < cap; probe++) {
+            uint32_t slot = (h + probe) & (cap - 1u);
+            if (tbl[slot] < 0) { tbl[slot] = id; break; }
+            if (strcmp(m->vocab[tbl[slot]], tok) == 0) break;  /* 同 key：保留较小 id */
+        }
+    }
+    m->vocab_hash = tbl;
+    m->vocab_hash_cap = cap;
+}
+
+/* 命中返回 id，未命中返回 -1（cap>=2*vocab ⇒ 未命中确定） */
+static inline int embed_vocab_lookup(const TGEmbedModel* m, const char* key, int len) {
+    if (!m->vocab_hash || len <= 0) return -1;
+    uint32_t cap = m->vocab_hash_cap;
+    uint32_t h = embed_fnv1a32(key, len) & (cap - 1u);
+    for (uint32_t probe = 0; probe < cap; probe++) {
+        uint32_t slot = (h + probe) & (cap - 1u);
+        int32_t id = m->vocab_hash[slot];
+        if (id < 0) return -1;
+        const char* tok = m->vocab[id];
+        if (tok && (int)strlen(tok) == len && memcmp(tok, key, (size_t)len) == 0) return (int)id;
+    }
+    return -1;
+}
+
+/* ─── ★ 字节 token（byte fallback）双向映射（2026-10-16 加）──────────
+ * 词表把 0x00-0xFF 表示为 '<b0>'..'<b255>'，且 **id 等于字节值**（实测 id 10='<b10>'）。
+ * 权威 tokenizer_v3.py 的 _encode_bytes()/decode() 就是这套语义：
+ *   未命中 ⇒ 按 UTF-8 字节回退成 <bN>（永不 OOV）；解码时 <bN> 还原成那个字节。
+ * 旧实现：'\n' 字面量查不到 ⇒ 输出 unk(1) ⇒ 对话模板里的换行变 <b1>，格式错。 */
+static int embed_parse_byte_token(const char* s) {
+    if (!s || s[0] != '<' || s[1] != 'b') return -1;
+    int v = 0, i = 2, any = 0;
+    while (s[i] >= '0' && s[i] <= '9') {
+        v = v * 10 + (s[i] - '0');
+        if (v > 255) return -1;
+        i++; any = 1;
+    }
+    if (!any || s[i] != '>' || s[i + 1] != '\0') return -1;
+    return v;
+}
+
+/* 字节 ⇒ token id：先哈希 O(1)，未命中返回 -1（老词表 ⇒ 调用方保留原行为） */
+static int embed_byte_token_id(TGEmbedModel* m, uint8_t byte) {
+    if (!m) return -1;
+    char name[8];
+    snprintf(name, sizeof(name), "<b%u>", (unsigned)byte);
+    int len = (int)strlen(name);
+    int tid = embed_vocab_lookup(m, name, len);
+    if (tid >= 0) return tid;
+    if (m->vocab) {                       /* 哈希不可用时线性兜底 */
+        for (int i = 0; i < m->vocab_size; i++) {
+            if (m->vocab[i] && strcmp(m->vocab[i], name) == 0) return i;
+        }
+    }
+    return -1;
+}
+
+/* token id ⇒ 可打印字符串（写入调用方缓冲，返回同一指针）。
+ * ★ 字节 token 还原成**原始单字节**（'<b10>' ⇒ '\n'）。
+ *   否则换行会被原样打印成字面 "<b10>" —— 对话模板与输出都会看着是坏的。
+ *   buf 至少 8 字节（最长 token 19 字节，超出会被截断，但字节 token 只占 1）。 */
+static const char* embed_token_str(TGEmbedModel* m, int id, char* buf, int cap) {
+    if (!buf || cap <= 0) return "";
+    buf[0] = '\0';
+    if (!m || id < 0 || id >= m->vocab_size || !m->vocab[id]) return buf;
+    const char* s = m->vocab[id];
+    int bn = embed_parse_byte_token(s);
+    if (bn >= 0) {
+        buf[0] = (char)(uint8_t)bn;
+        buf[1] = '\0';
+        return buf;
+    }
+    int len = (int)strlen(s);
+    if (len > cap - 1) len = cap - 1;
+    memcpy(buf, s, (size_t)len);
+    buf[len] = '\0';
+    return buf;
 }
 
 /* ─── FP16 to FP32 conversion ────────────────────── */
@@ -479,6 +649,107 @@ static void embed_softmax(float* x, int n) {
     for (int i = 0; i < n; i++) x[i] *= inv;
 }
 
+/* ─── ★ QK-Norm（V3，2026-10-16 加）────────────────────────────────
+ * model_v3.py L410-411 逐字：q = self.q_norm(q); k = self.k_norm(k)
+ * 位置：QKV 投影 + bias **之后**、RoPE **之前**；
+ * 粒度：每 head 在 **head_dim(d_k)** 上做 RMSNorm（不是 d_model！）。
+ * 与 tgai_engine.c 的 qk_norm_heads 同语义。 */
+static void embed_qk_norm_heads(float* q, int seq, int nheads, int dk, const float* w) {
+    if (!q || !w || nheads <= 0 || dk <= 0) return;
+    for (int t = 0; t < seq; t++) {
+        for (int h = 0; h < nheads; h++) {
+            float* v = q + ((size_t)t * nheads + h) * dk;
+            float ss = 0.0f;
+            for (int i = 0; i < dk; i++) ss += v[i] * v[i];
+            ss = 1.0f / sqrtf(ss / (float)dk + 1e-6f);
+            for (int i = 0; i < dk; i++) v[i] = v[i] * ss * w[i];
+        }
+    }
+}
+
+/* ─── ★ Block AttnRes resolve（V3，2026-10-16 加）──────────────────
+ * 权威语义（model_v3.py L841-851）：
+ *     if not blocks: return partial_block                    # ★ 空 blocks 直通
+ *     V = torch.stack(blocks + [partial_block], dim=0)       # [N+1, seq, d]
+ *     K = norm(V); logits = einsum('d,nbtd->nbt', proj_w, K)
+ *     h = einsum('nbt,nbtd->btd', logits.softmax(0), V)
+ * 本实现**不物化 V**（ESP32 省 ~数百 KB）：先流式算各 block 的 logits，
+ * softmax 后再流式加权求和。数学与 torch.stack 等价。
+ *   blocks_buf : [max_blocks][seq][d] 已收块；n_blocks = 已收块数
+ *   partial    : 当前 partial [seq][d]
+ *   out        : 输出 h [seq][d] —— 必须是【独立缓冲】，不可与 partial/blocks 别名 */
+#define TGG_AR_MAX_BLOCKS 64
+static void embed_attn_resolve(const float* blocks_buf, int n_blocks, int seq, int d,
+                               const float* proj_w, const float* norm_w,
+                               float* out, const float* partial) {
+    if (!proj_w || !norm_w || !out || !partial) return;
+    const size_t nd = (size_t)seq * (size_t)d;
+    /* ★ 空 blocks ⇒ 直通（与 PyTorch `if not blocks: return partial_block` 一致）。
+     *   注意：这也正是 V3 前 4 层 h==partial 的原因 —— 第一次收块在 layer 3 末尾。 */
+    if (n_blocks <= 0) { memcpy(out, partial, nd * sizeof(float)); return; }
+    const int N = n_blocks + 1;
+    if (N > TGG_AR_MAX_BLOCKS) return;
+
+    for (int t = 0; t < seq; t++) {
+        const float* src[TGG_AR_MAX_BLOCKS];
+        float logits[TGG_AR_MAX_BLOCKS];
+        for (int b = 0; b < n_blocks; b++) {
+            src[b] = blocks_buf + (size_t)b * nd + (size_t)t * d;
+        }
+        src[n_blocks] = partial + (size_t)t * d;
+        float mx = -1e30f;
+        for (int b = 0; b < N; b++) {
+            const float* r = src[b];
+            float ss = 0.0f;
+            for (int i = 0; i < d; i++) ss += r[i] * r[i];
+            float rms = 1.0f / sqrtf(ss / (float)d + 1e-6f);
+            float acc = 0.0f;
+            for (int i = 0; i < d; i++) acc += proj_w[i] * (r[i] * rms * norm_w[i]);
+            logits[b] = acc;
+            if (acc > mx) mx = acc;
+        }
+        float ssum = 0.0f;
+        for (int b = 0; b < N; b++) { logits[b] = expf(logits[b] - mx); ssum += logits[b]; }
+        float inv = 1.0f / (ssum > 0.0f ? ssum : 1.0f);
+        float* o = out + (size_t)t * d;
+        for (int i = 0; i < d; i++) {
+            float acc = 0.0f;
+            for (int b = 0; b < N; b++) acc += logits[b] * src[b][i];
+            o[i] = acc;
+        }
+    }
+}
+
+/* ─── ★ RoPE（GQA/MQA 版，2026-10-16 加）────────────────────────
+ * 旧 embed_rope 假设 q 与 k 都是 n_heads 个 head；sft5c 是 MQA(nkv=1)，
+ * K 只有 1 个 head ⇒ 必须分开传 head 数。
+ * 内层数学与 embed_rope 逐位相同（freq/angle/cos/sin 只依赖 i,pos,theta），
+ * 所以 nkv==nh 时两者结果一致。V2.x 仍走原 embed_rope，路径不变。 */
+static void embed_rope_gqa(float* q, int nqh, float* k, int nkh, int seq, int d_k,
+                           int cache_pos, float theta) {
+    for (int t = 0; t < seq; t++) {
+        int pos = cache_pos + t;
+        for (int i = 0; i < d_k; i += 2) {
+            float freq = 1.0f / powf(theta, (float)i / d_k);
+            float angle = (float)pos * freq;
+            float c = cosf(angle);
+            float sn = sinf(angle);
+            for (int h = 0; h < nqh; h++) {
+                float* qh = q + ((size_t)t * nqh + h) * d_k;
+                float q0 = qh[i], q1 = qh[i + 1];
+                qh[i]     = q0 * c - q1 * sn;
+                qh[i + 1] = q0 * sn + q1 * c;
+            }
+            for (int h = 0; h < nkh; h++) {
+                float* kh = k + ((size_t)t * nkh + h) * d_k;
+                float k0 = kh[i], k1 = kh[i + 1];
+                kh[i]     = k0 * c - k1 * sn;
+                kh[i + 1] = k0 * sn + k1 * c;
+            }
+        }
+    }
+}
+
 /* ─── RoPE (embedded scalar) ────────────────────────── */
 static void embed_rope(float* q, float* k, int seq, int n_heads, int d_k,
                        int cache_pos, float theta) {
@@ -526,6 +797,21 @@ typedef struct {
     const uint8_t* expert_w3_q4[16];
     int n_experts;
     int is_moe;
+
+    /* ═══ ★ V3（2026-10-16 加）═══ */
+    const float*   q_norm_w;        /* QK-Norm: 每 head 在 d_k 上 RMSNorm（RoPE 之前） */
+    const float*   k_norm_w;
+    const float*   attn_res_proj_w; /* Block AttnRes 伪查询（权重形状 [1,d] ⇒ 按 [d] 用） */
+    const float*   attn_res_norm_w;
+    const float*   mlp_res_proj_w;
+    const float*   mlp_res_norm_w;
+    /* ═══ 稠密 SwiGLU FFN（n_experts=0 的模型，如 sft5c）═══ */
+    const float*   ffn_w1;
+    const float*   ffn_w2;
+    const float*   ffn_w3;
+    const uint8_t* ffn_w1_q4;
+    const uint8_t* ffn_w2_q4;
+    const uint8_t* ffn_w3_q4;
 } EmbedBlockWeights;
 
 /* ─── Work buffer management ──────────────────────── */
@@ -543,9 +829,15 @@ static void embed_free_work_buffers(TGEmbedModel* m) {
     tg_embed_free(m->work_ffn_a);
     tg_embed_free(m->work_ffn_b);
     tg_embed_free(m->work_router);
+    /* ★ V3 AttnRes 缓冲（2026-10-16 加） */
+    tg_embed_free(m->res_blk);
+    tg_embed_free(m->res_partial);
+    tg_embed_free(m->res_h);
+    tg_embed_free(m->res_h2);
     m->work_x = m->work_ln = m->work_q = m->work_k = m->work_v = NULL;
     m->work_attn = m->work_moe_out = m->work_logits = m->last_logits = NULL;
     m->work_ffn_a = m->work_ffn_b = m->work_router = NULL;
+    m->res_blk = m->res_partial = m->res_h = m->res_h2 = NULL;
     m->max_work_seq = 0;
 }
 
@@ -556,6 +848,10 @@ static int embed_alloc_work_buffers(TGEmbedModel* m, int max_seq) {
     int v   = (int)m->header.vocab_size;
     int dff = (int)m->header.d_ff;
     int ne  = (int)m->header.n_experts;
+
+    /* ★ 稠密模型 ne==0：work_router 仍需至少 1 个元素，否则 calloc(x,0) 可能返回
+     *   NULL ⇒ 下面的"分配失败"检查会误判 ⇒ 稠密模型直接起不来（2026-10-16 修）。 */
+    int ne_alloc = ne > 0 ? ne : 1;
 
     m->work_x       = (float*)tg_embed_calloc(max_seq, d * sizeof(float));
     m->work_ln      = (float*)tg_embed_calloc(max_seq, d * sizeof(float));
@@ -568,7 +864,7 @@ static int embed_alloc_work_buffers(TGEmbedModel* m, int max_seq) {
     m->last_logits  = (float*)tg_embed_malloc(v * sizeof(float));
     m->work_ffn_a   = (float*)tg_embed_calloc(max_seq, dff * sizeof(float));
     m->work_ffn_b   = (float*)tg_embed_calloc(max_seq, dff * sizeof(float));
-    m->work_router  = (float*)tg_embed_calloc(max_seq, ne * sizeof(float));
+    m->work_router  = (float*)tg_embed_calloc(max_seq, ne_alloc * sizeof(float));
 
     if (!m->work_x || !m->work_ln || !m->work_q || !m->work_k ||
         !m->work_v || !m->work_attn || !m->work_moe_out ||
@@ -576,6 +872,29 @@ static int embed_alloc_work_buffers(TGEmbedModel* m, int max_seq) {
         !m->work_ffn_a || !m->work_ffn_b || !m->work_router) {
         embed_free_work_buffers(m);
         return -1;
+    }
+
+    /* ★ V3 AttnRes 缓冲（2026-10-16 加）—— 只在模型确实带 AttnRes 权重时分配。
+     *   内存估算（sft5c: max_seq=64, d=256）：
+     *     res_blk      max_blocks(3) * seq * d * 4 = 196 KB
+     *     res_partial  seq * d * 4                =  65 KB
+     *     res_h/res_h2 各 seq * d * 4              = 131 KB
+     *   ⇒ 合计约 393 KB，只在 V3 模型上付出。 */
+    if (m->v3_flags & TGG_V3_F_ATTN_RES) {
+        int nl = (int)m->header.n_layers;
+        int bs = m->attn_res_block > 0 ? m->attn_res_block : 4;
+        int mb = (nl + bs - 1) / bs;
+        if (mb < 1) mb = 1;
+        if (mb > TGG_AR_MAX_BLOCKS) mb = TGG_AR_MAX_BLOCKS;
+        m->max_blocks = mb;
+        m->res_blk     = (float*)tg_embed_calloc((size_t)mb * max_seq, d * sizeof(float));
+        m->res_partial = (float*)tg_embed_calloc(max_seq, d * sizeof(float));
+        m->res_h       = (float*)tg_embed_calloc(max_seq, d * sizeof(float));
+        m->res_h2      = (float*)tg_embed_calloc(max_seq, d * sizeof(float));
+        if (!m->res_blk || !m->res_partial || !m->res_h || !m->res_h2) {
+            embed_free_work_buffers(m);
+            return -1;
+        }
     }
 
     m->max_work_seq = max_seq;
@@ -602,34 +921,70 @@ int embed_transformer_block(TGEmbedModel* m, float* x, int seq,
     int dff = (int)m->header.d_ff;
     float theta = (float)m->header.rope_theta;
 
+    /* ★ GQA/MQA（2026-10-16 加）：K/V 的 head 数可以与 Q 不同。
+     *   sft5c: num_kv_heads=1 ⇒ kv_dim=32（不是 256）。
+     *   V2.x: num_kv_heads=0 ⇒ 归一化为 nh ⇒ 下面所有路径与改动前完全一致。 */
+    int nkv = m->n_kv_heads > 0 ? m->n_kv_heads : nh;
+    if (nkv > nh) nkv = nh;
+    int kv_dim = nkv * dk;
+
     if (ne > 16) ne = 16;
 
     EmbedBlockWeights* bw = (EmbedBlockWeights*)m->block_cache_void;
     EmbedBlockWeights* bwl = &bw[layer_idx];
 
+    /* ★★ Block AttnRes —— attn 侧（2026-10-16 加，语义同 tgai_engine.c v3.5）
+     *   PyTorch model_v3.py L924：h = self.attn_res_proj[i](blocks, partial)
+     *   h 只作为 attn 的输入；**残差基准是 resolve 之前的 partial**（L940）。 */
+    float* partial = m->attn_res_active ? m->res_partial : x;
+    float* h = x;
+    if (m->attn_res_active) {
+        h = m->res_h;
+        if (bwl->attn_res_proj_w && bwl->attn_res_norm_w) {
+            embed_attn_resolve(m->res_blk, m->res_n_blocks, seq, d,
+                               bwl->attn_res_proj_w, bwl->attn_res_norm_w,
+                               h, partial);
+        } else {
+            memcpy(h, partial, (size_t)seq * d * sizeof(float));  /* 权重缺失 ⇒ 直通 */
+        }
+    }
+
     /* === Attention === */
-    embed_rmsnorm(m->work_ln, x, bwl->ln1_w, seq, d, 1e-6f);
+    embed_rmsnorm(m->work_ln, h, bwl->ln1_w, seq, d, 1e-6f);
 
     if (bwl->q_w_q4) {
         embed_matmul_q4(m->work_q, m->work_ln, bwl->q_w_q4, seq, d, d);
-        embed_matmul_q4(m->work_k, m->work_ln, bwl->k_w_q4, seq, d, d);
-        embed_matmul_q4(m->work_v, m->work_ln, bwl->v_w_q4, seq, d, d);
+        embed_matmul_q4(m->work_k, m->work_ln, bwl->k_w_q4, seq, d, kv_dim);
+        embed_matmul_q4(m->work_v, m->work_ln, bwl->v_w_q4, seq, d, kv_dim);
     } else {
         embed_matmul(m->work_q, m->work_ln, bwl->q_w, seq, d, d);
-        embed_matmul(m->work_k, m->work_ln, bwl->k_w, seq, d, d);
-        embed_matmul(m->work_v, m->work_ln, bwl->v_w, seq, d, d);
+        embed_matmul(m->work_k, m->work_ln, bwl->k_w, seq, d, kv_dim);
+        embed_matmul(m->work_v, m->work_ln, bwl->v_w, seq, d, kv_dim);
     }
 
-    embed_rope(m->work_q, m->work_k, seq, nh, dk, cache_pos[layer_idx_cache], theta);
+    /* ★ QK-Norm（V3）：QKV 投影之后、RoPE 之前；每 head 在 d_k 上 RMSNorm。
+     *   Q 用 nh 个 head，K 用 nkv 个 head（GQA/MQA 下 K 只有 nkv 个）。 */
+    if (m->v3_flags & TGG_V3_F_QK_NORM) {
+        embed_qk_norm_heads(m->work_q, seq, nh,  dk, bwl->q_norm_w);
+        embed_qk_norm_heads(m->work_k, seq, nkv, dk, bwl->k_norm_w);
+    }
 
-    /* Write KV cache */
-    int layer_off = layer_idx_cache * nh * max_seq * dk;
+    /* RoPE：nkv==nh 时走原函数（V2.x 路径逐位不变）；否则用 GQA 版 */
+    if (nkv == nh) {
+        embed_rope(m->work_q, m->work_k, seq, nh, dk, cache_pos[layer_idx_cache], theta);
+    } else {
+        embed_rope_gqa(m->work_q, nh, m->work_k, nkv, seq, dk,
+                       cache_pos[layer_idx_cache], theta);
+    }
+
+    /* Write KV cache（按 nkv 个 head 排布） */
+    int layer_off = layer_idx_cache * nkv * max_seq * dk;
     for (int t = 0; t < seq; t++) {
-        for (int h = 0; h < nh; h++) {
+        for (int h = 0; h < nkv; h++) {
             float* kdst = kv_k + layer_off + ((size_t)h * max_seq + cache_pos[layer_idx_cache] + t) * dk;
             float* vdst = kv_v + layer_off + ((size_t)h * max_seq + cache_pos[layer_idx_cache] + t) * dk;
-            float* ksrc = m->work_k + ((size_t)t * nh + h) * dk;
-            float* vsrc = m->work_v + ((size_t)t * nh + h) * dk;
+            float* ksrc = m->work_k + ((size_t)t * nkv + h) * dk;
+            float* vsrc = m->work_v + ((size_t)t * nkv + h) * dk;
             memcpy(kdst, ksrc, (size_t)dk * sizeof(float));
             memcpy(vdst, vsrc, (size_t)dk * sizeof(float));
         }
@@ -638,17 +993,21 @@ int embed_transformer_block(TGEmbedModel* m, float* x, int seq,
     cache_pos[layer_idx_cache] = cache_pos_val + seq;
     int kv_len = cache_pos_val + seq;
 
-    /* Scaled dot-product attention */
+    /* Scaled dot-product attention（GQA：Q head h 用 KV head h/(nh/nkv)） */
     float inv_sqrt = 1.0f / sqrtf((float)dk);
+    int gqa_rep = (nkv > 0) ? (nh / nkv) : 1;   /* 每个 KV head 被几个 Q head 共享 */
+    if (gqa_rep < 1) gqa_rep = 1;
     for (int t = 0; t < seq; t++) {
         int cur_abs = cache_pos_val + t;
         for (int h = 0; h < nh; h++) {
+            int kvh = h / gqa_rep;
+            if (kvh >= nkv) kvh = nkv - 1;
             float* qh = m->work_q + ((size_t)t * nh + h) * dk;
             float* sc = m->work_ffn_a + (size_t)t * dff; /* reuse ffn buffer for scores */
 
             for (int ki = 0; ki < kv_len; ki++) {
                 if (ki > cur_abs) { sc[ki] = -1e30f; continue; }
-                float* kh_ptr = kv_k + layer_off + ((size_t)h * max_seq + ki) * dk;
+                float* kh_ptr = kv_k + layer_off + ((size_t)kvh * max_seq + ki) * dk;
                 sc[ki] = embed_dot(qh, kh_ptr, dk) * inv_sqrt;
             }
 
@@ -657,7 +1016,7 @@ int embed_transformer_block(TGEmbedModel* m, float* x, int seq,
             float* oh = m->work_attn + ((size_t)t * nh + h) * dk;
             memset(oh, 0, (size_t)dk * sizeof(float));
             for (int ki = 0; ki < kv_len; ki++) {
-                float* vh = kv_v + layer_off + ((size_t)h * max_seq + ki) * dk;
+                float* vh = kv_v + layer_off + ((size_t)kvh * max_seq + ki) * dk;
                 float w = sc[ki];
                 for (int i = 0; i < dk; i++) oh[i] += w * vh[i];
             }
@@ -669,11 +1028,76 @@ int embed_transformer_block(TGEmbedModel* m, float* x, int seq,
     } else {
         embed_matmul(m->work_moe_out, m->work_attn, bwl->out_w, seq, d, d);
     }
-    for (int i = 0; i < seq * d; i++) x[i] += m->work_moe_out[i];
+
+    /* ★★ AttnRes：new_partial = partial + attn_out
+     *   【残差项是 resolve 之前的 partial，不是 resolve 的输出 h！】
+     *   PyTorch L924/L933/L940 逐字：
+     *       h = attn_res_proj(blocks, partial)   # h 只当 attn 的输入
+     *       a = attn_part(h)                     # attn 输出
+     *       new_partial = partial + a            # ★ 残差用【旧 partial】
+     *   在 blocks 为空时 AttnRes.forward 直接返回 partial_block（L843-844）⇒ h==partial，
+     *   两种写法数值相同 —— 这正是"前 4 层对齐、layer 4 起分叉"的原因
+     *   （第一次收块在 layer 3 末尾）。桌面引擎 v3.5 修的就是这个根因。 */
+    for (int i = 0; i < seq * d; i++) partial[i] += m->work_moe_out[i];
+
+    /* ★ AttnRes 收块：在【mlp 之前】，且 partial 原地不动。
+     *   PyTorch L942-943：if (i+1) % bs == 0: blocks.append(new_partial)
+     *   用独立缓冲 res_blk 存快照，避免被后续 mlp 累加改写。 */
+    if (m->attn_res_active) {
+        int bs = m->attn_res_block > 0 ? m->attn_res_block : 4;
+        if ((layer_idx + 1) % bs == 0 && m->res_n_blocks < m->max_blocks) {
+            memcpy(m->res_blk + (size_t)m->res_n_blocks * (size_t)seq * (size_t)d,
+                   partial, (size_t)seq * d * sizeof(float));
+            m->res_n_blocks++;
+        }
+    }
+
+    /* === FFN ===
+     * ★ AttnRes：mlp 之前再做一次 resolve（blocks 已含刚收进来的块）。
+     *   PyTorch L946：h = self.mlp_res_proj[i](blocks, partial) —— h 只喂给 mlp，
+     *   残差不含它（L952 用的是 partial 自己）。 */
+    {
+        float* mh = partial;
+        if (m->attn_res_active) {
+            if (bwl->mlp_res_proj_w && bwl->mlp_res_norm_w) {
+                mh = m->res_h2;      /* ★ 与 attn 侧的 res_h 分开，互不覆盖 */
+                embed_attn_resolve(m->res_blk, m->res_n_blocks, seq, d,
+                                   bwl->mlp_res_proj_w, bwl->mlp_res_norm_w,
+                                   mh, partial);
+            }
+            /* 权重缺失时 mh 保持 = partial（直通），与 attn 侧同款保护 */
+        }
+        embed_rmsnorm(m->work_ln, mh, bwl->ln2_w, seq, d, 1e-6f);
+    }
+
+    /* ★ 稠密 SwiGLU FFN（n_experts=0 的模型，如 sft5c）。
+     *   旧代码只有 MoE 分支 ⇒ 稠密模型加载后 FFN 恒为 0（输出必然垃圾）。
+     *   与 tgai_engine.c 的 ne==0 分支数学等价：
+     *     a = ln @ w1^T [seq,dff] ；b = ln @ w2^T [seq,dff] ；a = silu(a)*b
+     *     out = a @ w3^T [seq,d]      （w 布局 [n_output, n_input]） */
+    if (m->is_dense_ffn || ne == 0) {
+        if (bwl->ffn_w1_q4) {
+            embed_matmul_q4(m->work_ffn_a, m->work_ln, bwl->ffn_w1_q4, seq, d, dff);
+            embed_matmul_q4(m->work_ffn_b, m->work_ln, bwl->ffn_w2_q4, seq, d, dff);
+        } else {
+            embed_matmul(m->work_ffn_a, m->work_ln, bwl->ffn_w1, seq, d, dff);
+            embed_matmul(m->work_ffn_b, m->work_ln, bwl->ffn_w2, seq, d, dff);
+        }
+        for (int i = 0; i < seq * dff; i++) {
+            float v = m->work_ffn_a[i];
+            m->work_ffn_a[i] = (v / (1.0f + expf(-v))) * m->work_ffn_b[i];
+        }
+        if (bwl->ffn_w3_q4) {
+            embed_matmul_q4(m->work_moe_out, m->work_ffn_a, bwl->ffn_w3_q4, seq, dff, d);
+        } else {
+            embed_matmul(m->work_moe_out, m->work_ffn_a, bwl->ffn_w3, seq, dff, d);
+        }
+        /* ★ partial += mlp_out（残差基准 = partial 自身，不含 resolve 输出） */
+        for (int i = 0; i < seq * d; i++) partial[i] += m->work_moe_out[i];
+        return 0;
+    }
 
     /* === FFN (MoE) === */
-    embed_rmsnorm(m->work_ln, x, bwl->ln2_w, seq, d, 1e-6f);
-
     if (bwl->router_w_q4) {
         embed_matmul_q4(m->work_router, m->work_ln, bwl->router_w_q4, seq, d, ne);
     } else {
@@ -761,7 +1185,9 @@ int embed_transformer_block(TGEmbedModel* m, float* x, int seq,
         }
     }
 
-    for (int i = 0; i < seq * d; i++) x[i] += m->work_moe_out[i];
+    /* ★ partial += mlp_out（V3 AttnRes 时 partial 在 res_partial；
+     *   非 V3 时 partial == x ⇒ 与原来的 `x[i] += work_moe_out[i]` 完全等价） */
+    for (int i = 0; i < seq * d; i++) partial[i] += m->work_moe_out[i];
     return 0;
 }
 
@@ -795,9 +1221,25 @@ static const float* embed_forward(TGEmbedModel* m, const int32_t* input_ids,
         }
     }
 
+    /* ★ V3 AttnRes 初始化（2026-10-16 加）—— 与 tgai_engine.c 一致：
+     *   PyTorch 每次 forward 都新建 blocks=[] 与 partial = x（model_v3.py L919-920）。
+     *   这里 res_n_blocks=0、res_partial = embedding。
+     *   非 V3 模型 attn_res_active=0 ⇒ 下面所有 AttnRes 分支全部跳过，行为不变。 */
+    m->attn_res_active = (m->v3_flags & TGG_V3_F_ATTN_RES) ? 1 : 0;
+    m->res_n_blocks = 0;
+    if (m->attn_res_active && m->res_partial) {
+        memcpy(m->res_partial, m->work_x, (size_t)seq_len * d * sizeof(float));
+    }
+
     /* Transformer blocks */
     for (int i = 0; i < nl; i++) {
         embed_transformer_block(m, m->work_x, seq_len, i, kv_k, kv_v, max_seq, cache_pos, i);
+    }
+
+    /* ★ 最后一层的 partial 要搬回 work_x 才能过 final_norm（V3 AttnRes）。
+     *   PyTorch L953/L979：x = partial; x = self.final_norm(x) */
+    if (m->attn_res_active && m->res_partial) {
+        memcpy(m->work_x, m->res_partial, (size_t)seq_len * d * sizeof(float));
     }
 
     /* Final norm */
@@ -907,6 +1349,19 @@ static int embed_load_tokenizer(TGEmbedModel* m) {
             }
         }
     }
+    /* ★ 建 vocab 哈希表 + 算最长词条字节长度（2026-10-16 加）
+     *   为什么必须：旧 embed_encode 对每个字符做 O(vocab) 线性 strcmp，
+     *   而 V3 的「最长匹配」要对每个位置试 max_token_len(实测 19) 个长度
+     *   ⇒ 19*8192 次 strcmp/字符，ESP32 上不可接受。
+     *   注：n_merges 已在上面解析；n_merges==0 即 V3 词表体系（走最长匹配）。 */
+    embed_vocab_hash_build(m);
+    m->max_token_len = 1;
+    for (int i = 0; i < m->vocab_size; i++) {
+        if (m->vocab[i]) {
+            int L = (int)strlen(m->vocab[i]);
+            if (L > m->max_token_len) m->max_token_len = L;
+        }
+    }
     return 0;
 }
 
@@ -954,37 +1409,84 @@ static int embed_encode(TGEmbedModel* m, const char* text, int32_t* out_ids,
     }
 
     int text_len = (int)strlen(text);
-    if (text_len == 0) {
-        if (add_special && m->eos_id >= 0) {
-            if (n_out >= max_out) return -1;
-            out_ids[n_out++] = m->eos_id;
-        }
-        return n_out;
-    }
+    if (text_len == 0) return n_out;   /* ★ 不再追加 EOS（见函数末尾长注释） */
 
-    int32_t* seq = (int32_t*)tg_embed_malloc((size_t)(text_len + 4) * sizeof(int32_t));
+    int32_t* seq = (int32_t*)tg_embed_malloc((size_t)(text_len + 8) * sizeof(int32_t));
     if (!seq) return -1;
     int seq_n = 0;
+    const int seq_cap = text_len + 8;   /* 最坏：每字节一个 <bN>，故上界 = text_len */
 
     const uint8_t* p = (const uint8_t*)text;
     const uint8_t* end = p + text_len;
-    char char_buf[8];
+    const uint8_t* miss_start = NULL;   /* 未命中连续段起点（与权威实现同语义） */
 
-    while (p < end) {
-        int cl = embed_utf8_char_len(*p);
-        if (p + cl > end) cl = (int)(end - p);
-        memcpy(char_buf, p, (size_t)cl);
-        char_buf[cl] = '\0';
-        int tid = -1;
-        for (int i = 0; i < m->vocab_size; i++) {
-            if (strcmp(m->vocab[i], char_buf) == 0) { tid = i; break; }
+    #define TGG_PUSH(_id) do { if (seq_n < seq_cap) seq[seq_n++] = (_id); } while (0)
+
+    /* ★ 结算未命中段：整段按 UTF-8 字节回退成 <bN>（永不 OOV）。
+     *   必须在 p 前进【之前】调用（区间是 [miss_start, p)）。 */
+    #define TGG_FLUSH_MISS() do {                                        \
+        if (miss_start) {                                                \
+            for (const uint8_t* _q = miss_start; _q < p; _q++) {         \
+                int _bt = embed_byte_token_id(m, (uint8_t)*_q);          \
+                TGG_PUSH(_bt >= 0 ? _bt : m->unk_id);                    \
+            }                                                            \
+            miss_start = NULL;                                           \
+        }                                                                \
+    } while (0)
+
+    if (m->n_merges == 0) {
+        /* ═══ ★★ V3 词表体系：Trie 最长匹配 + 字节回退 ═══════════════════
+         * 权威语义 = 03_src/tokenizer_v3.py 的 TGAIv3Tokenizer.encode()：
+         *   ① 从当前位置贪心匹配【最长】词表条目（不看 merge rank）
+         *   ② 未命中的【连续字符】累积成一段，段末整段按 UTF-8 字节回退成 <bN>
+         * 实测：'你好'→[6586]、'今天天气'→[7637]、'abc'→[5817]；
+         *       V3w 最长词条 19 字节 ⇒ 每位置最多 19 次 O(1) 哈希查表。
+         * 旧实现只做「单字符字面量查表」⇒ `你好` 被拆成 [586,650]，
+         * 与训练时的分词不一致（OOD 输入）⇒ 输出质量明显退化。 */
+        while (p < end) {
+            int maxL = m->max_token_len > 0 ? m->max_token_len : 1;
+            int avail = (int)(end - p);
+            if (maxL > avail) maxL = avail;
+            int hit = -1, hit_len = 0;
+            for (int L = maxL; L >= 1; L--) {
+                int t2 = embed_vocab_lookup(m, (const char*)p, L);
+                if (t2 >= 0) { hit = t2; hit_len = L; break; }
+            }
+            if (hit >= 0) {
+                TGG_FLUSH_MISS();          /* 先结算累积的未命中字节 */
+                TGG_PUSH(hit);
+                p += hit_len;
+            } else {
+                if (!miss_start) miss_start = p;
+                int cl = embed_utf8_char_len(*p);
+                if (p + cl > end) cl = (int)(end - p);
+                p += cl;
+            }
         }
-        if (tid < 0) tid = m->unk_id;
-        seq[seq_n++] = tid;
-        p += cl;
+        TGG_FLUSH_MISS();
+    } else {
+        /* ═══ V2.x 词表（有 merges）：原「单字符查表 + BPE」路径 ═══════════
+         * 语义与改动前一致；只把 O(vocab) 线性查表换成 O(1) 哈希
+         * （哈希未命中是确定的，下面那层线性扫描仅作极端兜底）。
+         * 另加单字节 <bN> 兜底（修 '\n' 变 unk 的老问题）。 */
+        while (p < end) {
+            int cl = embed_utf8_char_len(*p);
+            if (p + cl > end) cl = (int)(end - p);
+            int tid = embed_vocab_lookup(m, (const char*)p, cl);
+            if (tid < 0) {
+                for (int i = 0; i < m->vocab_size; i++) {
+                    if (m->vocab[i] && (int)strlen(m->vocab[i]) == cl &&
+                        memcmp(m->vocab[i], p, (size_t)cl) == 0) { tid = i; break; }
+                }
+            }
+            if (tid < 0 && cl == 1) tid = embed_byte_token_id(m, (uint8_t)*p);
+            TGG_PUSH(tid >= 0 ? tid : m->unk_id);
+            p += cl;
+        }
+        seq_n = embed_bpe_apply(m, seq, seq_n);
     }
-
-    seq_n = embed_bpe_apply(m, seq, seq_n);
+    #undef TGG_FLUSH_MISS
+    #undef TGG_PUSH
 
     for (int i = 0; i < seq_n; i++) {
         if (n_out >= max_out) { tg_embed_free(seq); return -1; }
@@ -992,10 +1494,11 @@ static int embed_encode(TGEmbedModel* m, const char* text, int32_t* out_ids,
     }
     tg_embed_free(seq);
 
-    if (add_special && m->eos_id >= 0) {
-        if (n_out >= max_out) return -1;
-        out_ids[n_out++] = m->eos_id;
-    }
+    /* ★★ 不再在末尾追加 EOS（2026-10-16 修，与桌面引擎 2026-10-10 的修复对齐）
+     *   症状：每个 prompt 尾部多一个 <EOS>(259)，模型据此认为"对话已结束"，
+     *         于是在结束标记后继续续写 ⇒ 退化/复读。
+     *   依据：训练语料按「只有 BOS、无 EOS」编码，单轮 chat 的收尾由
+     *         对话标记（<TGAI><回答>\n）承担，而不是 EOS。 */
     return n_out;
 }
 
@@ -1018,7 +1521,13 @@ static TGEmbedModel* embed_model_load(const uint8_t* data, size_t size, char* er
         if (err_buf) { strncpy(err_buf, "Invalid .TG magic number", err_max); }
         tg_embed_free(m); return NULL;
     }
-    if (m->header.version != 1 && m->header.version != 2) {
+    /* ★★ 版本校验（2026-10-16 修 —— 这是"连模型都加载不了"级别的 bug）
+     *   原实现：`if (version != 1 && version != 2)`。
+     *   而 tgai_format.h 里 TG_VERSION=1、TG_VERSION_V3=3；
+     *   **V2.7 与 V3(sft5c) 的 .TG 都是 version=3**，而 "2" 根本不是合法版本。
+     *   ⇒ 板载 V3 模型一进来就被拒，报 "Unsupported .TG version"。
+     *   改为与 tgai_engine.c 完全一致：接受 {TG_VERSION, TG_VERSION_V3}。 */
+    if (m->header.version != TG_VERSION && m->header.version != TG_VERSION_V3) {
         if (err_buf) { strncpy(err_buf, "Unsupported .TG version", err_max); }
         tg_embed_free(m); return NULL;
     }
@@ -1078,6 +1587,72 @@ static TGEmbedModel* embed_model_load(const uint8_t* data, size_t size, char* er
     int nl = (int)m->header.n_layers;
     int ne = (int)m->header.n_experts;
     if (ne > 16) ne = 16;
+
+    /* ═══ ★★ V3 / 稠密 FFN / MQA 自动检测（2026-10-16 加）══════════════════
+     * 为什么必须「按权重存在性」判定，而不是信 header：
+     *   · 稠密模型的 header.n_experts 可能是名义值（引擎踩过同款坑：
+     *     稠密模型 n_experts=1 ⇒ 去找不存在的 moe.router ⇒ 崩）。
+     *   · 板载 sft5c 的 header.n_experts=0，权重是 blocks.{i}.ffn.w1/w2/w3；
+     *     而 V2.7 是 MoE（n_experts=8，blocks.{i}.moe.experts.*）。
+     *   ⇒ 先探测 blocks.0 的实际结构，再决定走哪条 FFN 路径，并把
+     *     header.n_experts 归一化（引擎同款做法）。 */
+    {
+        char pn[128];
+        snprintf(pn, sizeof(pn), "blocks.0.ffn.w1.weight");
+        int has_dense = (embed_find_weight(m, pn) != NULL);
+        snprintf(pn, sizeof(pn), "blocks.0.moe.router.weight");
+        int has_router = (embed_find_weight(m, pn) != NULL);
+        m->is_dense_ffn = has_dense && !has_router;
+        if (m->is_dense_ffn) {
+            m->header.n_experts = 0;      /* 归一化：别再去 moe.* 找权重 */
+            m->header.n_activated = 0;
+            ne = 0;
+        } else if (!has_router) {
+            /* 既无稠密 FFN 也无 router ⇒ 老式结构，保持 ne 原样让运行时兜底 */
+        }
+
+        /* num_kv_heads 归一化（GQA/MQA）：0 或非法 ⇒ n_heads（V2.x 行为不变） */
+        int nh0 = (int)m->header.n_heads;
+        int nkv0 = (int)m->header.num_kv_heads;
+        if (nkv0 <= 0 || nkv0 > nh0) nkv0 = nh0;
+        m->n_kv_heads = nkv0;
+
+        /* V3 特性探测：按权重存在性置位（老模型全 0 ⇒ 前向路径逐位不变） */
+        m->v3_flags = 0;
+        snprintf(pn, sizeof(pn), "blocks.0.attn.q_norm.weight");
+        if (embed_find_weight(m, pn)) m->v3_flags |= TGG_V3_F_QK_NORM;
+        snprintf(pn, sizeof(pn), "blocks.0.attn_res_proj.proj.weight");
+        if (embed_find_weight(m, pn)) m->v3_flags |= TGG_V3_F_ATTN_RES;
+
+        /* attn_res_block：默认 4，可从 .TG 扩展段覆盖。
+         * 扩展段是 TLV，未知 type 整段跳过；格式非法则保持默认。
+         * ★ 必须做范围检查 —— V2.7 的 extension_off=0xFFFFFEEA 是历史垃圾值。 */
+        m->attn_res_block = 4;
+        if ((m->header.version == TG_VERSION || m->header.version == TG_VERSION_V3) &&
+            m->header.extension_off > 0 &&
+            (uint64_t)m->header.extension_off + 12 <= (uint64_t)size) {
+            const uint8_t* ep = data + m->header.extension_off;
+            uint32_t total, etype, plen;
+            memcpy(&total, ep, 4); memcpy(&etype, ep + 4, 4); memcpy(&plen, ep + 8, 4);
+            if (total >= 8 && etype == TGG_EXT_TYPE_V3CFG && plen >= 4 &&
+                (uint64_t)m->header.extension_off + 12 + plen <= (uint64_t)size) {
+                uint32_t magic = 0, ar_on = 0, ar_block = 0;
+                memcpy(&magic, ep + 12, 4);
+                if (plen >= 12) { memcpy(&ar_on, ep + 16, 4); memcpy(&ar_block, ep + 20, 4); }
+                if (magic == TGG_EXT_MAGIC_V3CFG && ar_on && ar_block > 0 && ar_block <= 1024) {
+                    m->attn_res_block = (int)ar_block;
+                }
+            }
+        }
+        /* max_blocks 上界保护 */
+        {
+            int bs0 = m->attn_res_block > 0 ? m->attn_res_block : 4;
+            int mb0 = (nl + bs0 - 1) / bs0;
+            if (mb0 < 1) mb0 = 1;
+            if (mb0 > TGG_AR_MAX_BLOCKS) mb0 = TGG_AR_MAX_BLOCKS;
+            m->max_blocks = mb0;
+        }
+    }
 
     EmbedBlockWeights* bc = (EmbedBlockWeights*)tg_embed_calloc((size_t)nl, sizeof(EmbedBlockWeights));
     if (!bc) {
@@ -1146,8 +1721,45 @@ static TGEmbedModel* embed_model_load(const uint8_t* data, size_t size, char* er
             }
         }
 
+        /* ═══ ★ V3 权重（2026-10-16 加）═══════════════════════════════
+         * QK-Norm 与 AttnRes 的权重都是小张量（[d_k] / [d] / [1,d]），
+         * 一律走 FP32 懒解码缓存，不涉及 Q4_0。 */
+        if (m->v3_flags & TGG_V3_F_QK_NORM) {
+            snprintf(name, sizeof(name), "blocks.%d.attn.q_norm.weight", i);
+            bw->q_norm_w = embed_get_cached_weight(m, embed_find_weight(m, name));
+            snprintf(name, sizeof(name), "blocks.%d.attn.k_norm.weight", i);
+            bw->k_norm_w = embed_get_cached_weight(m, embed_find_weight(m, name));
+        }
+        if (m->v3_flags & TGG_V3_F_ATTN_RES) {
+            snprintf(name, sizeof(name), "blocks.%d.attn_res_proj.proj.weight", i);
+            bw->attn_res_proj_w = embed_get_cached_weight(m, embed_find_weight(m, name));
+            snprintf(name, sizeof(name), "blocks.%d.attn_res_proj.norm.weight", i);
+            bw->attn_res_norm_w = embed_get_cached_weight(m, embed_find_weight(m, name));
+            snprintf(name, sizeof(name), "blocks.%d.mlp_res_proj.proj.weight", i);
+            bw->mlp_res_proj_w = embed_get_cached_weight(m, embed_find_weight(m, name));
+            snprintf(name, sizeof(name), "blocks.%d.mlp_res_proj.norm.weight", i);
+            bw->mlp_res_norm_w = embed_get_cached_weight(m, embed_find_weight(m, name));
+        }
+
+        /* ═══ ★ 稠密 SwiGLU FFN 权重（n_experts=0 的模型，2026-10-16 加）═══
+         * 旧代码只找 moe.router / moe.experts.* ⇒ 稠密模型 FFN 恒空。 */
+        if (m->is_dense_ffn) {
+            static const char* const DN[3] = { "w1", "w2", "w3" };
+            const uint8_t** dst_q4[3] = { &bw->ffn_w1_q4, &bw->ffn_w2_q4, &bw->ffn_w3_q4 };
+            const float**    dst_f [3] = { &bw->ffn_w1,    &bw->ffn_w2,    &bw->ffn_w3    };
+            for (int wi = 0; wi < 3; wi++) {
+                snprintf(name, sizeof(name), "blocks.%d.ffn.%s.weight", i, DN[wi]);
+                const TGWeightEntry* fe = embed_find_weight(m, name);
+                if (embed_weight_is_q4(fe)) {
+                    *dst_q4[wi] = m->weight_data + fe->offset;
+                } else {
+                    *dst_f[wi] = embed_get_cached_weight(m, fe);
+                }
+            }
+        }
+
         bw->n_experts = ne;
-        bw->is_moe = 1;
+        bw->is_moe = m->is_dense_ffn ? 0 : 1;
         for (int e = 0; e < ne; e++) {
             snprintf(name, sizeof(name), "blocks.%d.moe.experts.%d.w1.weight", i, e);
             {
@@ -1211,6 +1823,7 @@ static void embed_model_free(TGEmbedModel* m) {
     }
 
     free(m->weight_lookup);
+    tg_embed_free(m->vocab_hash);   /* ★ vocab 哈希表（2026-10-16 加） */
     tg_embed_free(m->vocab);
     tg_embed_free(m->vocab_strbuf);
     tg_embed_free(m->merge_a);
@@ -1229,7 +1842,7 @@ TGAI_GO::TGAI_GO()
       _max_seq_len(0), _vocab_size(0), _d_model(0),
       _eos_id(0), _bos_id(0),
     _n_marks(0), _has_v27(false), _stop_on_marks(false), _n_turn_eog(0),
-    _hist_len(0), _hist_turns(0), _last_answer_len(0),
+    _hist_len(0), _hist_turns(0), _last_answer_len(0), _rep_n(0),
       _file_data(NULL), _file_loaded(false),
       _sd_mounted(false), _sd_is_mmc(false), _sd_cs_pin(-1),
       _model_count(0)
@@ -1313,18 +1926,24 @@ bool TGAI_GO::begin(const uint8_t* model_data, size_t model_size) {
 
     int nl = (int)m->header.n_layers;
     int nh = (int)m->header.n_heads;
+    /* ★ GQA/MQA：KV cache 按 nkv 个 head 分配（sft5c nkv=1 ⇒ 省 8 倍内存）。
+     *   注意 embed_model_load 已把 m->n_kv_heads 归一化。 */
+    int nkv = m->n_kv_heads > 0 ? m->n_kv_heads : nh;
+    if (nkv > nh) nkv = nh;
     int dk = (int)m->header.d_model / nh;
-    size_t per_layer = (size_t)nh * max_seq * dk;
+    size_t per_layer = (size_t)nkv * max_seq * dk;
     size_t kv_total = (size_t)nl * per_layer * 2 * sizeof(float);
 
-    /* Debug: print memory info */
-    Serial.printf("[TGAI] model: d=%d layers=%d heads=%d vocab=%d max_seq=%d\n",
-        (int)m->header.d_model, nl, nh, (int)m->header.vocab_size, max_seq);
-    Serial.printf("[TGAI] KV=%u B  model=%u B\n", (unsigned)kv_total, (unsigned)model_size);
+    /* Debug: print memory info + ★ 版本戳（刷板后从串口即可确认固件版本） */
+    Serial.printf("[TGAI_GO] BUILD %s\n", TGAI_GO_BUILD);
+    Serial.printf("[TGAI] model: d=%d layers=%d heads=%d kv_heads=%d vocab=%d max_seq=%d\n",
+        (int)m->header.d_model, nl, nh, nkv, (int)m->header.vocab_size, max_seq);
+    Serial.printf("[TGAI] KV=%u B  model=%u B  attn_res_block=%d dense_ffn=%d\n",
+        (unsigned)kv_total, (unsigned)model_size, m->attn_res_block, m->is_dense_ffn);
 #ifdef TG_EMBED_ESP32
     Serial.printf("[TGAI] PSRAM init=%d free=%u\n",
+                  (int)TGG_PSRAM_IS_INIT(), (unsigned)ESP.getFreePsram());
     Serial.printf("[TGAI] dot kernel: %s\n", TG_EMBED_DOT_KIND);
-        (int)esp_spiram_is_initialized(), (unsigned)ESP.getFreePsram());
 #endif
 
     float* kv_k = (float*)tg_embed_calloc(1, kv_total);
@@ -1352,7 +1971,7 @@ bool TGAI_GO::begin(const uint8_t* model_data, size_t model_size) {
         c->k       = kv_k;
         c->v       = kv_v;
         c->nl      = nl;
-        c->nh      = nh;
+        c->nh      = nkv;   /* ★ GQA/MQA：KV cache 按 nkv 个 head 排布 */
         c->dk      = dk;
         c->max_seq = max_seq;
     }
@@ -1423,13 +2042,17 @@ bool TGAI_GO::begin(const char* tg_path) {
     int nh_val     = *(int32_t*)(hdr + 20);
     int d_model_val = *(int32_t*)(hdr + 16);
     int max_seq_val = *(int32_t*)(hdr + 32);
+    /* ★ GQA/MQA：读 header 偏移 116 的 num_kv_heads（0/非法 ⇒ n_heads） */
+    int nkv_val    = *(int32_t*)(hdr + 116);
+    if (nkv_val <= 0 || nkv_val > nh_val) nkv_val = nh_val;
     if (max_seq_val > TG_EMBED_DEFAULT_MAX_SEQ) max_seq_val = TG_EMBED_DEFAULT_MAX_SEQ;
     int dk_val     = d_model_val / nh_val;
-    size_t per_layer = (size_t)nh_val * max_seq_val * dk_val;
+    size_t per_layer = (size_t)nkv_val * max_seq_val * dk_val;
     size_t kv_total  = (size_t)nl_val * per_layer * 2 * sizeof(float);
 
-    Serial.printf("[TGAI] d=%d L=%d H=%d max_seq=%d KV=%u B file=%u B\n",
-        d_model_val, nl_val, nh_val, max_seq_val, (unsigned)kv_total, (unsigned)fsize);
+    Serial.printf("[TGAI_GO] BUILD %s\n", TGAI_GO_BUILD);
+    Serial.printf("[TGAI] d=%d L=%d H=%d KVH=%d max_seq=%d KV=%u B file=%u B\n",
+        d_model_val, nl_val, nh_val, nkv_val, max_seq_val, (unsigned)kv_total, (unsigned)fsize);
     Serial.printf("[TGAI] PSRAM free before KV=%u\n", (unsigned)ESP.getFreePsram());
 
     /* Allocate KV cache FIRST — before model data fragments PSRAM */
@@ -1495,7 +2118,7 @@ bool TGAI_GO::begin(const char* tg_path) {
         c->k       = kv_k;
         c->v       = kv_v;
         c->nl      = nl_val;
-        c->nh      = nh_val;
+        c->nh      = nkv_val;   /* ★ GQA/MQA */
         c->dk      = dk_val;
         c->max_seq = max_seq_val;
         memset(c->pos, 0, (size_t)nl_val * sizeof(int));
@@ -1526,6 +2149,11 @@ bool TGAI_GO::_load_from_sd(const char* tg_path, const TGAISDConfig* sd) {
     /* Store premounted state */
     _sd_is_mmc = sd->use_sdmmc;
     bool was_premounted = sd->sd_premounted;
+    /* ★ 2026-10-16 修（pre-existing 编译错误）：mount_ok 在原代码里从未声明，
+     *   而它在四个分支里被赋值、在下面被判断 ⇒ ESP32 上根本编不过
+     *   （以前没暴露是因为更早的 esp_spiram.h 先报了错）。 */
+    bool mount_ok = false;
+    (void)was_premounted;
 
     if (sd->sd_premounted) {
         /* SD was already initialized by other code (e.g. MP3 player).
@@ -1539,10 +2167,12 @@ bool TGAI_GO::_load_from_sd(const char* tg_path, const TGAISDConfig* sd) {
     } else if (sd->use_sdmmc) {
         /* SD_MMC 4-bit mode — uses fixed pins (2,4,12,13,14,15 on most boards) */
         if (sd->freq_khz > 0) {
+            /* ★ 2026-10-16 修：ESP32 core 3.x 的 SD_MMC::setPins 只有
+             *   3 参 (clk,cmd,d0) 与 6 参 (clk,cmd,d0..d3) 两个重载，
+             *   原来的 4 参写法不存在 ⇒ 改为 3 参 1-bit 形式。 */
             mount_ok = SD_MMC.setPins(sd->sck_pin > 0 ? sd->sck_pin : -1,
-                                      sd->miso_pin > 0 ? sd->miso_pin : -1,
                                       sd->mosi_pin > 0 ? sd->mosi_pin : -1,
-                                      sd->cs_pin > 0 ? sd->cs_pin : -1);
+                                      sd->miso_pin > 0 ? sd->miso_pin : -1);
             if (!mount_ok) {
                 mount_ok = SD_MMC.begin("/sdcard", false, false, sd->freq_khz);
             } else {
@@ -1563,7 +2193,11 @@ bool TGAI_GO::_load_from_sd(const char* tg_path, const TGAISDConfig* sd) {
                   sd->mosi_pin > 0 ? (uint8_t)sd->mosi_pin : (uint8_t)23,
                   sd->cs_pin > 0 ? (uint8_t)sd->cs_pin : (uint8_t)5);
 
-        mount_ok = SD.begin(sd->cs_pin > 0 ? sd->cs_pin : 5,
+        /* ★ 2026-10-16 修：core 3.x 的 SDFS::begin 签名是
+         *   begin(ssPin, SPIClass&, frequency, ...) —— 没有 (cs, freq) 这个重载。
+         *   原来的两参调用会试图把 uint32_t 隐式转成 SPIClass& ⇒ 编译报
+         *   "cannot bind non-const lvalue reference"。这里显式传 SPI 对象。 */
+        mount_ok = SD.begin(sd->cs_pin > 0 ? sd->cs_pin : 5, SPI,
                             (sd->freq_khz > 0) ? (uint32_t)sd->freq_khz * 1000 : (uint32_t)4000000);
         if (mount_ok) {
             Serial.printf("[TGAI] SD SPI mounted OK (CS=%d, freq=%d kHz)\n",
@@ -1625,13 +2259,17 @@ bool TGAI_GO::_load_from_sd(const char* tg_path, const TGAISDConfig* sd) {
     int nh_val      = *(int32_t*)(hdr + 20);
     int d_model_val = *(int32_t*)(hdr + 16);
     int max_seq_val = *(int32_t*)(hdr + 32);
+    /* ★ GQA/MQA：header 偏移 116 = num_kv_heads（0/非法 ⇒ n_heads） */
+    int nkv_val     = *(int32_t*)(hdr + 116);
+    if (nkv_val <= 0 || nkv_val > nh_val) nkv_val = nh_val;
     if (max_seq_val > TG_EMBED_DEFAULT_MAX_SEQ) max_seq_val = TG_EMBED_DEFAULT_MAX_SEQ;
     int dk_val     = d_model_val / nh_val;
-    size_t per_layer = (size_t)nh_val * max_seq_val * dk_val;
+    size_t per_layer = (size_t)nkv_val * max_seq_val * dk_val;
     size_t kv_total  = (size_t)nl_val * per_layer * 2 * sizeof(float);
 
-    Serial.printf("[TGAI] d=%d L=%d H=%d max_seq=%d KV=%u B file=%u B\n",
-        d_model_val, nl_val, nh_val, max_seq_val, (unsigned)kv_total, (unsigned)fsize);
+    Serial.printf("[TGAI_GO] BUILD %s\n", TGAI_GO_BUILD);
+    Serial.printf("[TGAI] d=%d L=%d H=%d KVH=%d max_seq=%d KV=%u B file=%u B\n",
+        d_model_val, nl_val, nh_val, nkv_val, max_seq_val, (unsigned)kv_total, (unsigned)fsize);
 
     /* Allocate KV cache FIRST — before model data fragments PSRAM */
     float* kv_k = (float*)tg_embed_calloc(1, kv_total);
@@ -1705,7 +2343,7 @@ bool TGAI_GO::_load_from_sd(const char* tg_path, const TGAISDConfig* sd) {
         c->k       = kv_k;
         c->v       = kv_v;
         c->nl      = nl_val;
-        c->nh      = nh_val;
+        c->nh      = nkv_val;   /* ★ GQA/MQA */
         c->dk      = dk_val;
         c->max_seq = max_seq_val;
         memset(c->pos, 0, (size_t)nl_val * sizeof(int));
@@ -1766,6 +2404,15 @@ String TGAI_GO::decode(int token_id) {
     if (token_id < 0 || token_id >= m->vocab_size) return String("");
 
     const char* s = m->vocab[token_id];
+    /* ★ 字节 token 还原（2026-10-16 加）：'<bN>' ⇒ 原始单字节 N。
+     *   与 embed_encode 的字节回退互为逆运算（权威 tokenizer_v3.py 的 decode 同语义）。
+     *   没有这一步，换行/控制字符会被原样打印成字面 "<b10>"。 */
+    int bn = embed_parse_byte_token(s);
+    if (bn >= 0) {
+        _decode_buf[0] = (char)(uint8_t)bn;
+        _decode_buf[1] = '\0';
+        return String(_decode_buf);
+    }
     int len = (int)strlen(s);
     if (len >= (int)sizeof(_decode_buf)) len = (int)sizeof(_decode_buf) - 1;
     memcpy(_decode_buf, s, (size_t)len);
@@ -1774,12 +2421,32 @@ String TGAI_GO::decode(int token_id) {
 }
 
 /* ─── Sampling ──────────────────────────────────────────── */
-int TGAI_GO::_sample_token(const float* logits, int vocab_size, float temp, int top_k) {
+int TGAI_GO::_sample_token(const float* logits, int vocab_size, float temp, int top_k,
+                           float top_p, float rep_penalty) {
     if (vocab_size <= 0) return 0;
 
     /* Top-K sampling: find top K token indices */
     if (top_k > vocab_size) top_k = vocab_size;
     if (top_k < 1) top_k = 1;
+    if (top_k > 128) top_k = 128;
+    if (top_p <= 0.0f || top_p > 1.0f) top_p = 1.0f;   /* 非法值 ⇒ 不截断 */
+
+    /* ★★ 重复惩罚（rep_penalty，2026-10-16 加）──────────────────────────
+     * CTRL 式：最近出现过的 token，正 logit 除以 rep、负 logit 乘 rep，
+     * 使其相对降权。实测最佳 rep=1.5（对比旧默认 rep=1.15：重复率 70%→5%）。
+     * ★ 不为省内存复制整份 logits（ESP32 栈只有几 KB，8192*4=32KB 放不下），
+     *   而是在【读取处】就地施加惩罚 —— 排序与 softmax 都只看惩罚后的值。
+     * 惩罚顺序按 llama.cpp：penalty → top_k → top_p → temperature → 采样。 */
+    const bool use_rep = (rep_penalty > 1.001f) && (_rep_n > 0);
+    auto pen = [&](float v, int idx) -> float {
+        if (!use_rep) return v;
+        for (int j = 0; j < _rep_n; j++) {
+            if (_rep_hist[j] == idx) {
+                return (v > 0.0f) ? (v / rep_penalty) : (v * rep_penalty);
+            }
+        }
+        return v;
+    };
 
     /* Simple selection sort for top K */
     int    top_ids[128];
@@ -1789,7 +2456,7 @@ int TGAI_GO::_sample_token(const float* logits, int vocab_size, float temp, int 
     /* Initialize with first K elements */
     for (int i = 0; i < top_k && i < 128; i++) {
         top_ids[i] = i;
-        top_vals[i] = logits[i];
+        top_vals[i] = pen(logits[i], i);
         found++;
     }
 
@@ -1805,16 +2472,17 @@ int TGAI_GO::_sample_token(const float* logits, int vocab_size, float temp, int 
 
     /* Scan remaining */
     for (int i = top_k; i < vocab_size; i++) {
-        if (logits[i] > top_vals[found - 1]) {
+        float lv = pen(logits[i], i);
+        if (lv > top_vals[found - 1]) {
             /* Insert into sorted top-k */
             int pos = found - 1;
-            while (pos > 0 && logits[i] > top_vals[pos - 1]) pos--;
+            while (pos > 0 && lv > top_vals[pos - 1]) pos--;
             /* Shift down */
             for (int j = found - 1; j > pos; j--) {
                 top_vals[j] = top_vals[j - 1];
                 top_ids[j]  = top_ids[j - 1];
             }
-            top_vals[pos] = logits[i];
+            top_vals[pos] = lv;
             top_ids[pos]  = i;
         }
     }
@@ -1831,22 +2499,40 @@ int TGAI_GO::_sample_token(const float* logits, int vocab_size, float temp, int 
         sum += top_vals[i];
     }
 
-    if (sum < 1e-10f) return top_ids[0]; /* All zero �?return top */
+    if (sum < 1e-10f) return top_ids[0]; /* All zero -> return top */
 
-    /* Random sampling */
+    /* ★ top_p（nucleus，2026-10-16 加）────────────────────────────────
+     * top_vals 已按 logit 降序，概率也降序 ⇒ 取「累积概率刚超过 top_p 的
+     * 最小前缀」作为候选集，其余丢弃并重新归一化。
+     * 实测最佳 top_p=0.8（配合 top_k=4）。 */
+    int nuc = found;
+    {
+        float cum = 0.0f;
+        for (int i = 0; i < found; i++) {
+            cum += top_vals[i] / sum;
+            if (cum >= top_p) { nuc = i + 1; break; }
+        }
+        if (nuc < 1) nuc = 1;
+    }
+    float sum2 = 0.0f;
+    for (int i = 0; i < nuc; i++) sum2 += top_vals[i];
+    if (sum2 < 1e-10f) return top_ids[0];
+
+    /* Random sampling（在截断后的候选集内） */
     float r = (float)random(0, 1000000) / 1000000.0f; /* [0, 1) */
-    float cum = 0;
-    for (int i = 0; i < found; i++) {
-        cum += top_vals[i] / sum;
-        if (r <= cum) return top_ids[i];
+    float cum2 = 0;
+    for (int i = 0; i < nuc; i++) {
+        cum2 += top_vals[i] / sum2;
+        if (r <= cum2) return top_ids[i];
     }
 
-    return top_ids[found - 1]; /* Fallback to last */
+    return top_ids[nuc - 1]; /* Fallback to last */
 }
 
 /* ─── Generate ──────────────────────────────────────────── */
 int TGAI_GO::generate(const char* prompt, TGOutputCallback callback,
-                      int max_tokens, float temp, int top_k) {
+                      int max_tokens, float temp, int top_k,
+                      float top_p, float rep_penalty) {
     if (!_ready || !_model || !_cache) {
         _set_error("Model not ready");
         return -1;
@@ -1889,7 +2575,19 @@ int TGAI_GO::generate(const char* prompt, TGOutputCallback callback,
     int gen_count = 0;
     _last_answer_len = 0;                 /* 本次回答缓冲复位 */
     _last_answer[0] = '\0';
-    int32_t token_id = _sample_token(logits, m->vocab_size, temp, top_k);
+
+    /* ★ 重复惩罚历史（2026-10-16 加）：先把 prompt 的尾部塞进去，
+     *   模型就不会一直复述提问；随后每个生成的 token 也进环。
+     *   环长 TGG_REP_HIST(64) —— 只惩罚"最近"出现过的，老 token 会被挤出。 */
+    _rep_n = 0;
+    {
+        int take = n_prompt < TGG_REP_HIST ? n_prompt : TGG_REP_HIST;
+        for (int i = 0; i < take; i++) {
+            _rep_hist[_rep_n++] = (int)prompt_ids[n_prompt - take + i];
+        }
+    }
+
+    int32_t token_id = _sample_token(logits, m->vocab_size, temp, top_k, top_p, rep_penalty);
 
     for (int i = 0; i < max_tokens && gen_count < max_tokens; i++) {
         /* Check for EOS */
@@ -1908,9 +2606,21 @@ int TGAI_GO::generate(const char* prompt, TGOutputCallback callback,
             if (hit) break;               /* 到轮次边界，停 */
         }
 
-        /* Decode and callback */
-        const char* token_str = m->vocab[token_id];
-        if (token_str && callback) {
+        /* ★ 重复惩罚历史入环（2026-10-16 加） */
+        if (_rep_n < TGG_REP_HIST) {
+            _rep_hist[_rep_n++] = (int)token_id;
+        } else {
+            for (int k = 1; k < TGG_REP_HIST; k++) _rep_hist[k - 1] = _rep_hist[k];
+            _rep_hist[TGG_REP_HIST - 1] = (int)token_id;
+        }
+
+        /* Decode and callback
+         * ★ 走 embed_token_str（2026-10-16 修）：字节 token 必须还原成原始字节
+         *   （'<b10>' ⇒ '\n'），否则换行会被原样打印成字面 "<b10>"，
+         *   对话模板与输出看着都是坏的。 */
+        char _tokbuf[24];
+        const char* token_str = embed_token_str(m, (int)token_id, _tokbuf, (int)sizeof(_tokbuf));
+        if (token_str && token_str[0] && callback) {
             callback(token_str);
         }
         /* ★ 顺手收集回答（chat() 用它写历史）*/
@@ -1936,7 +2646,7 @@ int TGAI_GO::generate(const char* prompt, TGOutputCallback callback,
         }
 
         /* Sample next token */
-        token_id = _sample_token(logits, m->vocab_size, temp, top_k);
+        token_id = _sample_token(logits, m->vocab_size, temp, top_k, top_p, rep_penalty);
     }
 
     return gen_count;
@@ -1950,6 +2660,9 @@ void TGAI_GO::reset() {
 
     /* Zero positions */
     memset(c->pos, 0, (size_t)c->nl * sizeof(int));
+
+    /* ★ 重复惩罚历史复位（2026-10-16 加） */
+    _rep_n = 0;
 
     /* Zero K and V buffers */
     size_t per_layer = (size_t)c->nh * c->max_seq * c->dk;
@@ -2284,7 +2997,8 @@ static void tgai_hist_append(TGAI_GO* self_unused, char* hist, int* hist_len,
 }
 
 int TGAI_GO::chat(const char* user_msg, TGOutputCallback callback,
-                  int max_tokens, float temp, int top_k) {
+                  int max_tokens, float temp, int top_k,
+                  float top_p, float rep_penalty) {
     if (!_ready || !_model || !_cache) { _set_error("Model not ready"); return -1; }
     if (!user_msg) { _set_error("null user_msg"); return -1; }
 
@@ -2293,7 +3007,7 @@ int TGAI_GO::chat(const char* user_msg, TGOutputCallback callback,
     if (np <= 0) { _set_error("chat prompt too long"); return -1; }
 
     /* 用 generate 跑（它会做 prefill + 自回归 + 边界停止）*/
-    int got = generate(prompt, callback, max_tokens, temp, top_k);
+    int got = generate(prompt, callback, max_tokens, temp, top_k, top_p, rep_penalty);
 
     /* 把这一轮记进历史（回答内容由 _last_answer 收集）*/
     if (got > 0) {

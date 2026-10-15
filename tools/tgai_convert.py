@@ -468,14 +468,107 @@ def get_dtype_for_param(name: str, default_dtype: int) -> int:
     """
     根据参数名决定其 dtype:
     - RoPE cos/sin: 永远 FP32 (避免精度损失)
-    - LayerNorm weight: FP32 (数值稳定性)
+    - 归一化权重: FP32 (数值稳定性)
     - 其他: 用 default_dtype
+
+    ★ 2026-10-16 扩充（V3）：把 V3 新增的归一化权重一并纳入 FP32 白名单：
+      · attn.q_norm / attn.k_norm        (QK-Norm, head_dim 维, 每头一份)
+      · attn_res_proj.norm / mlp_res_proj.norm  (Block AttnRes 的 RMSNorm)
+      理由：这些张量小到可以忽略字节数，但直接缩放整个残差/注意力分布 ⇒
+            量化噪声会放大到全模型；必须 FP32。
+      ★ 注意 exts：projection 权重（attn_res_proj.proj / mlp_res_proj.proj）
+        只有 d_model 个元素，同样建议 FP32（见下 *_proj.proj.weight 分支）。
     """
     if 'rope.cos' in name or 'rope.sin' in name:
         return DTYPE_FP32
     if 'ln1.weight' in name or 'ln2.weight' in name or 'final_norm.weight' in name:
         return DTYPE_FP32
+    # ── V3 新增（2026-10-16）──
+    if 'q_norm.weight' in name or 'k_norm.weight' in name:
+        return DTYPE_FP32
+    if 'attn_res_proj' in name or 'mlp_res_proj' in name:
+        return DTYPE_FP32
     return default_dtype
+
+
+# ─── ★ V3 权重名映射（2026-10-16 加）───────────────
+#  PyTorch（model_v3.py）的 state_dict 名字与 .TG 约定（引擎 L1752+ / 格式注释）不同：
+#
+#    PyTorch                            .TG（引擎期望）
+#    ─────────────────────────────      ─────────────────────────────
+#    embed.weight                    →  token_embedding.weight
+#    blocks.N.attn.o_proj.weight     →  blocks.N.attn.out_proj.weight
+#    attn_res_proj.N.proj.weight     →  blocks.N.attn_res_proj.proj.weight
+#    attn_res_proj.N.norm.weight     →  blocks.N.attn_res_proj.norm.weight
+#    mlp_res_proj.N.proj.weight      →  blocks.N.mlp_res_proj.proj.weight
+#    mlp_res_proj.N.norm.weight      →  blocks.N.mlp_res_proj.norm.weight
+#    其余（ln1/ln2/q_proj/k_proj/v_proj/ffn.w1..w3/final_norm）本就同名，原样通过。
+#
+#  ★ AttnRes 在 PyTorch 侧是**根级** ModuleList（attn_res_proj.N.*），
+#    必须改写成每层的 blocks.N.* 前缀 —— 否则引擎按 blocks.{i}.attn_res_proj
+#    查找会全部落空 ⇒ V3 特性检测失败 ⇒ 静默少算 AttnRes（数值全错但不报错）。
+#
+#  ★ 未识别的名字**不静默丢弃**：收集后打印 WARN（转换错名字是历史踩过的坑：
+#    名字对不上 ⇒ 引擎找不到权重 ⇒ get_cached_weight 返回 NULL ⇒ 乱码/崩溃）。
+def v3_map_weight_name(name: str, n_layers: int) -> str:
+    """PyTorch state_dict 名字 → .TG 权重名。未识别的原样返回。"""
+    import re as _re
+    # 根级 AttnRes（V3）
+    m = _re.match(r'^(attn_res_proj|mlp_res_proj)\.(\d+)\.(.+)$', name)
+    if m:
+        return 'blocks.%s.%s.%s' % (m.group(2), m.group(1), m.group(3))
+    # 其余按段替换
+    out = name
+    if out == 'embed.weight':
+        return 'token_embedding.weight'
+    out = out.replace('.attn.o_proj.', '.attn.out_proj.')
+    return out
+
+
+# ─── ★ V3 配置扩展段（TLV，2026-10-16 加）──────────────
+#  写在文件末尾，header.extension_off 指向它；老引擎完全不读（零影响）。
+#  用途：把无法从权重名反推的结构参数带给引擎（目前只有 attn_res_block）。
+EXT_MAGIC_V3CFG = 0x33474354   # "TCG3" little-endian
+EXT_TYPE_V3CFG = 1
+
+
+def build_v3_ext(cfg: dict) -> bytes:
+    """把 V3 结构参数打包成 TLV 扩展段（u32 payload_len 前缀，尾部对齐 8）。
+
+    TLV 设计（与《V3 改造规范》阶段 2 一致）：
+        [u32 total_len][u32 type][u32 payload_len][payload bytes]
+        total_len = 4(type) + 4(payload_len) + payload_len
+    未知 type 可整段跳过 ⇒ 天然前向兼容。
+    """
+    payload = struct.pack(
+        '<IIIiIIi',
+        EXT_MAGIC_V3CFG,
+        1 if cfg.get('attn_res_enabled') and cfg.get('dense_attn_res_free') else 0,
+        int(cfg.get('attn_res_block', 0) or 0),
+        0,                                   # header_size 占位（阅读用）
+        int(cfg.get('attn_global_every', 0) or 0),
+        int(cfg.get('csa_compress', 0) or 0),
+        int(cfg.get('sliding_window', 0) or 0),
+    )
+    # 追加一串字符串（人类可读的 JSON 摘要，长度前缀），未来解析器可忽略
+    summary = json.dumps({
+        'dense_ffn': bool(cfg.get('dense_ffn', False)),
+        'n_shared_experts': int(cfg.get('n_shared_experts', 0) or 0),
+        'hetero_rope': bool(cfg.get('hetero_rope', False)),
+        'rope_theta_global': cfg.get('rope_theta_global'),
+        'rope_theta_local': cfg.get('rope_theta_local'),
+        'partial_rotary_global': cfg.get('partial_rotary_global'),
+        'csa_latent': int(cfg.get('csa_latent', 0) or 0),
+        'csa_conv_kernel': int(cfg.get('csa_conv_kernel', 0) or 0),
+        'attn_qk_norm': bool(cfg.get('attn_qk_norm', False)),
+        'moe_use_situ': bool(cfg.get('moe_use_situ', False)),
+        'moe_post_norm': bool(cfg.get('moe_post_norm', False)),
+        'norm_eps': cfg.get('norm_eps'),
+    }, ensure_ascii=False).encode('utf-8')
+    payload = payload + struct.pack('<I', len(summary)) + summary
+    if len(payload) % 8:
+        payload = payload + b'\x00' * (8 - len(payload) % 8)
+    return struct.pack('<III', 4 + 4 + len(payload), EXT_TYPE_V3CFG, len(payload)) + payload
 
 
 # ─── 主转换流程 ────────────────────────────────────
@@ -485,14 +578,75 @@ def convert(checkpoint_path: str, output_path: str, tokenizer_path: str, target_
 
     # 1. 加载 checkpoint
     print("  加载 checkpoint...")
-    # ★ 修复（2026-10-09）：必须 mmap=True。
+    # ★ 修复（2026-10-09）：优先 mmap=True。
     #   原实现全量载入：5.65GB BF16 在 map_location='cpu' 下会物化成 FP32
     #   (~11.3GB)，再加下面的 weight_data 缓冲(5.65GB) => 17GB，本机 15.4GB 必 OOM。
     #   mmap 后张量按需读页，峰值内存降到 ~1 个张量。
-    ckpt = torch.load(checkpoint_path, map_location='cpu',
-                      weights_only=False, mmap=True)
-    cfg = ckpt['model_config']
-    state_dict = ckpt['model_state_dict']
+    # ★ 2026-10-16 加回退：mmap=True 只支持新式 zip 序列化的 .pt；
+    #   老式 pickle 会抛 RuntimeError（sft5c 就是老式存的）⇒ 回退到普通加载。
+    #   小模型（<1GB）普通加载完全没问题，只有大模型才依赖 mmap。
+    try:
+        ckpt = torch.load(checkpoint_path, map_location='cpu',
+                          weights_only=False, mmap=True)
+        print("    (mmap 加载)")
+    except RuntimeError as _e:
+        if 'mmap' not in str(_e):
+            raise
+        print("    (该 .pt 是老式 pickle, 不能用 mmap, 回退普通加载; %s)"
+              % str(_e)[:80])
+        ckpt = torch.load(checkpoint_path, map_location='cpu',
+                          weights_only=False)
+    if 'model_config' in ckpt:
+        cfg = ckpt['model_config']
+    elif 'config' in ckpt:
+        cfg = ckpt['config']            # ★ V3 checkpoint 用 'config'（model_v3.py 存盘键名）
+    else:
+        raise ValueError("checkpoint 里既没有 model_config 也没有 config")
+    state_dict = ckpt.get('model_state_dict')
+    if state_dict is None:
+        state_dict = ckpt.get('model')  # ★ V3 checkpoint 用 'model'
+    if state_dict is None:
+        raise ValueError("checkpoint 里既没有 model_state_dict 也没有 model")
+
+    # ─── ★ V3 名字映射（2026-10-16 加）───────────────────────────
+    #   映射在**最前面**统一做完，之后所有流程（dtype 决策/量化/写盘）都按 .TG 名走。
+    #   未识别的名字只 WARN 不丢弃（保留原样，方便事后排查）。
+    _nl = int(cfg.get('n_layers', 0))
+    _mapped = {}
+    _renamed = 0
+    for _k, _v in state_dict.items():
+        _nk = v3_map_weight_name(_k, _nl)
+        if _nk != _k:
+            _renamed += 1
+        if _nk in _mapped:
+            raise ValueError("名字映射后冲突: %s / %s → %s" % (_k, _nk, _nk))
+        _mapped[_nk] = _v
+    state_dict = _mapped
+    print("  ★ V3 名字映射: 重命名 %d 个张量 (embed→token_embedding, o_proj→out_proj,"
+          " attn/mlp_res_proj→blocks.N.*)" % _renamed)
+
+    # ─── ★ 稠密模型：n_experts 必须是 0 ─────────────────────────
+    #   引擎的 FFN 分派唯一依据就是 header.n_experts：
+    #     ne == 0 → 稠密 SwiGLU（读 blocks.{i}.ffn.w1/w2/w3.weight）
+    #     ne >  0 → MoE（读 blocks.{i}.moe.router/experts.*）
+    #   而 V3 的 w10m 预设是 dense_ffn=True 却把 n_experts 写成 1（名义值）⇒
+    #   直接照抄 header 会让引擎去找不存在的 moe.router ⇒ router_w=NULL ⇒ 崩溃。
+    #   故这里显式归一化，并用 ff0 名字做交叉校验（防止归一化错了却不报错）。
+    _dense = bool(cfg.get('dense_ffn', False))
+    _has_ffn = any(k.startswith('blocks.0.ffn.') for k in state_dict)
+    _has_moe = any(k.startswith('blocks.0.moe.') for k in state_dict)
+    if _has_ffn and _has_moe:
+        raise ValueError("blocks.0 同时有 ffn.* 和 moe.* 权重 —— checkpoint 结构异常")
+    if _dense != _has_ffn:
+        print("  [WARN] cfg.dense_ffn=%s 但 blocks.0.ffn 权重%s存在 ⇒ 以权重为准"
+              % (_dense, '' if _has_ffn else '不'))
+    dense_ffn = _has_ffn
+    if dense_ffn and not _has_moe:
+        print("  ★ 稠密 FFN 模型: header.n_experts 1→0, n_activated→0 "
+              "(cfg 原值 experts=%s×top%s)" % (cfg.get('n_experts'), cfg.get('n_activated')))
+        cfg = dict(cfg)
+        cfg['n_experts'] = 0
+        cfg['n_activated'] = 0
 
     # Auto-detect num_kv_heads from config (HF models use num_key_value_heads)
     num_kv_heads = cfg.get('num_kv_heads', 0) or cfg.get('n_kv_heads', 0) or cfg.get('num_key_value_heads', 0)
@@ -500,6 +654,29 @@ def convert(checkpoint_path: str, output_path: str, tokenizer_path: str, target_
     print(f"  配置: layers={cfg['n_layers']} d_model={cfg['d_model']} "
           f"heads={cfg['n_heads']} kv_heads={num_kv_heads} vocab={cfg['vocab_size']} "
           f"experts={cfg['n_experts']}×top{cfg['n_activated']}")
+    # ★ V3 结构参数摘要（2026-10-16 加）—— 转换前先让这些数字可见，
+    #   避免"结构参数没带过去"这类静默错误（如 attn_res_block 不一致 ⇒ 数值全错）
+    _ar_on = bool(cfg.get('attn_res_enabled')) and bool(cfg.get('dense_attn_res_free'))
+    print("  V3 结构: attn_res=%s(block=%s) qk_norm=%s csa_compress=%s "
+          "sliding_window=%s hetero_rope=%s dense_ffn=%s rope_theta=%s"
+          % (_ar_on, cfg.get('attn_res_block'), cfg.get('attn_qk_norm'),
+             cfg.get('csa_compress'), cfg.get('sliding_window'),
+             cfg.get('hetero_rope'), cfg.get('dense_ffn'), cfg.get('rope_theta')))
+    _warn_v3 = []
+    if _ar_on and not any(k.startswith('blocks.0.attn_res_proj.') for k in state_dict):
+        _warn_v3.append('cfg 说开 AttnRes 但找不到 blocks.0.attn_res_proj.* → 引擎不会启用')
+    if cfg.get('attn_qk_norm') and not any(k.startswith('blocks.0.attn.q_norm.') for k in state_dict):
+        _warn_v3.append('cfg 说开 QK-Norm 但找不到 blocks.0.attn.q_norm.weight → 引擎不会启用')
+    if cfg.get('hetero_rope'):
+        _warn_v3.append('hetero_rope=True —— ★ 引擎当前【未实现】异质 RoPE，数值会不符（阶段3）')
+    if int(cfg.get('csa_compress', 1) or 1) > 1:
+        _warn_v3.append('csa_compress>1 —— ★ 引擎当前【未实现】CSA，数值会不符（阶段3）')
+    if int(cfg.get('sliding_window', 0) or 0) > 0:
+        _warn_v3.append('sliding_window>0 —— ★ 引擎当前【未实现】滑窗，数值会不符（阶段3）')
+    if int(cfg.get('n_shared_experts', 0) or 0) > 0:
+        _warn_v3.append('n_shared_experts>0 —— ★ 引擎当前【未实现】共享专家（阶段3）')
+    for _w in _warn_v3:
+        print("  [V3-WARN] " + _w)
 
     # ─── 校验: tokenizer vocab_size 必须与模型 vocab_size 一致 ──────────
     # 防止用错 tokenizer (如 10M 模型的 vocab=8192 用到 0.86B 模型 vocab=32768)
@@ -550,15 +727,19 @@ def convert(checkpoint_path: str, output_path: str, tokenizer_path: str, target_
         for t in tok_check.get('added_tokens', []):
             token_to_id_hdr[t['content']] = t['id']
     # 兼容大小写: 优先大写, 回退小写
+    # ★ 2026-10-16 扩充：V3w 词表用的是**小写** <pad>/<unk>/<bos>/<eos>，
+    #   且 id 0..255 是字节 token <b0>..<b255>。全部命中不了时按词表布局回退到
+    #   256/257/258/259（= README 实测的真实布局），而不是老代码的 0/1/2/3
+    #   —— 后者会把 pad/bos/eos/unk 全指到字节 token 上。
     def _get_special(names, default):
         for n in names:
             if n in token_to_id_hdr:
                 return int(token_to_id_hdr[n])
         return default
-    h_pad = _get_special(['<PAD>', '<pad>'], 0)
-    h_bos = _get_special(['<BOS>', '<bos>'], 2)
-    h_eos = _get_special(['<EOS>', '<eos>'], 3)
-    h_unk = _get_special(['<UNK>', '<unk>'], 1)
+    h_pad = _get_special(['<PAD>', '<pad>', '<|pad|>'], 256)
+    h_bos = _get_special(['<BOS>', '<bos>', '<s>', '<|bos|>'], 258)
+    h_eos = _get_special(['<EOS>', '<eos>', '</s>', '<|endoftext|>', '<|eos|>'], 259)
+    h_unk = _get_special(['<UNK>', '<unk>', '<|unk|>'], 257)
     print(f"    header special ids (pad/bos/eos/unk): {h_pad}/{h_bos}/{h_eos}/{h_unk}")
 
     # 2. 序列化 tokenizer
@@ -661,8 +842,18 @@ def convert(checkpoint_path: str, output_path: str, tokenizer_path: str, target_
     struct.pack_into('<II', header, 112, arch_type, num_kv_heads)
     # v3 专属字段: modality_flags + extension_off (offset 120/124)
     #   modality_flags = TEXT(1): 纯文本 LLM, GO 引擎纯文本模式通过校验
-    #   extension_off  = 0: 无子模型扩展段 (纯文本 LLM, 可后续用 pack_multi.py 追加)
-    #   bytearray 初始化为 0, extension_off 无需显式写入
+    #   extension_off  = 扩展段偏移 (0 = 无扩展)。
+    #   ★ 2026-10-16：对**含 V3 特性**的模型写出 V3 配置扩展段（TLV），
+    #     把 attn_res_block 等"权重名里反推不出来"的结构参数带给引擎。
+    #     老引擎完全不读这段（extension_off 只在 dbg 里打印）⇒ 零风险。
+    ext_bytes = b''
+    _need_ext = bool(cfg.get('attn_res_block')) and (
+        any(k.startswith('blocks.0.attn_res_proj.') for k in state_dict)
+        or any(k.startswith('blocks.0.attn.q_norm.') for k in state_dict))
+    if _need_ext:
+        ext_bytes = build_v3_ext(cfg)
+        print("  ★ V3 扩展段: %d B (type=%d, attn_res_block=%s) —— 写在权重段之后"
+              % (len(ext_bytes), EXT_TYPE_V3CFG, cfg.get('attn_res_block')))
     struct.pack_into('<I', header, 120, MODALITY_TEXT)  # modality_flags = TEXT
 
     # 6. 写权重索引表
@@ -721,10 +912,24 @@ def convert(checkpoint_path: str, output_path: str, tokenizer_path: str, target_
         if endp % 16:
             f.write(b'\x00' * (16 - endp % 16))
         actual_len = f.tell() - base
+        weight_data_len = actual_len
+
+        # ── ★ V3 扩展段（2026-10-16 加）：写在权重段之后 ──
+        #   必须在权重段【对齐填充完】之后再取偏移，否则 extension_off
+        #   会落在填充字节中间（读出来的就是垃圾）。
+        #   header 里 weight_data_len 用的是含填充的长度（与老行为一致）。
+        if ext_bytes:
+            extension_off = f.tell()
+            f.write(ext_bytes)
+            print("    V3 扩展段写入 @ %d (%d B)" % (extension_off, len(ext_bytes)))
 
         # ── 回填 header 的 weight_data_len ──
         f.seek(96)
         f.write(struct.pack('<QQ', weight_data_off, actual_len))
+        # ── 回填 extension_off (offset 124) ──
+        if ext_bytes:
+            f.seek(124)
+            f.write(struct.pack('<I', extension_off))
 
         # ── 回填权重表的 offset ──
         f.seek(weight_table_off)
@@ -740,7 +945,6 @@ def convert(checkpoint_path: str, output_path: str, tokenizer_path: str, target_
                 struct.pack_into('<f', entry, 48, e['scales'][0])
             tbl2 += entry
         f.write(tbl2)
-        weight_data_len = actual_len
 
     total_size = os.path.getsize(output_path)
     print(f"\n[OK] 转换完成!")

@@ -20,7 +20,20 @@
 #include <Arduino.h>
 
 #ifdef ESP32
-  #include <esp_spiram.h>
+  /* ★ 2026-10-16 修：Arduino-ESP32 3.x（IDF 5.x）**删掉了 esp_spiram.h**，
+   *   改名为 esp_psram.h。旧的 2.x（IDF 4.x）只有 esp_spiram.h。
+   *   原来硬写 <esp_spiram.h> ⇒ 在 esp32 core 3.3.12 上直接 "No such file"，
+   *   整个库编不过（实测）。这里用 __has_include 两代 IDF 都兼容。
+   *   注：函数名由 TGAI_GO.cpp 的 TGG_PSRAM_IS_INIT() 按同一规则挑选。 */
+  #if defined(__has_include)
+    #if __has_include(<esp_psram.h>)
+      #include <esp_psram.h>
+    #elif __has_include(<esp_spiram.h>)
+      #include <esp_spiram.h>
+    #endif
+  #else
+    #include <esp_spiram.h>
+  #endif
   #include <esp_heap_caps.h>
   #define TG_EMBED_ESP32
 #endif
@@ -94,6 +107,24 @@ extern "C" {
  * @brief Maximum tokens to generate in one call.
  */
 #define TG_EMBED_MAX_GENERATE_TOKENS 512
+
+/**
+ * @brief ★ 固件版本戳（2026-10-16 加）。
+ *
+ * 放在**头文件**里，这样 sketch 自己也能打印
+ * （`Serial.printf("[TGAI_GO] BUILD %s\n", TGAI_GO_BUILD);`），
+ * 刷板后从串口一眼就能确认跑的是哪一版固件 —— 排查时极其有用。
+ * 与 tgai_engine.c 的 TG_ENGINE_BUILD 同一风格。
+ */
+#define TGAI_GO_BUILD "2026-10-16-v3-attnres-qknorm-mqa-dense"
+
+/**
+ * @brief ★ 重复惩罚（rep_penalty）的历史环长度（2026-10-16 加）。
+ *
+ * 只惩罚最近出现过的这么多个 token（含 prompt 尾部），老 token 会被挤出。
+ * 64 足够覆盖一轮回答，只占 256 B 内存。
+ */
+#define TGG_REP_HIST 64
 
 /**
  * @brief SD card configuration for loading models from external storage.
@@ -254,16 +285,22 @@ public:
      * @param prompt Null-terminated UTF-8 prompt string.
      * @param callback Function called for each generated token.
      * @param max_tokens Maximum number of tokens to generate (default 128).
-     * @param temp Temperature for sampling (default 0.6). Higher = more random.
-     * @param top_k Top-K sampling parameter (default 40). Only consider top K tokens.
+     * @param temp Temperature for sampling (default 0.2).
+     * @param top_k Top-K sampling (default 4). Only consider top K tokens.
+     * @param top_p Nucleus sampling (default 0.8, <=0 or >1 = disabled).
+     * @param rep_penalty Repetition penalty (default 1.5, <=1.0 = disabled).
      * @return Number of tokens generated, or -1 on error.
      *
      * @note Call from loop() — this is a blocking operation for the
      *       duration of generation. Each token takes 100-500ms on ESP32.
      * @note The callback receives each token as a null-terminated C string.
+     * @note ★ 默认值改为实测最佳组合 temp=0.2 / top_k=4 / top_p=0.8 / rep=1.5
+     *       （对比旧默认 top_k=40 rep=1.15：收敛率 42.5%→80%，重复率 70%→5%）。
+     *       显式传参的老调用点不受影响。
      */
     int generate(const char* prompt, TGOutputCallback callback,
-                 int max_tokens = 128, float temp = 0.6f, int top_k = 40);
+                 int max_tokens = 128, float temp = 0.2f, int top_k = 4,
+                 float top_p = 0.8f, float rep_penalty = 1.5f);
 
     /**
      * @brief Reset the KV cache for a new conversation turn.
@@ -381,7 +418,8 @@ public:
      * @param user_msg 用户这一轮说的话（UTF-8）
      * @param callback 每个生成 token 回调
      * @param max_tokens 最多生成多少 token
-     * @param temp / top_k 采样参数
+     * @param temp / top_k / top_p / rep_penalty 采样参数
+     *        （实测最佳组合：temp=0.2 top_k=4 top_p=0.8 rep_penalty=1.5）
      * @return 生成 token 数，负数表示错误
      *
      * @code
@@ -390,7 +428,8 @@ public:
      * @endcode
      */
     int chat(const char* user_msg, TGOutputCallback callback,
-             int max_tokens = 128, float temp = 0.6f, int top_k = 40);
+             int max_tokens = 128, float temp = 0.2f, int top_k = 4,
+             float top_p = 0.8f, float rep_penalty = 1.5f);
 
     /**
      * @brief 清空多轮对话历史（KV cache 一并重置）
@@ -490,13 +529,21 @@ private:
     int          _model_count;    /* number of models found */
     char         _loaded_model_name[64]; /* filename of currently loaded model */
 
+    /* ─── ★ 重复惩罚历史环（2026-10-16 加）─────────────
+     * 只惩罚【最近】TGG_REP_HIST 个出现过的 token（含 prompt 尾部），
+     * 老 token 会被挤出环 —— 与 llama.cpp 的 repeat penalty 同策略。
+     * 环长取 64：够覆盖一轮回答，内存只 256 B。 */
+    int          _rep_hist[TGG_REP_HIST];
+    int          _rep_n;
+
     /* ─── Internal methods ────────────────────────── */
     bool _init_model();
     bool _load_from_file(const char* path);
     bool _load_from_sd(const char* path, const TGAISDConfig* sd);
     void _unmount_sd();
     void _free_resources();
-    int  _sample_token(const float* logits, int vocab_size, float temp, int top_k);
+    int  _sample_token(const float* logits, int vocab_size, float temp, int top_k,
+                       float top_p, float rep_penalty);
     void _set_error(const char* msg);
 };
 

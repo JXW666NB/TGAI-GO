@@ -1063,6 +1063,26 @@ static uint64_t fnv1a_64(const char* s) {
     return h;
 }
 
+/* ─── V3 特性标志（2026-10-16 加）
+ * 由 init_block_cache 按【权重存在性】自动检测，不写进 .TG header：
+ *   · 老模型（V1/V2.x）不会有这些权重 ⇒ 标志为 0 ⇒ 前向代码路径逐位不变；
+ *   · 新模型（V3）带上这些权重 ⇒ 自动激活对应实现。 */
+#define TG_V3_F_QK_NORM   0x1   /* blocks.{i}.attn.q_norm/k_norm.weight 存在 */
+#define TG_V3_F_ATTN_RES  0x2   /* blocks.{i}.{attn,mlp}_res_proj.* 存在 */
+
+/* ★ 引擎构建版本戳（2026-10-16 加）—— tg_load 完成时打印一行，
+ *   用来确认"跑的是不是刚编出来的那一版"（排查时最容易踩的坑）。 */
+#define TG_ENGINE_BUILD "2026-10-16-v3.7-v3-longest-match-tokenizer"
+
+/* ★ .TG 扩展段（TLV）里的 V3 配置块（2026-10-16 加）
+ *   格式：[u32 total][u32 type][u32 payload_len][payload...]
+ *        payload = [u32 magic]['TCG3'][u32 attn_res_enabled][i32 attn_res_block]
+ *                  [u32 attn_global_every][u32 csa_compress][i32 sliding_window]
+ *                  [u32 json_len][json bytes]
+ *   未知 type 整段跳过 ⇒ 天然前向兼容（阶段 2 起用它携带任何新结构参数）。 */
+#define TG_EXT_TYPE_V3CFG   1
+#define TG_EXT_MAGIC_V3CFG  0x33474354u  /* "TCG3" little-endian */
+
 /* ─── Block 权重指针缓存 ──────────────────────────
  * 每次 forward 都要对每个 block 的 15+ 个权重做 hash 查找。
  * 预解析所有指针到此结构, transformer_block 直接读取, O(1)。
@@ -1095,6 +1115,21 @@ typedef struct {
     const float* expert_w2[16];
     const float* expert_w3[16];
     int n_experts;
+
+    /* ★ V3 特性权重（2026-10-16 加）
+     *
+     * ── QK-Norm（V3 cfg.attn_qk_norm）──
+     *   形状 [head_dim]，对**每个 head 单独**做 RMSNorm（over head_dim，不是 d_model）。
+     *   PyTorch 顺序：q_proj → q_norm → RoPE；缺失时为 NULL（V2.x/V1 不受影响）。
+     * ── Block AttnRes（V3 cfg.attn_res_enabled && dense_attn_res_free）──
+     *   attn_res_proj / mlp_res_proj 各含 proj.weight(1×d_model) + norm.weight(d_model)。
+     *   该层是【每层独立】的，命名 blocks.{i}.attn_res_proj.*；缺失时为 NULL。 */
+    const float* q_norm_w;
+    const float* k_norm_w;
+    const float* attn_res_proj_w;
+    const float* attn_res_norm_w;
+    const float* mlp_res_proj_w;
+    const float* mlp_res_norm_w;
 
     /* 稠密 FFN 权重 (n_experts==0 时使用, Task 20c.3)
      * ORV 导出命名: blocks.{i}.ffn.w1/w2/w3.weight
@@ -1193,6 +1228,11 @@ struct TGModel {
      * 0 表示不做替换（老模型）。 */
     char space_str[8];
     int space_len;
+    /* ★ 最长词条字节长度（v3.7，2026-10-16 加）
+     * V3w 8K 词表【没有 BPE merges】，多字词是词表里的整词条目，编码必须做
+     * 「最长匹配」。这里记录最长字节数作为试查上界（V3w 实测 = 19）。
+     * 0 表示未计算 ⇒ 调用方按 1 处理（退化成单字符，不会崩）。 */
+    int max_token_len;
     const uint16_t* merges;        /* 原始 merge pairs: [n_merges][2] uint16 */
     const char** vocab;
     /* ★ vocab hash 表（2026-10-09 加，A：编码提速）
@@ -1225,7 +1265,43 @@ struct TGModel {
     float* work_ffn_a;      /* [max_seq * d_ff] */
     float* work_ffn_b;      /* [max_seq * d_ff] */
     float* work_router;     /* [max_seq * n_experts] */
+    /* ★ 专用 attention score buffer（2026-10-16 加）
+     *   同一块内存之前被三处当草稿纸用：
+     *     · attention 的 sc[0..kv_len)        （transformer_block）
+     *     · int8 Q4 反量化 scratch（matmul_q4，若启用）
+     *     · qb_bias 的一次性 sum（(void) 丢弃结果）
+     *   容量最大 n_experts（w10m 稠密模型 = 1）⇒ kv_len>1 即写越界（堆破坏）。
+     *   现改为独立分配 [max_seq * d_ff]（>= max_seq，覆盖 kv_len 上界）。 */
+    float* work_scores;     /* [max_seq * d_ff] */
+    /* ★ AttnRes 深度残差工作区（2026-10-16 加，V3 Block AttnRes 用）
+     *   res_blocks: 已完成的 block 表示，连续排布 [attn_res_blocks_max, seq, d]
+     *   res_h:      深度注意力输出 h（attn/mlp 的输入）
+     *   容量按 header.n_layers 预留上界（block 数 <= 层数）。 */
+    float* res_blocks;      /* [n_layers, max_seq * d_model] — 当前 partial（永远在同一槽，
+                             *   收块不改写它；见 transformer_block 收块处注释） */
+    float* res_blk;         /* [n_layers, max_seq * d_model] — 已收块的快照
+                             *   （等价 PyTorch blocks[] 里的张量；必须在收块时
+                             *    独立拷贝，否则会被随后的 mlp 累加改写） */
+    float* res_h;           /* [max_seq * d_model] — attn 侧 AttnRes 输出 */
+    float* res_h2;          /* [max_seq * d_model] — mlp 侧 AttnRes 输出（与 res_h 分开，
+                             *   消除两侧互相覆盖；2026-10-16 加） */
+    float* res_vt;          /* [n_layers, max_seq * d_model] — AttnRes 的 V 显式拷贝
+                             *   （等价 torch.stack，见 tg_attn_resolve） */
+    float* res_ho;          /* [max_seq * d_model] — AttnRes 结果暂存（写完再拷回 out） */
     int   max_work_seq;
+
+    /* ★ V3 特性检测标志（2026-10-16 加，纯按权重存在性自动判定 ⇒ 老模型恒为 0）
+     *   0 = 关闭（V2.x / V1 模型，前向逐位不变）
+     *   bit0 = QK-Norm, bit1 = Block AttnRes */
+    int   v3_flags;
+    int   attn_res_block;   /* AttnRes 的 block 大小（从权重名反推，默认 4） */
+
+    /* ★ AttnRes 前向状态（2026-10-16 加）
+     *   res_n_blocks: 已完成的 block 数（res_blocks 的第 0..n-1 槽有效）
+     *   attn_res_active: 1 = 本次前向启用 AttnRes（= v3_flags 的 bit1）
+     *   生命周期：tg_forward 每次进入时清零，逐层推进。 */
+    int   res_n_blocks;
+    int   attn_res_active;
 
     /* 上下文扩展 (NTK-aware RoPE scaling)
      * 0 = 不扩展 (默认, 使用 train 时的 max_seq_len)
@@ -1709,6 +1785,70 @@ static int init_block_cache(TGModel* m) {
     m->block_cache = (BlockWeights*)calloc((size_t)nl, sizeof(BlockWeights));
     if (!m->block_cache) return TG_ERR_OOM;
 
+    /* ★ V3 特性检测（2026-10-16 加）：只看权重是否存在，**不改任何 header 语义**
+     *   ⇒ 老 .TG（V1/V2.x）三者全为 0，走原路径，行为逐位不变。
+     *   判定依据（与 PyTorch model_v3.py 一一对应）：
+     *     QK-Norm:    blocks.{i}.attn.q_norm.weight   (cfg.attn_qk_norm)
+     *     AttnRes:    blocks.{i}.attn_res_proj.proj.weight
+     *                 (use_attn_res = attn_res_enabled && dense_attn_res_free)
+     *   ★ attn_res_block（每几个 Transformer 层一个 block）无法携带在权重里，
+     *     转换器写进 .TG extension 段；读不到时按默认 4（V3 全部预设均为 4）。 */
+    m->v3_flags = 0;
+    m->attn_res_block = 4;
+    {
+        int _found_qk = 0, _found_ar = 0;
+        for (int i = 0; i < nl && !(_found_qk && _found_ar); i++) {
+            char _n[160];
+            if (!_found_qk) {
+                snprintf(_n, sizeof(_n), "blocks.%d.attn.q_norm.weight", i);
+                if (find_weight(m, _n)) _found_qk = 1;
+            }
+            if (!_found_ar) {
+                snprintf(_n, sizeof(_n), "blocks.%d.attn_res_proj.proj.weight", i);
+                if (find_weight(m, _n)) _found_ar = 1;
+            }
+        }
+        if (_found_qk) m->v3_flags |= TG_V3_F_QK_NORM;
+        if (_found_ar) m->v3_flags |= TG_V3_F_ATTN_RES;
+        if (m->v3_flags) {
+            dbg("[block_cache] V3 特性检测: qk_norm=%d attn_res=%d (attn_res_block=%d)\n",
+                _found_qk, _found_ar, m->attn_res_block);
+        }
+    }
+    /* ★ 从 .TG 扩展段读 V3 结构参数（2026-10-16 加）
+     *   扩展段是 TLV：未知 type 整段跳过（前向兼容），格式非法则忽略并保持默认值。
+     *   ★ 必须在 init_block_cache 里读：attn_res_block 决定 block 边界，
+     *     猜错会【静默】算出完全不同的数值（不报错，最难查的一类）。
+     *   ★ 只有 v1/v3 且 extension_off 落在文件内的文件才会走这段；
+     *     老 .TG（V2.7 的 extension_off=0xFFFFFEEA 是历史垃圾值）会被范围检查挡掉。 */
+    if ((m->header.version == TG_VERSION || m->header.version == TG_VERSION_V3) &&
+        m->header.extension_off > 0 &&
+        (uint64_t)m->header.extension_off + 12 <= (uint64_t)m->mapped_size) {
+        const uint8_t* p = (const uint8_t*)m->mapped + m->header.extension_off;
+        uint32_t total, type, plen;
+        memcpy(&total, p, 4); memcpy(&type, p + 4, 4); memcpy(&plen, p + 8, 4);
+        if (total >= 8 && type == TG_EXT_TYPE_V3CFG && plen >= 4 &&
+            (uint64_t)m->header.extension_off + 12 + plen <= (uint64_t)m->mapped_size) {
+            uint32_t magic = 0, ar_on = 0, ar_block = 0;
+            memcpy(&magic, p + 12, 4);
+            if (plen >= 12) {
+                memcpy(&ar_on, p + 16, 4);
+                memcpy(&ar_block, p + 20, 4);
+            }
+            if (magic == TG_EXT_MAGIC_V3CFG) {
+                if (ar_on && ar_block > 0 && ar_block <= 1024) {
+                    m->attn_res_block = (int)ar_block;
+                }
+                dbg("[block_cache] V3 扩展段: magic=OK ar_on=%u ar_block=%u -> attn_res_block=%d\n",
+                    ar_on, ar_block, m->attn_res_block);
+            } else {
+                dbg("[block_cache] V3 扩展段 magic 不匹配 (0x%X), 忽略\n", magic);
+            }
+        } else {
+            dbg("[block_cache] 扩展段不是 V3CFG (type=%u len=%u), 跳过\n", type, plen);
+        }
+    }
+
     char name[128];
     for (int i = 0; i < nl; i++) {
         BlockWeights* bw = &m->block_cache[i];
@@ -1801,9 +1941,51 @@ static int init_block_cache(TGModel* m) {
                     i, (const void*)bw->ffn_w1, (const void*)bw->ffn_w2, (const void*)bw->ffn_w3);
             }
         }
+
+        /* ★ V3: QK-Norm 权重（RMSNorm over head_dim，每 head 一份）
+         *   始终走 FP32 懒解码：张量只有 d_k 个元素（w10m=32），
+         *   量化省不了内存却会引入噪声，且 norm 权重必须精确。 */
+        if (m->v3_flags & TG_V3_F_QK_NORM) {
+            snprintf(name, sizeof(name), "blocks.%d.attn.q_norm.weight", i);
+            bw->q_norm_w = get_cached_weight(m, find_weight(m, name));
+            snprintf(name, sizeof(name), "blocks.%d.attn.k_norm.weight", i);
+            bw->k_norm_w = get_cached_weight(m, find_weight(m, name));
+            if (!bw->q_norm_w || !bw->k_norm_w) {
+                dbg_err("[block_cache] ERR: layer %d QK-Norm 权重缺失 (q=%p k=%p)"
+                        " —— 权重不完整, 前向会跳过 QK-Norm 导致数值不符\n",
+                        i, (const void*)bw->q_norm_w, (const void*)bw->k_norm_w);
+            }
+        }
+
+        /* ★ V3: Block AttnRes 权重（每层 2 组：attn 侧 + mlp 侧）
+         *   proj.weight: [1, d_model] 伪查询 w；norm.weight: [d_model] RMSNorm。
+         *   同样走 FP32 懒解码（总共只有 nl × 4 × d 个元素，可忽略）。 */
+        if (m->v3_flags & TG_V3_F_ATTN_RES) {
+            snprintf(name, sizeof(name), "blocks.%d.attn_res_proj.proj.weight", i);
+            bw->attn_res_proj_w = get_cached_weight(m, find_weight(m, name));
+            snprintf(name, sizeof(name), "blocks.%d.attn_res_proj.norm.weight", i);
+            bw->attn_res_norm_w = get_cached_weight(m, find_weight(m, name));
+            snprintf(name, sizeof(name), "blocks.%d.mlp_res_proj.proj.weight", i);
+            bw->mlp_res_proj_w = get_cached_weight(m, find_weight(m, name));
+            snprintf(name, sizeof(name), "blocks.%d.mlp_res_proj.norm.weight", i);
+            bw->mlp_res_norm_w = get_cached_weight(m, find_weight(m, name));
+            if (!bw->attn_res_proj_w || !bw->attn_res_norm_w ||
+                !bw->mlp_res_proj_w || !bw->mlp_res_norm_w) {
+                dbg_err("[block_cache] ERR: layer %d AttnRes 权重缺失 "
+                        "(a_proj=%p a_norm=%p m_proj=%p m_norm=%p)\n", i,
+                        (const void*)bw->attn_res_proj_w, (const void*)bw->attn_res_norm_w,
+                        (const void*)bw->mlp_res_proj_w, (const void*)bw->mlp_res_norm_w);
+            }
+        }
         #undef RESOLVE_W
     }
-    dbg("[block_cache] initialized %d blocks × %d experts\n", nl, ne);
+    dbg("[block_cache] initialized %d blocks × %d experts (v3_flags=0x%X)\n",
+        nl, ne, m->v3_flags);
+    /* ★ 版本戳（2026-10-16 加）：打印到 stdout，便于确认"当前跑的是哪一版引擎"。
+     *   排查时最怕"改了代码但 DLL 没更新"，这一行能一眼看出。 */
+    printf("[tgai_engine] BUILD %s  (V3: QK-Norm + Block AttnRes, attn_res_block=%d)\n",
+           TG_ENGINE_BUILD, m->attn_res_block);
+    fflush(stdout);
     return TG_OK;
 }
 
@@ -1929,9 +2111,21 @@ static int load_tokenizer(TGModel* m) {
         if (m->space_len) dbg("[load_tokenizer] space_token = U+2581\n");
     }
 
+    /* ★ 扫出最长词条字节长度（v3.7）：V3 无 merges 词表做最长匹配的上界。
+     *   必须在 vocab 有效时算；老模型（有 merges）用不到，但算了也无害。 */
+    m->max_token_len = 1;
+    for (int i = 0; i < m->vocab_size; i++) {
+        if (m->vocab[i]) {
+            int L = (int)strlen(m->vocab[i]);
+            if (L > m->max_token_len) m->max_token_len = L;
+        }
+    }
+    dbg("[load_tokenizer] max_token_len = %d\n", m->max_token_len);
+
     /* ★ 建 vocab hash 表（A：编码提速） */
     vocab_hash_build(m);    } else {
         m->pad_id = 0; m->unk_id = 1; m->bos_id = 2; m->eos_id = 3;
+        m->max_token_len = 1;   /* ★ 无 tokenizer 段：退化成单字符 */
     }
 
     /* 预计算 merge 查找表:
@@ -2186,11 +2380,41 @@ TGModel* tg_load(const char* path, int use_mmap, TGError* out_err) {
         size_t ne_alloc = m->header.n_experts > 0 ? m->header.n_experts : 1;
         m->work_router  = (float*)malloc((size_t)m->max_work_seq * ne_alloc * sizeof(float));
     }
+    /* ★ 专用 attention score buffer（2026-10-16 加）
+     *   原实现把 sc[] 写在 work_router 上（容量 = n_experts），
+     *   对稠密模型（n_experts=0 → 分配 1 个元素）只要 kv_len>1 就是写越界 ⇒
+     *   堆破坏 / 崩溃。这里给它独立容量：max_seq × d_ff（d_ff >= 1，且
+     *   kv_len <= max_seq，故永远够用）。 */
+    m->work_scores  = (float*)malloc((size_t)m->max_work_seq * dff * sizeof(float));
+    /* ★ AttnRes 工作区（2026-10-16 加）：只有 V3 模型才用，非 V3 时不分配
+     *   （省内存；前向也不会碰这两个指针）。 */
+    m->res_blocks = NULL;
+    m->res_blk    = NULL;
+    m->res_h      = NULL;
+    m->res_h2     = NULL;
+    m->res_vt     = NULL;
+    m->res_ho     = NULL;
+    if (m->v3_flags & TG_V3_F_ATTN_RES) {
+        int nl_hdr = (int)m->header.n_layers;
+        size_t one = (size_t)m->max_work_seq * (size_t)d;
+        m->res_blocks = (float*)calloc(one, sizeof(float));           /* 只 1 槽 */
+        m->res_blk    = (float*)calloc((size_t)nl_hdr * one, sizeof(float));
+        m->res_vt     = (float*)malloc((size_t)(nl_hdr + 1) * one * sizeof(float));
+        m->res_h      = (float*)malloc(one * sizeof(float));
+        m->res_h2     = (float*)malloc(one * sizeof(float));
+        m->res_ho     = (float*)malloc(one * sizeof(float));
+    }
 
     if (!m->work_x || !m->work_ln || !m->work_q || !m->work_k || !m->work_v ||
         !m->work_attn || !m->work_moe_out || !m->work_logits || !m->last_logits ||
-        !m->work_ffn_a || !m->work_ffn_b || !m->work_router) {
+        !m->work_ffn_a || !m->work_ffn_b || !m->work_router || !m->work_scores) {
         set_err("工作区分配失败"); if (out_err) *out_err = TG_ERR_OOM;
+        tg_free(m); return NULL;
+    }
+    if ((m->v3_flags & TG_V3_F_ATTN_RES) &&
+        (!m->res_blocks || !m->res_blk || !m->res_h || !m->res_h2 ||
+         !m->res_vt || !m->res_ho)) {
+        set_err("AttnRes 工作区分配失败"); if (out_err) *out_err = TG_ERR_OOM;
         tg_free(m); return NULL;
     }
 
@@ -2257,6 +2481,9 @@ void tg_free(TGModel* m) {
     free(m->work_logits); free(m->last_logits);
     if (m->vocab_hash) { free(m->vocab_hash); m->vocab_hash = NULL; m->vocab_hash_cap = 0; }
     free(m->work_ffn_a); free(m->work_ffn_b); free(m->work_router);
+    free(m->work_scores);
+    free(m->res_blocks); free(m->res_blk); free(m->res_h); free(m->res_h2);
+    free(m->res_vt); free(m->res_ho);
 
     if (m->mapped) {
 #ifdef _WIN32
@@ -2305,6 +2532,27 @@ static int ensure_work(TGModel* m, int seq_len) {
     REALLOC_N(m->work_ffn_b, dff);
     /* Task 20c.3: 稠密模型 ne==0 时分配 1 元素避免 realloc(ptr, 0) 释放指针 */
     REALLOC_N(m->work_router, ne > 0 ? ne : 1);
+    /* ★ attention score buffer（2026-10-16 加）：容量 max_seq × d_ff */
+    REALLOC_N(m->work_scores, dff);
+    /* ★ AttnRes 工作区（2026-10-16 加）：仅 V3 模型需要 */
+    if (m->v3_flags & TG_V3_F_ATTN_RES) {
+        int nl_hdr = (int)m->header.n_layers;
+        size_t one = (size_t)new_max * (size_t)d;
+        float* nb = (float*)realloc(m->res_blocks, one * sizeof(float));
+        if (!nb) return TG_ERR_OOM;
+        m->res_blocks = nb;
+        memset(m->res_blocks, 0, one * sizeof(float));
+        float* nk = (float*)realloc(m->res_blk, (size_t)nl_hdr * one * sizeof(float));
+        if (!nk) return TG_ERR_OOM;
+        m->res_blk = nk;
+        memset(m->res_blk, 0, (size_t)nl_hdr * one * sizeof(float));
+        float* nv = (float*)realloc(m->res_vt, (size_t)(nl_hdr + 1) * one * sizeof(float));
+        if (!nv) return TG_ERR_OOM;
+        m->res_vt = nv;
+        REALLOC_N(m->res_h, d);
+        REALLOC_N(m->res_h2, d);
+        REALLOC_N(m->res_ho, d);
+    }
 
     #undef REALLOC_N
     m->max_work_seq = new_max;
@@ -3180,6 +3428,110 @@ static void swiglu(TGModel* m, float* out, const float* x,
     matmul(out, a, w3, seq, d_ff, d_model);
 }
 
+/* ══════════════════════════════════════════════════════════════════════
+ * ★ V3 特性实现（2026-10-16 加，对照 D:\TGAI-WORLD-V2-10M\03_src\model_v3.py）
+ *
+ * 本段所有函数只在 v3_flags 对应位置位时被调用；老模型（V1/V2.x）的
+ * 权重表里没有这些张量 ⇒ 标志为 0 ⇒ 前向路径逐位不变。
+ * ══════════════════════════════════════════════════════════════════════ */
+
+/* ─── QK-Norm（model_v3.py L393-395 / L410-411 / L514-516）──────────────
+ *   PyTorch: self.q_norm = RMSNorm(self.d_k, eps)
+ *            q = self.q_norm(q)      # q: (B, H, T, d_k)
+ *   ⇒ **每个 head 在 head_dim 维上独立做 RMSNorm**，不是整 d_model。
+ *   位置：QKV 投影 + bias 之后、RoPE 之前（与 PyTorch 一致）。
+ *   w 为 RMSNorm 的 weight（长度 d_k）。 */
+static void qk_norm_heads(float* x, int seq, int n_heads, int dk,
+                          const float* w, int n_used_heads) {
+    if (!w) return;
+    for (int t = 0; t < seq; t++) {
+        float* base = x + (size_t)t * n_heads * dk;
+        for (int h = 0; h < n_used_heads; h++) {
+            float* v = base + (size_t)h * dk;
+            double ss = 0.0;
+            for (int i = 0; i < dk; i++) ss += (double)v[i] * (double)v[i];
+            float rms = (float)(1.0 / sqrt(ss / (double)dk + 1e-6));
+            for (int i = 0; i < dk; i++) v[i] = v[i] * rms * w[i];
+        }
+    }
+}
+
+/* ─── Block AttnRes（model_v3.py L812-856 + L913-953）───────────────────
+ *   官方伪代码（逐行照搬）：
+ *       V = stack(blocks + [partial_block])          # [N+1, B, T, D]
+ *       K = norm(V)
+ *       logits = einsum('d, n b t d -> n b t', proj.weight.squeeze(), K)
+ *       h = einsum('n b t, n b t d -> b t d', logits.softmax(0), V)
+ *
+ * ★★ 2026-10-16 重写（v3.3）：**显式拷贝，不用任何原地别名**
+ *
+ *   旧版直接在 res_blocks 上原地算（rows[b] 指进 res_blocks，out 可能就是
+ *   partial 那一槽）。虽然逐行推演是安全的，但实测在 layer 4 之后出现
+ *   无法解释的偏差（layer 0-3 完全正确，layer 4 起 h 偏 0.48 并逐层放大），
+ *   且与"是否原地"高度相关 —— 这类"读写同一块内存"的写法在开优化后
+ *   极易被编译器按 no-alias 假设重排，是最难查的一类问题。
+ *
+ *   新版语义与 PyTorch 的 torch.stack **逐位等价**：
+ *     ① Vt  = 显式拷贝 [N][seq*d]（blocks + partial，与 stack 同序）
+ *     ② 在 Vt 上算 logits / softmax / 加权和
+ *     ③ 结果写进独立缓冲 ho，最后才 memcpy 到 out
+ *   ⇒ 计算期间 out / blocks_buf 完全不被写；Vt/ho 都是独立 malloc 的。
+ *   ⇒ 无论如何优化，语义只有一种读法。
+ *
+ * 缓冲区由调用方按 max_work_seq 一次性分配（tg_attn_res_alloc），前向期间复用。 */
+static void tg_attn_resolve(const float* blocks_buf, int n_blocks,
+                            int seq, int d,
+                            const float* proj_w, const float* norm_w,
+                            float* out,
+                            float* vt, float* ho, int vt_cap_blocks,
+                            const float* partial) {
+    if (!proj_w || !norm_w || !vt || !ho || !partial) return;
+    const int N = n_blocks + 1;              /* blocks + [partial] */
+    if (N > vt_cap_blocks) return;           /* 容量保护（不可能触发） */
+    const size_t nd = (size_t)seq * (size_t)d;
+
+    /* ① V = stack(blocks + [partial_block]) —— 显式拷贝（等价 torch.stack） */
+    if (n_blocks > 0) memcpy(vt, blocks_buf, (size_t)n_blocks * nd * sizeof(float));
+    memcpy(vt + (size_t)n_blocks * nd, partial, nd * sizeof(float));
+
+    for (int t = 0; t < seq; t++) {
+        const float* rows[64];
+        double logits[64];
+        int n = N > 64 ? 64 : N;
+        for (int b = 0; b < n; b++) {
+            rows[b] = vt + (size_t)b * nd + (size_t)t * (size_t)d;
+        }
+        /* K = norm(V); logits[b] = <proj_w, K_b>（全按 FP32，与上游 .float() 一致） */
+        double mx = -1e30;
+        for (int b = 0; b < n; b++) {
+            const float* r = rows[b];
+            double ss = 0.0;
+            for (int i = 0; i < d; i++) ss += (double)r[i] * (double)r[i];
+            float rms = (float)(1.0 / sqrt(ss / (double)d + 1e-6));
+            double acc = 0.0;
+            for (int i = 0; i < d; i++) {
+                acc += (double)proj_w[i] * ((double)r[i] * (double)rms * (double)norm_w[i]);
+            }
+            logits[b] = acc;
+            if (acc > mx) mx = acc;
+        }
+        /* softmax over block 维（减最大值，数值稳定） */
+        double ssum = 0.0;
+        for (int b = 0; b < n; b++) { logits[b] = exp(logits[b] - mx); ssum += logits[b]; }
+        double inv = 1.0 / (ssum > 0.0 ? ssum : 1.0);
+        for (int b = 0; b < n; b++) logits[b] *= inv;
+        /* h = Σ_b w_b · V_b，写进独立缓冲 ho（不碰 out，也不碰 blocks_buf） */
+        float* o = ho + (size_t)t * (size_t)d;
+        for (int i = 0; i < d; i++) {
+            double acc = 0.0;
+            for (int b = 0; b < n; b++) acc += logits[b] * (double)rows[b][i];
+            o[i] = (float)acc;
+        }
+    }
+    /* ③ 最后一次性拷回 out（此时所有读取都已完成） */
+    memcpy(out, ho, nd * sizeof(float));
+}
+
 /* ─── 单个 Transformer Block (使用预解析 block_cache, 无 hash 查找) ── */
 /* ★ 逐层 dump（2026-10-10 加，临时诊断）
  * 环境变量 TGAI_DUMP_DIR 指定目录；未设置时零开销。
@@ -3196,9 +3548,42 @@ static void tg_dump_f32(const char* tag, const float* p, size_t n) {
     dbg("[dump] %s  n=%llu\n", tag, (unsigned long long)n);
 }
 
+/* ★ 诊断开关（2026-10-16 加）：TGAI_DUMP_EXTRA=1 时额外 dump 每层的
+ *   attn_out / attn 输入 h / attn 侧 resolve 输出 / mlp 侧 resolve 输出 /
+ *   mlp_out / 层末 partial，用于与 PyTorch 逐层对拍（local_final.py 消费）。
+ *   ★ v3.5 起 dump 点严格对应 PyTorch model_v3.py L924-952 的各个中间量：
+ *       c_hraw{i}   = h   （attn 侧 resolve 的输出，= L924）
+ *       c_attnout{i}= a   （attn_part 输出，= L933 的 a）
+ *       c_mlph2_{i} = h   （mlp 侧 resolve 的输出，= L946）
+ *       c_mlpout{i} = m   （mlp_part 输出，= L951 的 m）
+ *       c_partend{i}= partial（mlp 累加之后、收块之后的层末 partial，= L952）
+ *   注意 c_hin{i} 与 c_hraw{i} 现为同一块内存（h 就是 resolve 输出），
+ *   保留 c_hin 只为兼容旧脚本。 */
+static int tg_extra_dump_on(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* e = getenv("TGAI_DUMP_EXTRA");
+        cached = (e && e[0] == '1') ? 1 : 0;
+    }
+    return cached;
+}
+
+/* ─── AttnRes partial 槽位助手（2026-10-16 加）──────────────────────────
+ * partial 永远位于 res_blocks 的第 res_n_blocks 槽。
+ * ★★ 收块时必须把新 partial 复制到【下一个】槽：收块那一步 res_n_blocks
+ *    自增后，第 res_n_blocks 槽已经被"刚完成的块"占用了，若新 partial 仍留在
+ *    原槽，下一层的 tg_attn_resolve 会把【半成品】当成 block 读（实测症状：
+ *    layer 3 完全正确，layer 4 突然差 0.54，之后逐层放大到 10+）。
+ *    与 PyTorch `blocks.append(new_partial); partial = new_partial` 语义一致
+ *    （Python 里 new_partial 是独立张量，不存在别名问题）。 */
+static float* tg_ar_partial(TGModel* m, int seq, int d) {
+    (void)seq; (void)d;
+    return m->res_blocks;        /* partial 永远在第 0 槽（收块不改写它） */
+}
+
+
 static void transformer_block(TGModel* m, float* x, int seq,
-                              int layer_idx, TGKVCache* cache, int cache_pos) {
-    int d = (int)m->header.d_model;
+                              int layer_idx, TGKVCache* cache, int cache_pos) {    int d = (int)m->header.d_model;
     int nh = (int)m->header.n_heads;
     int dk = d / nh;
     /* Task 20c.3: GQA 支持 — K/V 投影输出 kv_dim = n_kv_heads * d_k (非 d_model)。
@@ -3216,8 +3601,32 @@ static void transformer_block(TGModel* m, float* x, int seq,
 
     BlockWeights* bw = &m->block_cache[layer_idx];
 
+    /* ★ AttnRes（V3）：attn 之前先做一次深度注意力，得到 h（attn 的输入）；
+     *   非 V3 模型 h 就指向 x（零开销，且 x 不会被本函数改写：
+     *   本函数只写 work_* 与 h，不写 x）。 */
+    float* h = x;
+    if (m->attn_res_active) {
+        h = m->res_h;
+        float* _partial = tg_ar_partial(m, seq, d);
+        if (bw->attn_res_proj_w && bw->attn_res_norm_w) {
+            tg_attn_resolve(m->res_blk, m->res_n_blocks,
+                            seq, d, bw->attn_res_proj_w, bw->attn_res_norm_w, h,
+                            m->res_vt, m->res_ho, (int)m->header.n_layers + 1, _partial);
+            /* ★ 立刻 dump（在任何后续写入之前）—— attn 侧 AttnRes 的真实输出 h */
+            if (tg_extra_dump_on()) {
+                char _t2[64];
+                snprintf(_t2, sizeof(_t2), "c_hraw%d", layer_idx);
+                tg_dump_f32(_t2, h, (size_t)seq * d);
+            }
+        } else {
+            /* 权重缺失（转换不完整）：退化为 partial 直通，避免用未初始化的
+             * res_h 继续算 ⇒ 输出垃圾。init_block_cache 已就此事报错。 */
+            memcpy(h, _partial, (size_t)seq * d * sizeof(float));
+        }
+    }
+
     /* === Attention (预解析指针, O(1)) === */
-    rmsnorm(m->work_ln, x, bw->ln1_w, seq, d, 1e-6f);
+    rmsnorm(m->work_ln, h, bw->ln1_w, seq, d, 1e-6f);
 
     /* Q4_0 路径: 使用原始 4-bit 数据直接点积 (减 4x 内存带宽) */
     if (m->use_q4_direct && bw->q4_q) {
@@ -3259,6 +3668,15 @@ static void transformer_block(TGModel* m, float* x, int seq,
         }
     }
 
+    /* ★ QK-Norm（V3，2026-10-16 加）：每 head 在 head_dim 上做 RMSNorm。
+     *   PyTorch model_v3.py L410-411：q = self.q_norm(q); k = self.k_norm(k)
+     *   位置必须在 RoPE **之前**、bias **之后**（与上游 forward 顺序一致）。
+     *   Q 用 n_heads 个 head，K 用 nkv 个 head（GQA/MQA 下 K 只有 nkv 个）。 */
+    if (m->v3_flags & TG_V3_F_QK_NORM) {
+        qk_norm_heads(m->work_q, seq, nh, dk, bw->q_norm_w, nh);
+        qk_norm_heads(m->work_k, seq, nkv, dk, bw->k_norm_w, nkv);
+    }
+
     /* YaRN 注意力温度修正: rope() 输出 mscale, 应用到 QK^T 缩放.
      * 仅启用 NTK 扩展时 mscale>1; 短序列时恒为 1.0 (与旧行为完全一致). */
     float yarn_mscale = 1.0f;
@@ -3294,7 +3712,10 @@ static void transformer_block(TGModel* m, float* x, int seq,
         for (int h = 0; h < nh; h++) {
             float* qh = m->work_q + ((size_t)t * nh + h) * dk;
             int kvh = h * nkv / nh;  /* GQA 映射: Q head → KV head */
-            float* sc = m->work_ffn_a + (size_t)t * dff;  /* d_ff 通常 >= kv_len */
+            /* ★ 2026-10-16 修：原为 `m->work_ffn_a + t*dff`，容量只有 dff
+             *   （w10m dff=672 尚可，但 dff 小的模型/长上下文会越界）。改用专用
+             *   work_scores（容量 max_seq×d_ff >= kv_len）。 */
+            float* sc = m->work_scores + (size_t)t * dff;  /* d_ff >= kv_len 保证见下 */
             int layer_off = cache ? layer_idx * cache->n_kv_heads * cache->max_seq_len * cache->d_k : 0;
 
             for (int ki = 0; ki < kv_len; ki++) {
@@ -3345,11 +3766,87 @@ static void transformer_block(TGModel* m, float* x, int seq,
         matmul(m->work_moe_out, m->work_attn, bw->out_w, seq, d, d);
     }
 
-    /* x = x + attn_out */
-    for (int i = 0; i < seq * d; i++) x[i] += m->work_moe_out[i];
+    /* ★★ V3 AttnRes：new_partial = partial + attn_out
+     *   【残差项是 resolve 之【前】的 partial，不是 resolve 的输出 h！】
+     *
+     *   PyTorch model_v3.py L924 / L933 / L940 逐字：
+     *       h           = self.attn_res_proj[i](blocks, partial)   # ← h 只当 attn 的输入
+     *       a, hm       = blk.attn_part(h, ...)                    # ← attn 输出
+     *       new_partial = partial + a                              # ← ★ 残差用「旧 partial」
+     *   ⇒ resolve 的输出 h 只喂给 attn，**绝不可**回写进 partial 当残差基线。
+     *
+     *   ★ 根因修复（v3.5，2026-10-16）：v3.4 及以前误写成 `partial = h + attn_out`。
+     *     当 blocks 为空时 AttnRes.forward 直接返回 partial_block（L843-844），
+     *     h == partial，两种写法数值逐位相同 —— 这正是"layer 0-3 完全对齐、
+     *     layer 4 起突然偏、之后逐层放大"的原因：第一次收块发生在 layer 3 末尾，
+     *     直到 layer 4 的 resolve 才第一次真正让 h ≠ partial。
+     *
+     *   非 V3 时 partial == x ⇒ 与原来的 `x[i] += work_moe_out[i]` 完全等价。 */
+    if (tg_extra_dump_on()) {
+        char _tg[64];
+        snprintf(_tg, sizeof(_tg), "c_attnout%d", layer_idx);
+        tg_dump_f32(_tg, m->work_moe_out, (size_t)seq * d);
+        snprintf(_tg, sizeof(_tg), "c_hin%d", layer_idx);
+        tg_dump_f32(_tg, h, (size_t)seq * d);
+    }
+    {
+        float* partial = m->attn_res_active ? tg_ar_partial(m, seq, d) : x;
+        for (int i = 0; i < seq * d; i++) partial[i] += m->work_moe_out[i];
+
+        /* ★★ AttnRes block 边界 —— 收块点在【mlp 之前】，且 partial 原地不动
+         *
+         *   PyTorch（model_v3.py L940-952）逐行：
+         *       new_partial = partial + a          # ← 只含 attn，不含 mlp！
+         *       if (i + 1) % bs == 0:
+         *           blocks.append(new_partial)     # ← 收块（引用同一张量）
+         *       partial = new_partial              # ← 仍是【同一块内存】
+         *       h = self.mlp_res_proj[i](blocks, partial)
+         *       partial = partial + m
+         *   ⇒ 两个要点：
+         *     ① blocks 里存的是「attn 之后、mlp 之前」的 partial；
+         *     ② 收块**不改变 partial 的位置**（Python 里 new_partial 就是
+         *        partial + a 新建的张量，而 partial 随后指向它；blocks 里那一项
+         *        在下一步 `partial = partial + m` 后仍是旧张量，不会被改写）。
+         *
+         *   ★ 实测踩过的两个反例（都会让 layer 0-3 正确、layer 4 起崩）：
+         *     a) 收块放到函数末尾（partial += mlp 之后）⇒ 收进去的多了 mlp_out；
+         *     b) 收块后把 partial 搬到"下一个槽" ⇒ 下一层的 partial 少加了一次
+         *        mlp_out（layer 5 起偏 0.6）。
+         *   正确做法：**只把 blocks 里那一位记下来，partial 留在原槽**。
+         *   在 C 里"blocks 里那一位"= res_blocks[res_n_blocks] 的当前内容，
+         *   而 partial 紧接着会被 mlp 更新 —— 所以这里用一块独立副本
+         *   （res_blk）保存收块内容，避免被后续 mlp 累加改写。 */
+        if (m->attn_res_active) {
+            int bs = m->attn_res_block > 0 ? m->attn_res_block : 4;
+            if ((layer_idx + 1) % bs == 0 && m->res_n_blocks < (int)m->header.n_layers) {
+                memcpy(m->res_blk + (size_t)m->res_n_blocks * (size_t)seq * (size_t)d,
+                       partial, (size_t)seq * d * sizeof(float));
+                m->res_n_blocks++;
+            }
+        }
+    }
 
     /* === FFN (稠密 SwiGLU 或 MoE, 由 n_experts 决定, Task 20c.3) === */
-    rmsnorm(m->work_ln, x, bw->ln2_w, seq, d, 1e-6f);
+    /* ★ V3 AttnRes：mlp 之前再做一次深度注意力（blocks 已含刚收进来的块） */
+    {
+        float* partial = m->attn_res_active ? tg_ar_partial(m, seq, d) : x;
+        float* mh = partial;
+        if (m->attn_res_active) {
+            if (bw->mlp_res_proj_w && bw->mlp_res_norm_w) {
+                mh = m->res_h2;      /* ★ 与 attn 侧的 res_h 分开，互不覆盖 */
+                tg_attn_resolve(m->res_blk, m->res_n_blocks,
+                                seq, d, bw->mlp_res_proj_w, bw->mlp_res_norm_w, mh,
+                                m->res_vt, m->res_ho, (int)m->header.n_layers + 1, partial);
+            }
+            /* 权重缺失时 mh 保持 = partial（直通），见 attn 侧同款保护 */
+        }
+        rmsnorm(m->work_ln, mh, bw->ln2_w, seq, d, 1e-6f);
+        if (tg_extra_dump_on() && mh != partial) {
+            char _tg[64];
+            snprintf(_tg, sizeof(_tg), "c_mlph2_%d", layer_idx);
+            tg_dump_f32(_tg, mh, (size_t)seq * d);
+        }
+    }
 
     if (ne == 0) {
         /* 稠密 SwiGLU FFN (Task 20c.3): 与 MoE 专家 SwiGLU 数学等价, 无 router/top-k。
@@ -3540,8 +4037,24 @@ static void transformer_block(TGModel* m, float* x, int seq,
 #endif
     } /* end else (MoE FFN) */
 
-    /* x = x + ffn_out (稠密 SwiGLU 或 MoE 统一用 work_moe_out) */
-    for (int i = 0; i < seq * d; i++) x[i] += m->work_moe_out[i];
+    /* ★ partial += mlp_out（V3 AttnRes 时 partial 就在 res_blocks 的当前槽里）
+     *   非 V3 时 partial == x ⇒ 与原来的 `x[i] += work_moe_out[i]` 完全等价。
+     *   ★ 注意：AttnRes 的【收块】已经移到上面 attn 累加之后（mlp 之前），
+     *     这里只更新 partial，不再收块（见该处长注释）。 */
+    {
+        float* partial = m->attn_res_active ? tg_ar_partial(m, seq, d) : x;
+        if (tg_extra_dump_on()) {
+            char _tg[64];
+            snprintf(_tg, sizeof(_tg), "c_mlpout%d", layer_idx);
+            tg_dump_f32(_tg, m->work_moe_out, (size_t)seq * d);
+        }
+        for (int i = 0; i < seq * d; i++) partial[i] += m->work_moe_out[i];
+        if (tg_extra_dump_on()) {
+            char _tg[64];
+            snprintf(_tg, sizeof(_tg), "c_partend%d", layer_idx);
+            tg_dump_f32(_tg, partial, (size_t)seq * d);
+        }
+    }
 }
 
 /* ─── 前向推理 ────────────────────────────────── */
@@ -3607,13 +4120,35 @@ const float* tg_forward(TGModel* m, const int32_t* input_ids, int seq_len,
 
     tg_dump_f32("c_embed", m->work_x, (size_t)seq_len * d);
 
+    /* ★ V3 AttnRes 初始化（2026-10-16 加）
+     *   PyTorch 每次 forward 都新建 blocks=[] 与 partial=x：
+     *     blocks: List = [];  partial = x        (model_v3.py L919-920)
+     *   这里用 res_blocks 的第 0 槽当 partial，res_n_blocks 记录已完成块数。
+     *   非 V3 模型 attn_res_active=0 ⇒ 下面循环里的分支全部跳过。 */
+    m->attn_res_active = (m->v3_flags & TG_V3_F_ATTN_RES) ? 1 : 0;
+    m->res_n_blocks = 0;
+    if (m->attn_res_active) {
+        memcpy(m->res_blocks, m->work_x, (size_t)seq_len * d * sizeof(float));
+    }
+
     /* 2. Transformer blocks */
     for (int i = 0; i < nl; i++) {
         dbg("[fwd] block %d\n", i);
         transformer_block(m, m->work_x, seq_len, i, cache, cache_pos);
         {   char _tag[64];
             snprintf(_tag, sizeof(_tag), "c_block%d", i);
-            tg_dump_f32(_tag, m->work_x, (size_t)seq_len * d); }
+            /* ★ AttnRes 时每层的"当前 partial"在 res_blocks 第 0 槽，
+             *   不在 work_x（work_x 只保存 embedding 供首层使用）——
+             *   dump 需要跟着换，否则逐层比对会拿到陈旧数据。 */
+            const float* _dp = m->attn_res_active ? m->res_blocks : m->work_x;
+            tg_dump_f32(_tag, _dp, (size_t)seq_len * d); }
+    }
+
+    /* ★ 最后一层的 partial 要搬回 work_x 才能过 final_norm（V3 AttnRes）。
+     *   PyTorch: `x = partial; x = self.final_norm(x)`（model_v3.py L953/L979）
+     *   ★ partial 永远在 res_blocks 第 0 槽（收块不改写它） */
+    if (m->attn_res_active) {
+        memcpy(m->work_x, m->res_blocks, (size_t)seq_len * d * sizeof(float));
     }
 
     /* 3. Final norm */
@@ -3652,9 +4187,47 @@ const float* tg_forward(TGModel* m, const int32_t* input_ids, int seq_len,
 }
 
 /* ─── Tokenizer 查询 ──────────────────────────── */
+/* ─── ★ 字节 token（byte fallback）双向映射（v3.6，2026-10-16 加）────────
+ *
+ * 背景（实测，非推测）：TGAI v3 词表把 0x00-0xFF 表示为 '<b0>'..'<b255>'，
+ *   且 **token id 恰好等于字节值**：
+ *       tg_token_to_str(10) = '<b10>'   ⇒ 字节 0x0A ('\n')
+ *       tg_token_to_str(255)= '<b255>'  ⇒ 字节 0xFF
+ *       id 256..264 才是 <pad>/<unk>/<bos>/<eos>/<mask>/... 等特殊标记
+ *
+ * 症状：'\n' 这种控制字符在词表里**没有字面量条目**，tg_encode 的单字符查表
+ *   必然失败 ⇒ 落到 unk_id(1)。实测：
+ *       tg_encode("<用户>\n你好\n<TGAI><回答>\n") = [265,1,586,650,1,266,268,1]
+ *   两个换行都变成了 <b1>（=0x01），模型看到的是**错的对话格式**。
+ *
+ * 修法：两个方向都补，且都**只在原路径失败时才启用** ⇒ 老词表 / 老模型行为不变。
+ *   · 编码：单字节字面量查不到 ⇒ 回落查 '<bN>'（N = 该字节值）
+ *   · 解码：token 字符串形如 '<bN>' ⇒ 输出那个原始字节
+ *
+ * 为什么 '<bos>' 不会被误判：本函数要求 s[1]=='b' 之后**至少一位数字**且
+ *   紧接 '>' 且字符串结束；'<bos>' 的 s[2]=='o' 不是数字 ⇒ 直接返回 -1。 */
+static int tg_parse_byte_token(const char* s) {
+    if (!s || s[0] != '<' || s[1] != 'b') return -1;
+    int v = 0, i = 2, any = 0;
+    while (s[i] >= '0' && s[i] <= '9') {
+        v = v * 10 + (s[i] - '0');
+        if (v > 255) return -1;                 /* 超过 255 不是字节 token */
+        i++; any = 1;
+    }
+    if (!any || s[i] != '>' || s[i + 1] != '\0') return -1;
+    return v;
+}
+
 int tg_token_to_str(const TGModel* m, int id, char* out_str, int max_len) {
     if (!m || id < 0 || id >= m->vocab_size) return -1;
     const char* s = m->vocab[id];
+    int bn = tg_parse_byte_token(s);
+    if (bn >= 0) {
+        if (max_len < 2) return -1;
+        out_str[0] = (char)(uint8_t)bn;
+        out_str[1] = '\0';
+        return 1;
+    }
     int len = (int)strlen(s);
     if (len >= max_len) len = max_len - 1;
     memcpy(out_str, s, (size_t)len);
@@ -3781,6 +4354,22 @@ static int bpe_apply(const TGModel* m, int32_t* seq, int n) {
     return n;
 }
 
+/* ★ 字节 ⇒ token id（v3.6，2026-10-16 加）：查 '<bN>'
+ *   先 hash O(1)，未命中再线性兜底（与 tg_encode 单字符查表同款双保险）。
+ *   返回 -1 表示该模型没有字节 token（老词表）⇒ 调用方保持原行为（unk）。 */
+static int tg_byte_token_id(const TGModel* m, uint8_t byte) {
+    if (!m || !m->vocab) return -1;
+    char name[8];
+    snprintf(name, sizeof(name), "<b%u>", (unsigned)byte);
+    int len = (int)strlen(name);
+    int tid = vocab_hash_lookup(m, name, len);
+    if (tid >= 0) return tid;
+    for (int i = 0; i < m->vocab_size; i++) {
+        if (m->vocab[i] && strcmp(m->vocab[i], name) == 0) return i;
+    }
+    return -1;
+}
+
 int tg_encode(const TGModel* model, const char* text, int32_t* out_ids, int max_out, int add_special) {
     if (!model || !text || !out_ids || max_out <= 0) return -1;
 
@@ -3823,6 +4412,23 @@ int tg_encode(const TGModel* model, const char* text, int32_t* out_ids, int max_
     const uint8_t* p = (const uint8_t*)text;
     const uint8_t* end = p + text_len;
     char char_buf[8];
+    /* ★ 未命中连续段的起点（v3.7，2026-10-16）：与权威 tokenizer_v3.py 的
+     *   miss_start 同语义 —— 连续未命中的字符累积成一段，段末整段按 UTF-8
+     *   字节回退成 <bN>，而不是遇到一个就立刻写 unk。NULL = 当前无累积。 */
+    const uint8_t* miss_start = NULL;
+
+    /* ★ 结算未命中段：整段按字节回退成 <bN>（永不 OOV）。
+     *   必须在 p 前进【之前】调用（区间是 [miss_start, p)）。 */
+    #define TG_FLUSH_MISS() do {                                        \
+        if (miss_start) {                                               \
+            for (const uint8_t* _q = miss_start; _q < p; _q++) {        \
+                int _bt = tg_byte_token_id(model, (uint8_t)*_q);        \
+                if (_bt < 0) _bt = model->unk_id;                       \
+                if (seq_n < text_len + 8) seq[seq_n++] = _bt;           \
+            }                                                           \
+            miss_start = NULL;                                          \
+        }                                                               \
+    } while (0)
 
     #define TG_FLUSH_SEG() do {                                       \
         if (seg_n > 0) {                                              \
@@ -3850,7 +4456,8 @@ int tg_encode(const TGModel* model, const char* text, int32_t* out_ids, int max_
                 }
             }
             if (best >= 0) {
-                TG_FLUSH_SEG();                            /* 先结算前面的普通段 */
+                TG_FLUSH_MISS();                           /* 先结算未命中字节 */
+                TG_FLUSH_SEG();                            /* 再结算前面的普通段 */
                 if (seq_n < text_len + 8) seq[seq_n++] = model->special_id[best];
                 p += best_len;
                 matched = 1;
@@ -3858,6 +4465,46 @@ int tg_encode(const TGModel* model, const char* text, int32_t* out_ids, int max_
         }
         if (matched) continue;
 
+        /* ═══ ★★ V3 词表：Trie 最长匹配（2026-10-16 重写，v3.7）═══════════
+         * 为什么必须分两套：V3w 8K 词表【没有 BPE merges】
+         *   （vocab_v3w_meta.json 自述："无 BPE merges(字符+词组级)"，
+         *     实测 n_merges=0），多字词是**词表里的整词条目**：
+         *     '你好'=6586、'今天天气'=7637、'abc'=5817。
+         *   权威语义 = 03_src/tokenizer_v3.py 的 TGAIv3Tokenizer.encode()：
+         *     ① 从当前位置做 Trie 贪心最长匹配（只看【最长】，不看 merge rank）
+         *     ② 未命中的【连续字符】累积成一段，段末整段按 UTF-8 字节回退成 <bN>
+         *   而 V2.7（n_merges=24355）走的是真 BPE，必须保持原路径【逐位不变】。
+         *   ⇒ 用 n_merges 是否为 0 作为分流依据（这是词表体系的真实结构差异）。
+         *
+         * 这里用「按长度逐个试查哈希表」替代 Trie：从最长词条字节数向下试，
+         * 命中即出。V3w 实测最长 19 字节 ⇒ 每字符最多 19 次 O(1) 查表，
+         * 且**不需要为 Trie 分配任何内存**（ESP32 友好）。
+         * 哈希表 cap >= 2*vocab 且用 -1 空槽哨兵 ⇒ 未命中是确定的，无需线性兜底。 */
+        if (model->n_merges == 0) {
+            int maxL = model->max_token_len > 0 ? model->max_token_len : 1;
+            int avail = (int)(end - p);
+            if (maxL > avail) maxL = avail;
+            int hit = -1, hit_len = 0;
+            for (int L = maxL; L >= 1; L--) {
+                int t2 = vocab_hash_lookup(model, (const char*)p, L);
+                if (t2 >= 0) { hit = t2; hit_len = L; break; }
+            }
+            if (hit >= 0) {
+                TG_FLUSH_MISS();                       /* 先结算累积的未命中字节 */
+                if (seq_n < text_len + 8) seq[seq_n++] = hit;
+                p += hit_len;
+            } else {
+                /* 未命中：累积一个【字符】（与权威实现 i += 1 个字符一致），
+                 * 段末统一按字节回退。不写 unk —— 字节回退永不 OOV。 */
+                if (!miss_start) miss_start = p;
+                int cl2 = utf8_char_len(*p);
+                if (p + cl2 > end) cl2 = (int)(end - p);
+                p += cl2;
+            }
+            continue;
+        }
+
+        /* ═══ V2.x 词表（有 merges）：保持原「单字符查表 + BPE」路径 ═══ */
         int cl = utf8_char_len(*p);
         if (p + cl > end) cl = (int)(end - p);
         int src_len = cl;              /* ★ 源文本消费的字节数（与 cl 解耦！） */
@@ -3883,13 +4530,22 @@ int tg_encode(const TGModel* model, const char* text, int32_t* out_ids, int max_
                 if (strcmp(model->vocab[i], char_buf) == 0) { tid = i; break; }
             }
         }
+        /* ★ 字节 fallback（v3.6，2026-10-16）：字面量查表失败且只消费了 1 个原始
+         *   字节 ⇒ 回落查 '<bN>'。修的就是 '\n' 变 unk(1) 那个 bug（见上方
+         *   tg_parse_byte_token 的长注释）。多字节字符（中文等）查不到时仍走
+         *   unk —— 保持与改动前一致，不扩大改动面。 */
+        if (tid < 0 && src_len == 1) {
+            tid = tg_byte_token_id(model, (uint8_t)*p);
+        }
         if (tid < 0) tid = model->unk_id;
         if (seg_n < text_len + 8) seg[seg_n++] = tid;
 
         p += src_len;              /* ★ 只按源文本步进 */
     }
+    TG_FLUSH_MISS();               /* ★ 末尾残留的未命中段（v3.7） */
     TG_FLUSH_SEG();
     #undef TG_FLUSH_SEG
+    #undef TG_FLUSH_MISS
     free(seg);
     int bpe_n = seq_n;
 
@@ -3933,6 +4589,13 @@ int tg_decode(const TGModel* model, const int32_t* ids, int n, char* out_str, in
                 tid == model->bos_id || tid == model->eos_id) continue;
         }
         const char* s = model->vocab[tid];
+        /* ★ 字节 token 还原（v3.6）：'<bN>' ⇒ 原始单字节 N（与 encode 互逆） */
+        int bn = tg_parse_byte_token(s);
+        if (bn >= 0) {
+            if (pos + 1 >= max_len) break;
+            out_str[pos++] = (char)(uint8_t)bn;
+            continue;
+        }
         int slen = (int)strlen(s);
         if (pos + slen >= max_len) break;
         memcpy(out_str + pos, s, slen);

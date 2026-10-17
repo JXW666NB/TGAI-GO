@@ -1072,7 +1072,7 @@ static uint64_t fnv1a_64(const char* s) {
 
 /* ★ 引擎构建版本戳（2026-10-16 加）—— tg_load 完成时打印一行，
  *   用来确认"跑的是不是刚编出来的那一版"（排查时最容易踩的坑）。 */
-#define TG_ENGINE_BUILD "2026-10-16-v3.7-v3-longest-match-tokenizer"
+#define TG_ENGINE_BUILD "2026-10-18-v3.8-gguf-native-experimental"
 
 /* ★ .TG 扩展段（TLV）里的 V3 配置块（2026-10-16 加）
  *   格式：[u32 total][u32 type][u32 payload_len][payload...]
@@ -2170,6 +2170,10 @@ static int load_tokenizer(TGModel* m) {
 }
 
 /* ─── 加载模型 ────────────────────────────────── */
+/* ═══ GGUF 原生加载（2026-10-18）═══ */
+#define TGAI_GGUF_ATTACH 1
+#include "tgai_gguf.inc"
+
 TGModel* tg_load(const char* path, int use_mmap, TGError* out_err) {
     dbg("[tg_load] enter path=%s use_mmap=%d\n", path, use_mmap);
     TGModel* m = (TGModel*)calloc(1, sizeof(TGModel));
@@ -2268,6 +2272,80 @@ TGModel* tg_load(const char* path, int use_mmap, TGError* out_err) {
             m->header.weight_table_count, m->header.tokenizer_len);
 
     if (m->header.magic != TG_MAGIC) {
+        /* ★ GGUF 原生加载（2026-10-18）：文件头是 "GGUF" 而不是 TG_MAGIC 时走此路径。
+         * mmap 已完成、TGModel 已分配，只需填充 header / 权重表 / 分词器。 */
+        {
+            uint32_t fmagic = 0;
+            if (m->mapped_size >= 4) memcpy(&fmagic, m->mapped, 4);
+            /* ★ GGUF 原生加载默认【关闭】，需设 TGAI_GGUF_NATIVE=1 才启用。
+             *   原因：Q/K 的 RoPE 布局尚未与 llama.cpp 完全对齐，生成结果不正确；
+             *   生产环境请用 tools/gguf_to_tg.py 转换成 .tg（已验证可用）。 */
+            const char* _gn = getenv("TGAI_GGUF_NATIVE");
+            if (fmagic == GGUF_MAGIC && _gn && _gn[0] == '1') {
+                GGUFReader gr;
+                if (!gguf_open(&gr, (const uint8_t*)m->mapped, m->mapped_size)) {
+                    char eb[256];
+                    snprintf(eb, sizeof(eb), "GGUF 解析失败: %s", gr.err ? gr.err : "?");
+                    set_err(eb);
+                    if (out_err) *out_err = TG_ERR_MAGIC;
+                    gguf_close(&gr); tg_free(m); return NULL;
+                }
+                {
+                    char msg[256]; msg[0] = 0;
+                    TGError grc = tg_gguf_attach(m, &gr, msg, sizeof(msg));
+                    gguf_close(&gr);
+                    if (grc != TG_OK) {
+                        set_err(msg[0] ? msg : "GGUF 挂接失败");
+                        if (out_err) *out_err = grc;
+                        tg_free(m); return NULL;
+                    }
+                    dbg("[tg_load] GGUF OK: %s\n", msg);
+                }
+                /* ★ 必须补调 .tg 路径的后续初始化：
+                 *   否则 cached_weights / block_cache 全为 NULL，
+                 *   forward 时 get_cached_weight 返回 NULL ⇒ 访问违例。 */
+                {
+                    TGError e2 = preload_weights(m);
+                    if (e2 != TG_OK) {
+                        set_err("GGUF 权重预加载失败");
+                        if (out_err) *out_err = e2;
+                        tg_free(m); return NULL;
+                    }
+                    e2 = init_block_cache(m);
+                    if (e2 != TG_OK) {
+                        set_err("GGUF block_cache 初始化失败");
+                        if (out_err) *out_err = e2;
+                        tg_free(m); return NULL;
+                    }
+                }
+                /* ★ 内联 .tg 路径的工作缓冲区分配（原分支提前 return 会跳过它们）*/
+                {
+                    size_t _d = (size_t)m->header.d_model;
+                    size_t _v = (size_t)m->header.vocab_size;
+                    size_t _dff = (size_t)(m->header.d_ff ? m->header.d_ff : _d * 4);
+                    size_t _ne = m->header.n_experts > 0 ? (size_t)m->header.n_experts : 1u;
+                    m->max_work_seq = 64;
+                    m->work_x       = (float*)malloc(m->max_work_seq * _d * sizeof(float));
+                    m->work_ln      = (float*)malloc(m->max_work_seq * _d * sizeof(float));
+                    m->work_q       = (float*)malloc(m->max_work_seq * _d * sizeof(float));
+                    m->work_k       = (float*)malloc(m->max_work_seq * _d * sizeof(float));
+                    m->work_v       = (float*)malloc(m->max_work_seq * _d * sizeof(float));
+                    m->work_attn    = (float*)malloc(m->max_work_seq * _d * sizeof(float));
+                    m->work_moe_out = (float*)malloc(m->max_work_seq * _d * sizeof(float));
+                    m->work_logits  = (float*)malloc(m->max_work_seq * _v * sizeof(float));
+                    m->last_logits  = (float*)malloc(_v * sizeof(float));
+                    m->work_ffn_a   = (float*)malloc(m->max_work_seq * _dff * sizeof(float));
+                    m->work_ffn_b   = (float*)malloc(m->max_work_seq * _dff * sizeof(float));
+                    m->work_router  = (float*)malloc(m->max_work_seq * _ne * sizeof(float));
+                    m->work_scores  = (float*)malloc(m->max_work_seq * _dff * sizeof(float));
+                    if (!m->work_x || !m->work_ln || !m->work_logits || !m->last_logits ||
+                        !m->work_ffn_a || !m->work_ffn_b || !m->work_scores) {
+                        set_err("GGUF 工作缓冲区分配失败"); tg_free(m); return NULL;
+                    }
+                }
+                return m;
+            }
+        }
         set_err("magic 不匹配"); if (out_err) *out_err = TG_ERR_MAGIC;
         tg_free(m); return NULL;
     }
@@ -3536,7 +3614,125 @@ static void tg_attn_resolve(const float* blocks_buf, int n_blocks,
 /* ★ 逐层 dump（2026-10-10 加，临时诊断）
  * 环境变量 TGAI_DUMP_DIR 指定目录；未设置时零开销。
  * 用途：与 PyTorch 参考前向逐层比对，定位数值偏离点。 */
+/* ══ 运行时 dump 总开关（2026-10-18）══════════════════════════════
+ * 为什么需要：Windows 上 os.environ 的改动传不进已加载的 MSVC DLL
+ * （CRT 在 DLL 加载时复制了环境块），所以 TGAI_DUMP_DIR 只能在启动前设。
+ * 实测：全量 dump 会把单步从 83ms 拖到 115ms（每步 114 次 fopen/fclose）。
+ * 这里导出一个 C 函数让 Python 能在运行时开关 —— 只在需要动画的那几帧
+ * 开 dump，其余帧全速跑。
+ *   -1 = 跟随环境变量（默认，向后兼容）
+ *    0 = 强制关闭
+ *    1 = 强制开启 */
+static int g_dump_force = -1;
+
+/* ══ 专家屏蔽位（2026-10-18）════════════════════════════════════════
+ * 需求：验证假设「E7 是垃圾堆，禁用它会怎样」。
+ *
+ * 正确做法是把 E7 的 router logit 从 top-k 里排除，而不是把它的权重置零 ——
+ * 后者会让 MoE 变成"只有 1 个专家"，结构被破坏。
+ *
+ * 位图语义：bit e = 1 表示【禁用】专家 e。0 = 全部启用（默认）。
+ * 安全兜底：如果某层剩余可用专家数 < n_activated，本次 top-k 退回不屏蔽，
+ *          避免出现 best = -1 导致权重和为零。
+ */
+static unsigned int g_expert_mask = 0u;
+
+/* ★ 专家屏蔽（2026-10-18）—— 曾在加 remap 时被误删，现恢复。
+ *   语义：bit e = 1 表示【禁用】专家 e。0 = 全部启用（默认）。
+ *   安全兜底在 forward 的 top-k 前：若可用专家数 < n_activated，
+ *   本次退回不屏蔽，避免选出 best=-1 导致权重和为 0、模型崩坏。 */
+__declspec(dllexport) void tg_expert_set_disabled(int e, int disabled) {
+    if (e < 0 || e >= 32) return;
+    if (disabled) g_expert_mask |=  (1u << (unsigned)e);
+    else          g_expert_mask &= ~(1u << (unsigned)e);
+}
+
+__declspec(dllexport) void tg_expert_clear_mask(void) {
+    g_expert_mask = 0u;
+}
+
+__declspec(dllexport) unsigned int tg_expert_get_mask(void) {
+    return g_expert_mask;
+}
+
+/* ══ 专家权重 / 路由重映射（2026-10-18）════════════════════════════════
+ * 需求：把 E7 的权重塞进 E1 的槽位，或随机打乱专家顺序，
+ *      用于验证「Super Expert 的'超级'来自权重本身还是来自槽位」。
+ *
+ * 两组独立映射，覆盖三种实验：
+ *   w[] 与 r[] 同设  → 一致置换（模型等价，输出应逐字节相同）
+ *   只设 w[]         → 实验B：router 选槽位 e，但用另一个专家的权重
+ *   只设 r[]         → 实验C：router 读错了行，专家权重不变
+ *
+ * 语义：g_remap_w[slot] = src，表示"槽位 slot 使用专家 src 的权重"。
+ *      -1 = 恒等（默认）。
+ * ═══════════════════════════════════════════════════════════════ */
+static int g_remap_w[32];
+static int g_remap_r[32];
+static int g_remap_init = 0;
+
+static void remap_lazy_init(void) {
+    if (!g_remap_init) {
+        for (int i = 0; i < 32; i++) { g_remap_w[i] = -1; g_remap_r[i] = -1; }
+        g_remap_init = 1;
+    }
+}
+
+static inline int RM_W(int e) {
+    if (!g_remap_init) return e;
+    int s = g_remap_w[e];
+    return (s >= 0) ? s : e;
+}
+static inline int RM_R(int e) {
+    if (!g_remap_init) return e;
+    int s = g_remap_r[e];
+    return (s >= 0) ? s : e;
+}
+
+__declspec(dllexport) void tg_expert_remap_weight(int slot, int src) {
+    remap_lazy_init();
+    if (slot >= 0 && slot < 32) g_remap_w[slot] = src;
+}
+__declspec(dllexport) void tg_expert_remap_router(int slot, int src) {
+    remap_lazy_init();
+    if (slot >= 0 && slot < 32) g_remap_r[slot] = src;
+}
+__declspec(dllexport) void tg_expert_remap_clear(void) {
+    for (int i = 0; i < 32; i++) { g_remap_w[i] = -1; g_remap_r[i] = -1; }
+    g_remap_init = 1;
+}
+__declspec(dllexport) int tg_expert_remap_get(int slot, int which) {
+    if (!g_remap_init || slot < 0 || slot >= 32) return -1;
+    return which ? g_remap_r[slot] : g_remap_w[slot];
+}
+
+/* 用确定性的 LCG + Fisher-Yates 生成一个置换。
+ * mode: 0 = 只换权重, 1 = 只换 router, 2 = 两者一致（等价置换）
+ * 返回实际使用的种子（0 时用固定值，避免"随机导致不可复现"）*/
+__declspec(dllexport) unsigned int tg_expert_remap_shuffle(unsigned int seed, int mode, int ne) {
+    remap_lazy_init();
+    if (ne <= 1 || ne > 32) return 0;
+    unsigned int s = seed ? seed : 0x9E3779B9u;
+    int perm[32];
+    for (int i = 0; i < ne; i++) perm[i] = i;
+    for (int i = ne - 1; i > 0; i--) {
+        s = s * 1664525u + 1013904223u;          /* LCG */
+        int j = (int)((s >> 16) % (unsigned)(i + 1));
+        int t = perm[i]; perm[i] = perm[j]; perm[j] = t;
+    }
+    for (int i = 0; i < ne; i++) {
+        if (mode == 0 || mode == 2) g_remap_w[i] = perm[i];
+        if (mode == 1 || mode == 2) g_remap_r[i] = perm[i];
+    }
+    return s;
+}
+
+__declspec(dllexport) void tg_dump_set_enabled(int on) {
+    g_dump_force = (on > 0) ? 1 : 0;
+}
+
 static void tg_dump_f32(const char* tag, const float* p, size_t n) {
+    if (g_dump_force == 0) return;       /* ★ 运行时总开关：0 = 强制关闭 */
     const char* dir = getenv("TGAI_DUMP_DIR");
     if (!dir || !dir[0] || !p) return;
     char path[1024];
@@ -3560,12 +3756,12 @@ static void tg_dump_f32(const char* tag, const float* p, size_t n) {
  *   注意 c_hin{i} 与 c_hraw{i} 现为同一块内存（h 就是 resolve 输出），
  *   保留 c_hin 只为兼容旧脚本。 */
 static int tg_extra_dump_on(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        const char* e = getenv("TGAI_DUMP_EXTRA");
-        cached = (e && e[0] == '1') ? 1 : 0;
-    }
-    return cached;
+    /* ★ 2026-10-18 改：去掉 static 缓存，每次读环境变量。
+     *   原因：调用方要按当前可视化视图动态开关 —— 全开时每步写 170 个
+     *   文件，实测把单步从 83ms 拖到 140ms（+68%）。
+     *   getenv 开销可忽略（每层最多调 2 次）。 */
+    const char* e = getenv("TGAI_DUMP_EXTRA");
+    return (e && e[0] == '1') ? 1 : 0;
 }
 
 /* ★ 注意力权重 dump（2026-10-18 加）
@@ -3581,12 +3777,9 @@ static int tg_extra_dump_on(void) {
  *     forward 锁，因此同一时刻只有一个线程在写它；但仍要求调用方不要
  *     在多模型之间并行 forward（现有用法满足）。 */
 static int tg_attn_dump_on(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        const char* e = getenv("TGAI_DUMP_ATTN");
-        cached = (e && e[0] == '1') ? 1 : 0;
-    }
-    return cached;
+    /* ★ 同上：每次读环境变量，支持运行时按视图切换 */
+    const char* e = getenv("TGAI_DUMP_ATTN");
+    return (e && e[0] == '1') ? 1 : 0;
 }
 
 static float* g_attn_row = NULL;
@@ -3837,8 +4030,11 @@ static void transformer_block(TGModel* m, float* x, int seq,
         char _tg[64];
         snprintf(_tg, sizeof(_tg), "c_attnout%d", layer_idx);
         tg_dump_f32(_tg, m->work_moe_out, (size_t)seq * d);
-        snprintf(_tg, sizeof(_tg), "c_hin%d", layer_idx);
-        tg_dump_f32(_tg, h, (size_t)seq * d);
+        /* ★ 2026-10-18 删掉 c_hin{i} 的 dump：
+         *   它只是本层输入的副本（== 上一层 c_partend，或首层的 c_embed），
+         *   而每次 dump 是一次 fopen/fclose —— 实测 170 个文件里
+         *   56 个是这种可推导的冗余，白付 ~51ms 的 syscall 开销。
+         *   需要时用「上一层 c_partend」替代即可。 */
     }
     {
         float* partial = m->attn_res_active ? tg_ar_partial(m, seq, d) : x;
@@ -3965,12 +4161,35 @@ static void transformer_block(TGModel* m, float* x, int seq,
     for (int t = 0; t < seq; t++) {
         float* logits = m->work_router + (size_t)t * ne;
 
+        /* ★ router logit 重映射（2026-10-18）：
+         *   把 logits 按 RM_R 置换，使"槽位 e 读到的是 RM_R(e) 那一路的分数"。
+         *   与 RM_W 同时设置 ⇒ 一致置换（模型等价，输出不变）；
+         *   只设 RM_R 而 RM_W 恒等 ⇒ router 读错行，专家权重不变（实验 C）。
+         *   未配置时 g_remap_init==0，整块跳过，零开销。 */
+        if (g_remap_init) {
+            float tmp[32];
+            int nn = ne < 32 ? ne : 32;
+            for (int e = 0; e < nn; e++) tmp[e] = logits[RM_R(e)];
+            for (int e = 0; e < nn; e++) logits[e] = tmp[e];
+        }
+
+        /* ★ 专家屏蔽（2026-10-18）：统计剩余可用专家数。
+         *   若不足 na 个，本次退回不屏蔽 —— 否则 top-k 会选出 best=-1，
+         *   权重归一化后为 0，MoE 输出恒为 0，整个模型直接坏掉。 */
+        unsigned int mask = g_expert_mask;
+        int avail = ne;
+        if (mask) {
+            for (int e = 0; e < ne; e++) if (mask & (1u << e)) avail--;
+            if (avail < na) mask = 0u;     /* 兜底：不屏蔽 */
+        }
+
         /* top-k 选择 (na 通常 2, 用简单选择排序) */
         int top_ids[8] = {0};
         float top_vals[8] = {0};
         for (int k = 0; k < na && k < 8; k++) {
             int best = -1; float best_v = -1e30f;
             for (int e = 0; e < ne; e++) {
+                if (mask & (1u << e)) continue;          /* ★ 跳过被禁用 */
                 int used = 0;
                 for (int kk = 0; kk < k; kk++) if (top_ids[kk] == e) { used = 1; break; }
                 if (used) continue;
@@ -3993,6 +4212,13 @@ static void transformer_block(TGModel* m, float* x, int seq,
             int e = top_ids[k];
             if (e < 0 || e >= ne) continue;
             float w = top_vals[k];
+
+            /* ★ 专家权重重映射（2026-10-18）：
+             *   router 仍然按槽位 e 选择，但这里改用 RM_W(e) 的权重。
+             *   默认（未配置）时 RM_W(e)==e，零开销。
+             *   下面的 q4 / bf16 / fp32 三条路径都用这个 e，改一处即全生效。 */
+            e = RM_W(e);
+            if (e < 0 || e >= ne) continue;
 
             /* swiglu 输出单行: work_attn[0:d] */
             /* 复用 swiglu, seq=1 */
@@ -4094,11 +4320,9 @@ static void transformer_block(TGModel* m, float* x, int seq,
      *     这里只更新 partial，不再收块（见该处长注释）。 */
     {
         float* partial = m->attn_res_active ? tg_ar_partial(m, seq, d) : x;
-        if (tg_extra_dump_on()) {
-            char _tg[64];
-            snprintf(_tg, sizeof(_tg), "c_mlpout%d", layer_idx);
-            tg_dump_f32(_tg, m->work_moe_out, (size_t)seq * d);
-        }
+        /* ★ 2026-10-18 删掉 c_mlpout{i} 的 dump：
+         *   m = c_partend - 上一层 c_partend - c_attnout，完全可推导。
+         *   同 c_hin 一样，这是纯 syscall 开销。 */
         for (int i = 0; i < seq * d; i++) partial[i] += m->work_moe_out[i];
         if (tg_extra_dump_on()) {
             char _tg[64];

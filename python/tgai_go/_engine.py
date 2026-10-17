@@ -219,7 +219,54 @@ class TGEngine:
         self.chat_meta = {'present': False}   # .TG 内嵌的对话配置
         self.extra_stop_strings = []          # 用户自定义停止串（--stop）
 
+    def _gguf_bridge(self, path):
+        """★ GGUF 自动转换桥（2026-10-18）
+
+        用户直接传 .gguf 时，自动调用 tools/gguf_to_tg.py 转成同名 .TG 并缓存，
+        之后直接加载缓存。转换器已实测可用（Qwen2.5-0.5B 全链路验证通过）。
+
+        缓存命名：<model>.gguf → <model>.TG（同目录）
+        可用环境变量 TGAI_GGUF_NO_CACHE=1 强制重新转换。
+        """
+        import subprocess, sys
+        if not path.lower().endswith('.gguf'):
+            return path
+        if not os.path.isfile(path):
+            return path
+
+        dst = os.path.splitext(path)[0] + '.TG'
+        need = (not os.path.isfile(dst)) or \
+               os.path.getmtime(dst) < os.path.getmtime(path) or \
+               os.environ.get('TGAI_GGUF_NO_CACHE') == '1'
+        if not need:
+            return dst
+
+        # 找转换器：源码树 tools/ 或包目录同级 tools/
+        conv = None
+        for base in (ROOT, os.path.dirname(ROOT), os.getcwd()):
+            p = os.path.join(base, 'tools', 'gguf_to_tg.py')
+            if os.path.isfile(p):
+                conv = p
+                break
+        if conv is None:
+            log.warning('找不到 tools/gguf_to_tg.py，无法自动转换 GGUF')
+            return path
+
+        log.warning('GGUF 自动转换：%s → %s（首次较慢，之后走缓存）', path, dst)
+        r = subprocess.run([sys.executable, conv, '-i', path, '-o', dst,
+                            '--dtype', 'fp16'],
+                           capture_output=True, text=True)
+        if r.returncode != 0 or not os.path.isfile(dst):
+            log.error('GGUF 转换失败：%s', (r.stderr or '')[-500:])
+            return path
+        return dst
+
     def load(self, tg_path, extend_ctx=0):
+        # ★ GGUF 自动转换桥：传入 .gguf 时自动转换后加载
+        try:
+            tg_path = self._gguf_bridge(tg_path)
+        except Exception as _e:
+            log.warning('GGUF 桥异常：%s', _e)
         lib_path = self.dll_path
         if not lib_path:
             # ★ 发行版支持（2026-10-10 加）：启动器会设 TGAI_DLL_DIR / TGAI_HOME，

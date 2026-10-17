@@ -3568,6 +3568,31 @@ static int tg_extra_dump_on(void) {
     return cached;
 }
 
+/* ★ 注意力权重 dump（2026-10-18 加）
+ *   环境变量 TGAI_DUMP_ATTN=1 时，每层 dump 最后一个 query token 对所有
+ *   历史位置的注意力权重，形状 [n_heads, kv_len]（float32 扁平数组）。
+ *
+ *   ★ 为什么只 dump 最后一行：
+ *      全量 dump 是 [seq, n_heads, kv_len]，长上下文下是平方级
+ *      （2000 token ⇒ 16×2000×2000×4 = 256 MB/层），直接把 I/O 打爆。
+ *      可视化只需要"当前 token 在看谁" —— 那就正好是最后一行。
+ *
+ *   ★ 注意：g_attn_row 是文件级全局缓冲。引擎在 forward 期间持有全局
+ *     forward 锁，因此同一时刻只有一个线程在写它；但仍要求调用方不要
+ *     在多模型之间并行 forward（现有用法满足）。 */
+static int tg_attn_dump_on(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* e = getenv("TGAI_DUMP_ATTN");
+        cached = (e && e[0] == '1') ? 1 : 0;
+    }
+    return cached;
+}
+
+static float* g_attn_row = NULL;
+static int g_attn_row_cap = 0;
+static int g_attn_row_len = 0;      /* 本层实际写入的长度（nh * kv_len） */
+
 /* ─── AttnRes partial 槽位助手（2026-10-16 加）──────────────────────────
  * partial 永远位于 res_blocks 的第 res_n_blocks 槽。
  * ★★ 收块时必须把新 partial 复制到【下一个】槽：收块那一步 res_n_blocks
@@ -3741,6 +3766,23 @@ static void transformer_block(TGModel* m, float* x, int seq,
 
             softmax(sc, kv_len);
 
+            /* ★ 捕获最后一行的注意力权重（2026-10-18 加，可视化用）
+             *   t == seq-1 即本次 forward 的最后一个 query token，
+             *   它看到的 kv_len 个位置就是"当前 token 在读谁"的完整答案。 */
+            if (tg_attn_dump_on() && t == seq - 1) {
+                int _need = nh * kv_len;
+                if (g_attn_row_cap < _need) {
+                    float* _np = (float*)realloc(g_attn_row,
+                                                 (size_t)_need * sizeof(float));
+                    if (_np) { g_attn_row = _np; g_attn_row_cap = _need; }
+                }
+                if (g_attn_row && g_attn_row_cap >= _need) {
+                    memcpy(g_attn_row + (size_t)h * kv_len, sc,
+                           (size_t)kv_len * sizeof(float));
+                    g_attn_row_len = _need;
+                }
+            }
+
             /* out = scores × v */
             float* oh = m->work_attn + ((size_t)t * nh + h) * dk;
             for (int i = 0; i < dk; i++) oh[i] = 0;
@@ -3755,6 +3797,15 @@ static void transformer_block(TGModel* m, float* x, int seq,
                 for (int i = 0; i < dk; i++) oh[i] += w * vh[i];
             }
         }
+    }
+
+    /* ★ 注意力权重 dump（2026-10-18 加）：必须在 out_proj 之前、sc 已被 softmax
+     *   覆盖之后。形状 [n_heads, kv_len]，只含最后一个 query token。 */
+    if (tg_attn_dump_on() && g_attn_row && g_attn_row_len > 0) {
+        char _ta[64];
+        snprintf(_ta, sizeof(_ta), "c_attn%d", layer_idx);
+        tg_dump_f32(_ta, g_attn_row, (size_t)g_attn_row_len);
+        g_attn_row_len = 0;
     }
 
     /* out_proj (预解析指针) */

@@ -2332,10 +2332,10 @@ TGModel* tg_load(const char* path, int use_mmap, TGError* out_err) {
                     m->max_work_seq = 64;
                     m->work_x       = (float*)malloc(m->max_work_seq * _d * sizeof(float));
                     m->work_ln      = (float*)malloc(m->max_work_seq * _d * sizeof(float));
-                    m->work_q       = (float*)malloc(m->max_work_seq * _d * sizeof(float));
-                    m->work_k       = (float*)malloc(m->max_work_seq * _d * sizeof(float));
-                    m->work_v       = (float*)malloc(m->max_work_seq * _d * sizeof(float));
-                    m->work_attn    = (float*)malloc(m->max_work_seq * _d * sizeof(float));
+                    m->work_q       = (float*)malloc(m->max_work_seq * (size_t)(m->header.n_heads * ((m->head_dim>0)?m->head_dim:(m->header.d_model/m->header.n_heads))) * sizeof(float));
+                    m->work_k       = (float*)malloc(m->max_work_seq * (size_t)((m->header.num_kv_heads>0?m->header.num_kv_heads:m->header.n_heads) * ((m->head_dim>0)?m->head_dim:(m->header.d_model/m->header.n_heads))) * sizeof(float));
+                    m->work_v       = (float*)malloc(m->max_work_seq * (size_t)((m->header.num_kv_heads>0?m->header.num_kv_heads:m->header.n_heads) * ((m->head_dim>0)?m->head_dim:(m->header.d_model/m->header.n_heads))) * sizeof(float));
+                    m->work_attn    = (float*)malloc(m->max_work_seq * (size_t)(m->header.n_heads * ((m->head_dim>0)?m->head_dim:(m->header.d_model/m->header.n_heads))) * sizeof(float));
                     m->work_moe_out = (float*)malloc(m->max_work_seq * _d * sizeof(float));
                     m->work_logits  = (float*)malloc(m->max_work_seq * _v * sizeof(float));
                     m->last_logits  = (float*)malloc(_v * sizeof(float));
@@ -2447,10 +2447,10 @@ TGModel* tg_load(const char* path, int use_mmap, TGError* out_err) {
     int dff = (int)m->header.d_ff;
     m->work_x       = (float*)malloc((size_t)m->max_work_seq * d * sizeof(float));
     m->work_ln      = (float*)malloc((size_t)m->max_work_seq * d * sizeof(float));
-    m->work_q       = (float*)malloc((size_t)m->max_work_seq * d * sizeof(float));
-    m->work_k       = (float*)malloc((size_t)m->max_work_seq * d * sizeof(float));
-    m->work_v       = (float*)malloc((size_t)m->max_work_seq * d * sizeof(float));
-    m->work_attn    = (float*)malloc((size_t)m->max_work_seq * d * sizeof(float));
+    m->work_q       = (float*)malloc((size_t)m->max_work_seq * (size_t)((int)m->header.n_heads * ((m->head_dim>0)?m->head_dim:((int)m->header.d_model/(int)m->header.n_heads))) * sizeof(float));
+    m->work_k       = (float*)malloc((size_t)m->max_work_seq * (size_t)(((int)m->header.num_kv_heads>0?(int)m->header.num_kv_heads:(int)m->header.n_heads) * ((m->head_dim>0)?m->head_dim:((int)m->header.d_model/(int)m->header.n_heads))) * sizeof(float));
+    m->work_v       = (float*)malloc((size_t)m->max_work_seq * (size_t)(((int)m->header.num_kv_heads>0?(int)m->header.num_kv_heads:(int)m->header.n_heads) * ((m->head_dim>0)?m->head_dim:((int)m->header.d_model/(int)m->header.n_heads))) * sizeof(float));
+    m->work_attn    = (float*)malloc((size_t)m->max_work_seq * (size_t)((int)m->header.n_heads * ((m->head_dim>0)?m->head_dim:((int)m->header.d_model/(int)m->header.n_heads))) * sizeof(float));
     m->work_moe_out = (float*)malloc((size_t)m->max_work_seq * d * sizeof(float));
     m->work_logits  = (float*)malloc((size_t)m->max_work_seq * v * sizeof(float));
     m->last_logits  = (float*)malloc((size_t)v * sizeof(float));  /* 输出副本 */
@@ -2605,10 +2605,10 @@ static int ensure_work(TGModel* m, int seq_len) {
 
     REALLOC_N(m->work_x, d);
     REALLOC_N(m->work_ln, d);
-    REALLOC_N(m->work_q, d);
-    REALLOC_N(m->work_k, d);
-    REALLOC_N(m->work_v, d);
-    REALLOC_N(m->work_attn, d);
+    REALLOC_N(m->work_q, (int)m->header.n_heads * ((m->head_dim>0)?m->head_dim:((int)m->header.d_model/(int)m->header.n_heads)));
+    REALLOC_N(m->work_k, ((int)m->header.num_kv_heads>0?(int)m->header.num_kv_heads:(int)m->header.n_heads) * ((m->head_dim>0)?m->head_dim:((int)m->header.d_model/(int)m->header.n_heads)));
+    REALLOC_N(m->work_v, ((int)m->header.num_kv_heads>0?(int)m->header.num_kv_heads:(int)m->header.n_heads) * ((m->head_dim>0)?m->head_dim:((int)m->header.d_model/(int)m->header.n_heads)));
+    REALLOC_N(m->work_attn, ((int)m->header.n_heads * ((m->head_dim>0)?m->head_dim:((int)m->header.d_model/(int)m->header.n_heads))));
     REALLOC_N(m->work_moe_out, d);
     REALLOC_N(m->work_logits, v);
     REALLOC_N(m->work_ffn_a, dff);
@@ -3810,7 +3810,7 @@ static float* tg_ar_partial(TGModel* m, int seq, int d) {
 static void transformer_block(TGModel* m, float* x, int seq,
                               int layer_idx, TGKVCache* cache, int cache_pos) {    int d = (int)m->header.d_model;
     int nh = (int)m->header.n_heads;
-    int dk = d / nh;
+        int dk = (m->head_dim > 0) ? m->head_dim : (d / nh);   /* ★ 真实 head_dim */
     /* Task 20c.3: GQA 支持 — K/V 投影输出 kv_dim = n_kv_heads * d_k (非 d_model)。
      * ORV 导出的稠密 LLM 是 GQA (n_kv=2 < n_heads=4), kv_dim=16 < d=32。
      * 旧代码 matmul(work_k, ..., d, d) 把 k_w 当 [d,d] 越界读取, 触发访问违例崩溃。 */
@@ -3818,6 +3818,7 @@ static void transformer_block(TGModel* m, float* x, int seq,
     if (nkv <= 0) nkv = nh;        /* 0 = 同 n_heads (向后兼容 v1/MoE 模型) */
     if (nkv > nh) nkv = nh;        /* 安全上限 */
     int kv_dim = nkv * dk;         /* K/V 投影输出维度 */
+        int q_dim = nh * dk;            /* Q 投影输出维度（head_dim 可能 != d/nh） */
     int ne = (int)m->header.n_experts;
     int na = (int)m->header.n_activated;
     int dff = (int)m->header.d_ff;
@@ -3855,16 +3856,16 @@ static void transformer_block(TGModel* m, float* x, int seq,
 
     /* Q4_0 路径: 使用原始 4-bit 数据直接点积 (减 4x 内存带宽) */
     if (m->use_q4_direct && bw->q4_q) {
-        matmul_q4(m->work_q, m->work_ln, bw->q4_q, bw->q4_q_s, bw->q4_q_sw, seq, d, d);          /* Q: [seq, d] */
+        matmul_q4(m->work_q, m->work_ln, bw->q4_q, bw->q4_q_s, bw->q4_q_sw, seq, d, q_dim);          /* Q: [seq, d] */
         matmul_q4(m->work_k, m->work_ln, bw->q4_k, bw->q4_k_s, bw->q4_k_sw, seq, d, kv_dim);     /* K: [seq, kv_dim] (GQA) */
         matmul_q4(m->work_v, m->work_ln, bw->q4_v, bw->q4_v_s, bw->q4_v_sw, seq, d, kv_dim);     /* V: [seq, kv_dim] (GQA) */
     } else if (m->use_bf16_direct && bw->bf16_q) {
         /* ★ BF16 直算（2026-10-10 加）：权重 2 字节，带宽减半 */
-        matmul_bf16(m->work_q, m->work_ln, bw->bf16_q, seq, d, d);
+        matmul_bf16(m->work_q, m->work_ln, bw->bf16_q, seq, d, q_dim);
         matmul_bf16(m->work_k, m->work_ln, bw->bf16_k, seq, d, kv_dim);
         matmul_bf16(m->work_v, m->work_ln, bw->bf16_v, seq, d, kv_dim);
     } else {
-        matmul(m->work_q, m->work_ln, bw->q_w, seq, d, d);                          /* Q: [seq, d] */
+        matmul(m->work_q, m->work_ln, bw->q_w, seq, d, q_dim);                          /* Q: [seq, d] */
         matmul(m->work_k, m->work_ln, bw->k_w, seq, d, kv_dim);                     /* K: [seq, kv_dim] (GQA) */
         matmul(m->work_v, m->work_ln, bw->v_w, seq, d, kv_dim);                     /* V: [seq, kv_dim] (GQA) */
     }
@@ -3877,7 +3878,7 @@ static void transformer_block(TGModel* m, float* x, int seq,
     if (bw->q_bias) {
         for (int t = 0; t < seq; t++) {
             float* row = m->work_q + (size_t)t * d;
-            for (int i = 0; i < d; i++) row[i] += bw->q_bias[i];
+            for (int i = 0; i < q_dim; i++) row[i] += bw->q_bias[i];
         }
     }
     if (bw->k_bias) {
@@ -4010,11 +4011,11 @@ static void transformer_block(TGModel* m, float* x, int seq,
 
     /* out_proj (预解析指针) */
     if (m->use_q4_direct && bw->q4_out) {
-        matmul_q4(m->work_moe_out, m->work_attn, bw->q4_out, bw->q4_out_s, bw->q4_out_sw, seq, d, d);
+        matmul_q4(m->work_moe_out, m->work_attn, bw->q4_out, bw->q4_out_s, bw->q4_out_sw, seq, q_dim, d);
     } else if (m->use_bf16_direct && bw->bf16_out) {
-        matmul_bf16(m->work_moe_out, m->work_attn, bw->bf16_out, seq, d, d);
+        matmul_bf16(m->work_moe_out, m->work_attn, bw->bf16_out, seq, q_dim, d);
     } else {
-        matmul(m->work_moe_out, m->work_attn, bw->out_w, seq, d, d);
+        matmul(m->work_moe_out, m->work_attn, bw->out_w, seq, q_dim, d);
     }
 
     /* ★★ V3 AttnRes：new_partial = partial + attn_out

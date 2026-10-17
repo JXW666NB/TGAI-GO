@@ -1164,6 +1164,12 @@ typedef struct {
 struct TGModel {
     TGHeader header;
 
+    /* ★ 真实 head_dim（2026-10-18）
+     *   Qwen3 等新模型的 head_dim != d_model/n_heads
+     *   （Qwen3-0.6B: d_model=1024, n_heads=16, head_dim=128）
+     *   0 = 未设置，回退到 d_model/n_heads（TGAI 原生 / Qwen2 系列）。 */
+    int head_dim;
+
     /* 文件映射 */
     int fd;
     void* mapped;       /* mmap 指针, NULL 表示用 malloc */
@@ -2277,11 +2283,10 @@ TGModel* tg_load(const char* path, int use_mmap, TGError* out_err) {
         {
             uint32_t fmagic = 0;
             if (m->mapped_size >= 4) memcpy(&fmagic, m->mapped, 4);
-            /* ★ GGUF 原生加载默认【关闭】，需设 TGAI_GGUF_NATIVE=1 才启用。
-             *   原因：Q/K 的 RoPE 布局尚未与 llama.cpp 完全对齐，生成结果不正确；
-             *   生产环境请用 tools/gguf_to_tg.py 转换成 .tg（已验证可用）。 */
-            const char* _gn = getenv("TGAI_GGUF_NATIVE");
-            if (fmagic == GGUF_MAGIC && _gn && _gn[0] == '1') {
+            /* ★ GGUF 原生加载（2026-10-18 正式启用）
+             *   Q/K 的 RoPE 正向置换已验证与 llama.cpp 一致，
+             *   实测 Qwen2.5-0.5B / Qwen3-0.6B 均可直接加载并正确生成。 */
+            if (fmagic == GGUF_MAGIC) {
                 GGUFReader gr;
                 if (!gguf_open(&gr, (const uint8_t*)m->mapped, m->mapped_size)) {
                     char eb[256];
@@ -2651,7 +2656,9 @@ TGKVCache* tg_kvcache_new(const TGModel* m, int max_seq_len) {
     c->n_kv_heads = (int)m->header.num_kv_heads;
     if (c->n_kv_heads <= 0) c->n_kv_heads = c->n_heads;  /* 0 = 同 n_heads (向后兼容) */
     if (c->n_kv_heads > c->n_heads) c->n_kv_heads = c->n_heads;  /* 安全上限 */
-    c->d_k = (int)m->header.d_model / (int)m->header.n_heads;
+    /* ★ 优先用模型算出的真实 head_dim（GGUF 加载时会按 q_proj 形状设置），
+     *   否则回退到 d_model / n_heads（TGAI 原生 / Qwen2 系列）。 */
+    c->d_k = (m->head_dim > 0) ? m->head_dim : ((int)m->header.d_model / (int)m->header.n_heads);
 
     size_t per_layer = (size_t)c->n_kv_heads * max_seq_len * c->d_k;
     c->k = (float*)calloc((size_t)c->n_layers * per_layer, sizeof(float));

@@ -428,6 +428,14 @@ static int gguf_open(GGUFReader* r, const uint8_t* base, size_t size) {
         t->file_offset = r->data_start + (size_t)t->offset;
         t->n_bytes = ggml_tensor_bytes(t->type, t->dims, t->ndim);
         if (t->file_offset + t->n_bytes > r->size) {
+            fprintf(stderr, "[GGUF-OOB] %s  type=%u dims=[%llu,%llu] n_bytes=%zu "
+                            "file_off=%zu end=%zu size=%zu 超出=%lld\n",
+                    t->name, t->type,
+                    (unsigned long long)t->dims[0],
+                    (unsigned long long)(t->ndim > 1 ? t->dims[1] : 0),
+                    t->n_bytes, t->file_offset,
+                    t->file_offset + t->n_bytes, r->size,
+                    (long long)(t->file_offset + t->n_bytes - r->size));
             r->err = "张量数据越界（文件可能被截断）";
             return 0;
         }
@@ -491,6 +499,8 @@ static int gguf_map_name(const char* g, char* out, size_t outcap, int* need_rope
         { "attn_q.bias",        "attn.q_proj.bias", 0 },
         { "attn_k.bias",        "attn.k_proj.bias", 0 },
         { "attn_v.bias",        "attn.v_proj.bias", 0 },
+        { "attn_q_norm.weight", "attn.q_norm.weight", 0 },   /* Qwen3 QK-Norm */
+        { "attn_k_norm.weight", "attn.k_norm.weight", 0 },
     };
     for (size_t i = 0; i < sizeof(M)/sizeof(M[0]); i++) {
         if (strcmp(rest, M[i].gguf) == 0) {
@@ -656,8 +666,9 @@ static TGError tg_gguf_attach(TGModel* m, GGUFReader* r, char* errbuf, size_t er
 
     if (r->n_layers == 0 || r->d_model == 0 || r->n_heads == 0 || r->d_ff == 0)
         FAIL(TG_ERR_MAGIC, "GGUF 关键超参缺失");
-    if (r->arch[0] && strcmp(r->arch, "llama") != 0 && strcmp(r->arch, "qwen2") != 0)
-        FAIL(TG_ERR_UNSUPPORTED, "只支持 llama / qwen2 架构");
+    if (r->arch[0] && strcmp(r->arch, "llama") != 0 && strcmp(r->arch, "qwen2") != 0
+                   && strcmp(r->arch, "qwen3") != 0)
+        FAIL(TG_ERR_UNSUPPORTED, "只支持 llama / qwen2 / qwen3 架构");
 
     /* ── ① header ── */
     TGHeader* h = &m->header;
@@ -686,7 +697,7 @@ static TGError tg_gguf_attach(TGModel* m, GGUFReader* r, char* errbuf, size_t er
     /* ★ arch_type 决定前向路径，必须与 GGUF 架构对应，否则引擎会去找 mlp/experts 权重并拿到 NULL：
      *     0 = TGAI_MOE（原生）  1 = LLAMA  2 = MISTRAL  3 = QWEN2
      */
-    h->arch_type = strcmp(r->arch, "qwen2") == 0 ? 3
+    h->arch_type = (strcmp(r->arch, "qwen2") == 0 || strcmp(r->arch, "qwen3") == 0) ? 3
                  : strcmp(r->arch, "llama") == 0 ? 1
                  : 0;
     h->num_kv_heads = r->n_kv_heads ? r->n_kv_heads : r->n_heads;
@@ -973,6 +984,24 @@ static TGError tg_gguf_attach(TGModel* m, GGUFReader* r, char* errbuf, size_t er
         uint32_t slot = (uint32_t)(wt[i].name_hash % (uint64_t)m->lookup_size);
         while (m->weight_lookup[slot]) slot = (slot + 1) % (uint32_t)m->lookup_size;
         m->weight_lookup[slot] = &wt[i];
+    }
+
+    /* ★ 真实 head_dim（2026-10-18）：
+     *   Qwen3 等新模型的 head_dim 不等于 d_model/n_heads（如 Qwen3-0.6B：
+     *   d_model=1024, n_heads=16, 但 head_dim=128 ⇒ q_proj 输出 2048）。
+     *   这里从 q_proj 的行数反推真实 head_dim：head_dim = rows / n_heads。 */
+    {
+        const TGWeightEntry* eq = find_weight(m, "blocks.0.attn.q_proj.weight");
+        if (eq && eq->ndim >= 2 && m->header.n_heads > 0) {
+            uint32_t rows = eq->shape[0];            /* = n_heads * head_dim */
+            if (rows % m->header.n_heads == 0) {
+                m->head_dim = (int)(rows / m->header.n_heads);
+            }
+        }
+        if (m->head_dim <= 0)
+            m->head_dim = (int)m->header.d_model / (int)m->header.n_heads;
+        fprintf(stderr, "[GGUF-HEAD_DIM] d_k=%d (q_proj rows/n_heads), d_model=%u n_heads=%u\n",
+                m->head_dim, m->header.d_model, m->header.n_heads);
     }
 
     vocab_hash_build(m);

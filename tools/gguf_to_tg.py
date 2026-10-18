@@ -1170,11 +1170,27 @@ def maybe_permute_rope(mapped: str, w_bytes, dims, cfg, target_dtype: int):
     is_k_w = mapped.endswith('.attn.k_proj.weight')
     is_q_b = mapped.endswith('.attn.q_proj.bias')
     is_k_b = mapped.endswith('.attn.k_proj.bias')
+    is_qn = mapped.endswith('.attn.q_norm.weight')   # ★ Qwen3 QK-Norm：1D，按 1 个 head 处理
+    is_kn = mapped.endswith('.attn.k_norm.weight')
+    if is_qn or is_kn:
+        np_dtype_n = np.float16 if target_dtype == TG_DTYPE_FP16 else np.float32
+        a_n = np.frombuffer(w_bytes, dtype=np_dtype_n).copy()
+        if a_n.size % 2 != 0:
+            return w_bytes
+        out_n = permute_rope_half_to_interleaved(a_n, 1, int(a_n.size))
+        return np.ascontiguousarray(out_n).tobytes()
     if not (is_q_w or is_k_w or is_q_b or is_k_b):
         return w_bytes
     is_q = is_q_w or is_q_b
     n_heads = cfg['n_heads'] if is_q else cfg['n_kv_heads']
-    d_k = cfg['d_model'] // cfg['n_heads']
+    # ★ 真实 head_dim（2026-10-18）：Qwen3 的 head_dim != d_model/n_heads
+    d_k = cfg.get('head_dim') or 0
+    if not d_k and len(dims) >= 2:
+        _out = int(dims[1])          # GGUF 2D 权重是 [in, out]
+        if _out > 0 and _out % n_heads == 0:
+            d_k = _out // n_heads
+    if not d_k:
+        d_k = cfg['d_model'] // cfg['n_heads']
     if d_k % 2 != 0 or n_heads <= 0:
         return w_bytes
     np_dtype = np.float16 if target_dtype == TG_DTYPE_FP16 else np.float32
@@ -1249,6 +1265,12 @@ def map_weight_name(gguf_name: str, arch_cfg: dict) -> str | None:
             return f'blocks.{layer_idx}.attn.v_proj.weight'
         if rest == f'{o_key}.weight':
             return f'blocks.{layer_idx}.attn.out_proj.weight'
+        # ★ Qwen3 QK-Norm（2026-10-18 加）：引擎按 blocks.{i}.attn.q_norm/k_norm.weight 查找
+        if rest == 'attn_q_norm.weight':
+            return f'blocks.{layer_idx}.attn.q_norm.weight'
+        if rest == 'attn_k_norm.weight':
+            return f'blocks.{layer_idx}.attn.k_norm.weight'
+
 
         # FFN (SwiGLU) — 命名对齐 ORV 导出 / 引擎稠密 FFN 查找 (init_block_cache)
         #   ffn.w1 = gate (silu 分支)   [d_ff, d_model]

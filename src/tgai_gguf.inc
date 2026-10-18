@@ -866,7 +866,20 @@ static TGError tg_gguf_attach(TGModel* m, GGUFReader* r, char* errbuf, size_t er
     }
     if (n_map <= 0) { free(lens); FAIL(TG_ERR_MAGIC, "GGUF 无可用张量"); }
 
+    /* ★ 真实 head_dim（2026-10-18）：Qwen3 的 head_dim != d_model/n_heads。
+     *   GGUF 的 attn_q 形状是 [in=d_model, out=n_heads*head_dim]，
+     *   所以 head_dim = out / n_heads。必须在 RoPE 置换【之前】确定，
+     *   否则 d_k 取成 64（Qwen3 实际 128），置换按错误的步长切分 ⇒ 输出全错。 */
     int d_k = (int)(r->d_model / r->n_heads);
+    for (int qi = 0; qi < r->n_ti; qi++) {
+        GGUFTensorInfo* qt = &r->ti[qi];
+        if (strcmp(qt->name, "blk.0.attn_q.weight") == 0 && qt->ndim >= 2 && r->n_heads > 0) {
+            uint64_t out_dim = qt->dims[1];
+            if (out_dim % r->n_heads == 0 && out_dim / r->n_heads > 0)
+                d_k = (int)(out_dim / r->n_heads);
+            break;
+        }
+    }
     if (d_k <= 0 || (d_k % 2) != 0) { free(lens); FAIL(TG_ERR_UNSUPPORTED, "head_dim 非法或不是偶数"); }
 
     /* 第一遍：算出需要重排的总字节数 */
@@ -928,7 +941,30 @@ static TGError tg_gguf_attach(TGModel* m, GGUFReader* r, char* errbuf, size_t er
         }
 
         /* ── RoPE 重排 ── */
+        /* ★ QK-Norm（q_norm/k_norm）长度只有 head_dim，heads 必须是 1；
+         *   之前误用 n_kv_heads 会越界读源、写 8 倍数据 ⇒ Qwen3 输出空。 */
+        int is_norm = (strstr(tg, ".q_norm") != NULL) || (strstr(tg, ".k_norm") != NULL);
         int is_q = (strstr(tg, ".q_proj") != NULL);
+        if (is_norm) {
+            uint32_t heads_n = 1u;
+            uint32_t rows_n = heads_n * (uint32_t)d_k;
+            size_t esz_n = ggml_type_size(t->type);
+            if (!esz_n) { n_skip_dtype++; continue; }
+            size_t need_n = (size_t)rows_n * esz_n;
+            if (arena_used + need_n > arena_bytes) { n_skip_dtype++; continue; }
+            uint8_t* dst_n = arena + arena_used;
+            const uint8_t* src_n = r->base + t->file_offset;
+            for (uint32_t ii2 = 0; ii2 < (uint32_t)d_k; ii2++) {
+                uint32_t kk2 = (ii2 % 2 == 0) ? (ii2 / 2)
+                                              : (ii2 / 2 + (uint32_t)(d_k / 2));
+                memcpy(dst_n + (size_t)ii2 * esz_n, src_n + (size_t)kk2 * esz_n, esz_n);
+            }
+            e->offset = (uint64_t)(arena_delta + (int64_t)arena_used);
+            arena_used += need_n;
+            arena_used = (arena_used + 63) & ~(size_t)63;
+            n_rope++; wi++;
+            continue;
+        }
         uint32_t heads = is_q ? r->n_heads
                               : (r->n_kv_heads ? r->n_kv_heads : r->n_heads);
         uint32_t rows = heads * (uint32_t)d_k;

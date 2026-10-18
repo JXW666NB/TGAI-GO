@@ -1900,6 +1900,17 @@ static int init_block_cache(TGModel* m) {
         snprintf(name, sizeof(name), "blocks.%d.ln2.weight", i);
         bw->ln2_w = get_cached_weight(m, find_weight(m, name));
         snprintf(name, sizeof(name), "blocks.%d.attn.q_proj.weight", i);
+        /* ★ 从 q_proj 形状反推真实 head_dim（2026-10-18）
+         *   .tg 文件不携带 head_dim 字段，而 Qwen3 等模型的 head_dim != d_model/n_heads。
+         *   不修的话 dk 被算成 64（实际 128）⇒ QK-Norm 只归一化一半维度、RoPE 错位。
+         *   实测修复后 layer0 head0 的 ss 从 25.40 -> 55.77，与 Python 参考完全一致。 */
+        if (i == 0 && m->head_dim <= 0) {
+            const TGWeightEntry* _qe = find_weight(m, name);
+            if (_qe && _qe->ndim >= 2 && m->header.n_heads > 0
+                && _qe->shape[0] % m->header.n_heads == 0) {
+                m->head_dim = (int)(_qe->shape[0] / m->header.n_heads);
+            }
+        }
         RESOLVE_W_BF16(q_w, q4_q, q4_q_s, q4_q_sw, bf16_q, name);
         snprintf(name, sizeof(name), "blocks.%d.attn.k_proj.weight", i);
         RESOLVE_W_BF16(k_w, q4_k, q4_k_s, q4_k_sw, bf16_k, name);

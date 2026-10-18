@@ -1186,7 +1186,11 @@ def maybe_permute_rope(mapped: str, w_bytes, dims, cfg, target_dtype: int):
     # ★ 真实 head_dim（2026-10-18）：Qwen3 的 head_dim != d_model/n_heads
     d_k = cfg.get('head_dim') or 0
     if not d_k and len(dims) >= 2:
-        _out = int(dims[1])          # GGUF 2D 权重是 [in, out]
+        # ★ 注意：调用方已把 dims 换成【引擎布局 [out, in]】，
+        #   所以输出维是 dims[0]（不是 dims[1]！）。
+        #   之前误用 dims[1] 导致非方阵 q_proj（Qwen3: [1024,2048]）被当成
+        #   [1024,2048] 置换 ⇒ 数据散架；方阵 k_proj 不触发交换而侥幸正确。
+        _out = int(dims[0])
         if _out > 0 and _out % n_heads == 0:
             d_k = _out // n_heads
     if not d_k:

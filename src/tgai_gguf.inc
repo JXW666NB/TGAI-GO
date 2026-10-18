@@ -496,11 +496,11 @@ static int gguf_map_name(const char* g, char* out, size_t outcap, int* need_rope
         { "ffn_gate.weight",    "ffn.w1.weight",   0 },
         { "ffn_up.weight",      "ffn.w2.weight",   0 },
         { "ffn_down.weight",    "ffn.w3.weight",   0 },
-        { "attn_q.bias",        "attn.q_proj.bias", 0 },
-        { "attn_k.bias",        "attn.k_proj.bias", 0 },
+        { "attn_q.bias",        "attn.q_proj.bias", 1 },   /* ★ K/Q bias 同样需要 RoPE 重排 */
+        { "attn_k.bias",        "attn.k_proj.bias", 1 },   /* ★ */
         { "attn_v.bias",        "attn.v_proj.bias", 0 },
-        { "attn_q_norm.weight", "attn.q_norm.weight", 0 },   /* Qwen3 QK-Norm */
-        { "attn_k_norm.weight", "attn.k_norm.weight", 0 },
+        { "attn_q_norm.weight", "attn.q_norm.weight", 1 },   /* ★ Qwen3 QK-Norm 也需与置换后的 q 对齐 */
+        { "attn_k_norm.weight", "attn.k_norm.weight", 1 },   /* ★ */
     };
     for (size_t i = 0; i < sizeof(M)/sizeof(M[0]); i++) {
         if (strcmp(rest, M[i].gguf) == 0) {
@@ -674,7 +674,7 @@ static TGError tg_gguf_attach(TGModel* m, GGUFReader* r, char* errbuf, size_t er
     TGHeader* h = &m->header;
     memset(h, 0, sizeof(*h));
     h->magic        = TG_MAGIC;
-    h->version      = TG_VERSION;
+    h->version      = TG_VERSION_V3;   /* ★ 与转换器产物一致（v3），避免版本分支差异 */
     h->weight_dtype = (r->d_model > 0) ? TG_DTYPE_FP16 : TG_DTYPE_FP16;
     h->n_layers     = r->n_layers;
     h->d_model      = r->d_model;
@@ -1000,8 +1000,9 @@ static TGError tg_gguf_attach(TGModel* m, GGUFReader* r, char* errbuf, size_t er
         }
         if (m->head_dim <= 0)
             m->head_dim = (int)m->header.d_model / (int)m->header.n_heads;
-        fprintf(stderr, "[GGUF-HEAD_DIM] d_k=%d (q_proj rows/n_heads), d_model=%u n_heads=%u\n",
-                m->head_dim, m->header.d_model, m->header.n_heads);
+        dbg("[GGUF] head_dim=%d d_model=%u n_heads=%u rows=%u\n",
+            m->head_dim, m->header.d_model, m->header.n_heads,
+            (unsigned)(m->header.n_heads * m->head_dim));
     }
 
     vocab_hash_build(m);

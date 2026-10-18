@@ -231,6 +231,9 @@ class TGEngine:
         import subprocess, sys
         if not path.lower().endswith('.gguf'):
             return path
+        # ★ TGAI_NO_GGUF_BRIDGE=1 时跳过转换，直接交给引擎原生加载
+        if os.environ.get('TGAI_NO_GGUF_BRIDGE') == '1':
+            return path
         if not os.path.isfile(path):
             return path
 

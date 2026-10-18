@@ -4130,6 +4130,12 @@ static void transformer_block(TGModel* m, float* x, int seq,
         }
         for (int i = 0; i < seq * dff; i++) {
             float v = m->work_ffn_a[i];
+            /* ★ silu 数值保护（2026-10-18）：v 极度负时 expf(-v) 溢出到 +inf，
+             *   /fp:fast 下 v/inf 可能产生 NaN。silu 在 |v|>88 后已完全饱和
+             *   （silu(88)≈88，silu(-88)≈-1.6e-38），钳制对结果无实质影响。
+             *   Qwen3-0.6B 实测 L27 有 52 个元素触发，导致整层 NaN。 */
+            if (v >  88.0f) v =  88.0f;
+            if (v < -88.0f) v = -88.0f;
             m->work_ffn_a[i] = (v / (1.0f + expf(-v))) * m->work_ffn_b[i];
         }
         if (m->use_q4_direct && bw->q4_ffn_w3) {
